@@ -15,6 +15,9 @@ main() {
   version=$(get_version)
   echo "Building version: $version"
 
+  section "Building wheel"
+  uv build
+
   local tag
   tag="v${version}-$(date +%Y%m%d-%H%M%S)"
   echo "Generated tag: $tag"
