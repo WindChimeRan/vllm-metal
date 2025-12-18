@@ -8,7 +8,6 @@ import torch
 
 from vllm_metal._compat import Platform, PlatformEnum, init_logger
 from vllm_metal.envs import (
-    VLLM_METAL_EAGER_MODE,
     VLLM_METAL_MEMORY_FRACTION,
 )
 from vllm_metal.utils import (
@@ -138,7 +137,7 @@ class MetalPlatform(Platform):
         and some configs may be None in early calls. We guard all accesses
         appropriately.
         """
-        from vllm.config.compilation import CUDAGraphMode
+        from vllm.config.compilation import CompilationMode, CUDAGraphMode
 
         # Validate platform availability (always safe to check)
         available, error = check_metal_availability()
@@ -185,18 +184,18 @@ class MetalPlatform(Platform):
                 cache_config.block_size = 16
                 logger.info("Metal backend: Using block_size=16 for KV cache")
 
-        # Force eager mode if configured
-        if model_config is not None and VLLM_METAL_EAGER_MODE:
+        # Metal always runs in eager mode (no CUDA graph support)
+        if model_config is not None:
             model_config.enforce_eager = True
-            logger.info("Metal backend: Using eager mode")
 
         # Disable CUDA graphs and torch.compile - Metal doesn't support them
         if compilation_config is not None:
             compilation_config.cudagraph_mode = CUDAGraphMode.NONE
             compilation_config.cudagraph_capture_sizes = []
             compilation_config.compile_sizes = []
-            # Disable compilation entirely - Metal doesn't support CUDA graphs
+            # Disable compilation entirely - Metal doesn't support CUDA graphs or inductor
             compilation_config.level = 0
+            compilation_config.mode = CompilationMode.NONE
             logger.info(
                 "Metal backend: Disabled CUDA graphs and compilation (not supported on Metal)"
             )

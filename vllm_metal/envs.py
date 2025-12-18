@@ -11,7 +11,7 @@ VLLM_METAL_MEMORY_FRACTION: float = float(
     os.getenv("VLLM_METAL_MEMORY_FRACTION", "0.9")
 )
 
-# Attention backend selection: "metal" or "eager"
+# Attention backend selection (always "metal" for Rust kernels)
 VLLM_METAL_ATTENTION_BACKEND: str = os.getenv("VLLM_METAL_ATTENTION_BACKEND", "metal")
 
 # Enable profiling
@@ -32,12 +32,9 @@ VLLM_METAL_MAX_BATCH_SIZE: int = int(os.getenv("VLLM_METAL_MAX_BATCH_SIZE", "256
 # KV cache dtype override (None means use model dtype)
 VLLM_METAL_KV_CACHE_DTYPE: str | None = os.getenv("VLLM_METAL_KV_CACHE_DTYPE", None)
 
-# Enable eager mode (disable graph compilation)
-VLLM_METAL_EAGER_MODE: bool = os.getenv("VLLM_METAL_EAGER_MODE", "1").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+# Metal uses custom kernels (no eager PyTorch fallback)
+# This is kept for vLLM compatibility but always True
+VLLM_METAL_EAGER_MODE: bool = True
 
 
 def get_metal_env_info() -> dict:

@@ -21,8 +21,8 @@ class TestMetalConfig:
 
         assert config.device_id == 0
         assert 0 < config.memory_fraction <= 1.0
-        assert config.attention_backend in ("metal", "eager")
-        assert isinstance(config.eager_mode, bool)
+        assert config.attention_backend == "metal"
+        assert config.eager_mode is True  # Always True for Metal
         assert isinstance(config.compile, bool)
         assert config.max_batch_size > 0
 
@@ -31,14 +31,14 @@ class TestMetalConfig:
         config = MetalConfig(
             device_id=0,
             memory_fraction=0.8,
-            attention_backend="eager",
+            attention_backend="metal",
             eager_mode=True,
             max_batch_size=128,
         )
 
         assert config.device_id == 0
         assert config.memory_fraction == 0.8
-        assert config.attention_backend == "eager"
+        assert config.attention_backend == "metal"
         assert config.eager_mode is True
         assert config.max_batch_size == 128
 
@@ -54,6 +54,10 @@ class TestMetalConfig:
         """Test invalid attention backend raises error."""
         with pytest.raises(ValueError, match="attention_backend"):
             MetalConfig(attention_backend="invalid")
+
+        # "eager" is no longer valid - only "metal" (Rust kernels)
+        with pytest.raises(ValueError, match="attention_backend"):
+            MetalConfig(attention_backend="eager")
 
     def test_invalid_max_batch_size(self):
         """Test invalid max batch size raises error."""

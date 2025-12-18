@@ -1,318 +1,458 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal Model Runner V2 - High-performance inference with custom Metal kernels.
+"""Metal V2 Model Runner - extends GPU model runner for Metal/MPS backend."""
 
-This is a thin Python wrapper around the Rust Metal kernels.
-Key features:
-- Custom Metal kernels for attention, GEMV, RoPE, RMS norm
-- Zero-copy data transfer via unified memory
-- vLLM-compatible interface
-"""
-
-from typing import TYPE_CHECKING
+from contextlib import contextmanager
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
-if TYPE_CHECKING:
-    from vllm.v1.core.sched.output import SchedulerOutput
-
 logger = init_logger(__name__)
 
-# Import Rust extensions
+# ============================================================================
+# Module-level patching for Metal (must happen before importing GPUModelRunner)
+# ============================================================================
+
+
+def _patched_bincount_metal(
+    prefill_token_ids: torch.Tensor,
+    prefill_len: int,
+    prompt_len: int,
+    prompt_bin_mask: torch.Tensor,
+    output_bin_counts: torch.Tensor,
+) -> None:
+    """PyTorch-based bincount replacement for Metal (no Triton)."""
+    prompt_bin_mask.zero_()
+    output_bin_counts.zero_()
+
+    # Get the tokens in the range [prompt_len, prefill_len)
+    if prefill_len > prompt_len:
+        tokens = prefill_token_ids[prompt_len:prefill_len]
+        # Use PyTorch's bincount
+        # Move to CPU for bincount if needed, then copy back
+        tokens_cpu = tokens.cpu().to(torch.int64)
+        vocab_size = output_bin_counts.shape[0]
+        counts = torch.bincount(tokens_cpu, minlength=vocab_size)
+        # Copy counts to output (truncate if vocab sizes differ)
+        min_len = min(len(counts), vocab_size)
+        output_bin_counts[:min_len] = counts[:min_len].to(output_bin_counts.device)
+
+    # Set prompt_bin_mask for tokens in [0, prompt_len)
+    if prompt_len > 0:
+        prompt_tokens = prefill_token_ids[:prompt_len]
+        prompt_tokens_cpu = prompt_tokens.cpu().to(torch.int64)
+        vocab_size = prompt_bin_mask.shape[0]
+        # Create a mask indicating which tokens appeared in the prompt
+        for token in prompt_tokens_cpu:
+            if 0 <= token < vocab_size:
+                prompt_bin_mask[token] = 1
+
+
+# Patch bincount BEFORE any vLLM modules that use it are imported
+# This is critical because states.py imports bincount at module load time
 try:
-    from vllm_metal_rust import (
-        BatchStateManager,
-        BlockTableManager,
-        MetalBuffer,
+    import vllm.v1.worker.gpu.sample.penalties as penalties_module
+
+    penalties_module.bincount = _patched_bincount_metal
+    logger.debug("Patched penalties_module.bincount for Metal")
+except ImportError:
+    pass
+
+# Patch input_batch functions BEFORE importing GPUModelRunner
+# These functions use Triton kernels which are not available on Metal
+try:
+    import vllm.v1.worker.gpu.input_batch as input_batch_module
+
+    from vllm_metal.v2.input_batch import (
+        combine_sampled_and_draft_tokens,
+        post_update,
+        prepare_pos_seq_lens,
+        prepare_prefill_inputs,
     )
 
-    RUST_METAL_AVAILABLE = True
-    logger.info("Rust Metal V2 extensions loaded")
+    input_batch_module.prepare_prefill_inputs = prepare_prefill_inputs
+    input_batch_module.prepare_pos_seq_lens = prepare_pos_seq_lens
+    input_batch_module.combine_sampled_and_draft_tokens = (
+        combine_sampled_and_draft_tokens
+    )
+    input_batch_module.post_update = post_update
+    logger.debug("Patched input_batch module functions for Metal")
 except ImportError as e:
-    RUST_METAL_AVAILABLE = False
-    MetalBuffer = None
-    BatchStateManager = None  # type: ignore[misc, assignment]
-    BlockTableManager = None  # type: ignore[misc, assignment]
+    logger.warning(f"Failed to patch input_batch module: {e}")
+
+# Patch penalties module - uses Triton kernels for temperature and penalties
+try:
+    import vllm.v1.worker.gpu.sample.penalties as penalties_module
+
+    from vllm_metal.v2.penalties import apply_penalties_and_temperature
+
+    penalties_module.apply_penalties_and_temperature = apply_penalties_and_temperature
+    logger.debug("Patched penalties_module.apply_penalties_and_temperature for Metal")
+except ImportError as e:
+    logger.warning(f"Failed to patch penalties module: {e}")
+
+# Patch gumbel module - uses Triton kernel for gumbel sampling
+try:
+    import vllm.v1.worker.gpu.sample.gumbel as gumbel_module
+
+    from vllm_metal.v2.gumbel import gumbel_sample
+
+    gumbel_module.gumbel_sample = gumbel_sample
+    logger.debug("Patched gumbel_module.gumbel_sample for Metal")
+except ImportError as e:
+    logger.warning(f"Failed to patch gumbel module: {e}")
+
+# Patch async_utils module - uses CUDA streams for async copies
+try:
+    import vllm.v1.worker.gpu.async_utils as async_utils_module
+
+    from vllm_metal.v2.async_utils import MetalAsyncOutput
+
+    async_utils_module.AsyncOutput = MetalAsyncOutput
+    logger.debug("Patched async_utils_module.AsyncOutput for Metal")
+except ImportError as e:
+    logger.warning(f"Failed to patch async_utils module: {e}")
+
+# Now import the rest of vLLM modules (they will get our patched functions)
+# These must be imported after the patches above, hence E402
+from vllm.model_executor.model_loader import get_model  # noqa: E402
+from vllm.v1.kv_cache_interface import KVCacheConfig  # noqa: E402
+from vllm.v1.utils import CpuGpuBuffer  # noqa: E402
+from vllm.v1.worker.gpu.attn_utils import (  # noqa: E402
+    init_attn_backend,
+    init_kv_cache,
+)
+from vllm.v1.worker.gpu.model_runner import GPUModelRunner  # noqa: E402
+
+# Use our Metal-compatible BlockTables instead of the Triton-based one
+from vllm_metal.v2.block_table import MetalBlockTables as BlockTables  # noqa: E402
+
+# Also patch states module's bincount reference (imported before we could patch)
+try:
+    import vllm.v1.worker.gpu.states as states_module
+
+    states_module.bincount = _patched_bincount_metal
+    logger.debug("Patched states_module.bincount for Metal")
+except (ImportError, AttributeError):
+    pass
+
+# Check for Rust Metal extensions availability
+try:
+    import vllm_metal_rust  # noqa: F401
+
+    RUST_AVAILABLE = True
+except ImportError as e:
+    RUST_AVAILABLE = False
     logger.warning(f"Rust Metal V2 extensions not available: {e}")
 
 
-class MetalModelRunner:
-    """Metal Model Runner V2 with custom Metal kernels.
+class MetalModelRunner(GPUModelRunner):
+    """Metal/MPS model runner that extends the GPU model runner.
 
-    This runner uses Rust-based Metal kernels for maximum performance on Apple Silicon.
-    It maintains compatibility with vLLM's model runner interface while using
-    custom Metal kernels for attention and other critical operations.
+    This class inherits all the complex input batch management, attention
+    metadata building, and model execution from GPUModelRunner. It only
+    overrides Metal-specific functionality like:
+    - Disabling CUDA-specific features (pinned memory, CUDA graphs)
+    - Using MPS synchronization instead of CUDA
+    - Metal-specific device handling
     """
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
-        assert device.type == "mps", (
-            f"MetalModelRunner requires Metal device (mps), got {device}"
-        )
+        # Use the CUDA wrapper to prevent CUDA stream/event creation during init
+        with _torch_cuda_wrapper():
+            super().__init__(vllm_config, device)
 
-        self.vllm_config = vllm_config
-        self.device = device
-        self.model_config = vllm_config.model_config
-        self.cache_config = vllm_config.cache_config
-        self.scheduler_config = vllm_config.scheduler_config
-        self.parallel_config = vllm_config.parallel_config
-        self.lora_config = vllm_config.lora_config
+        # Override CUDA-specific settings
+        self.pin_memory = False  # Metal uses unified memory
+        self.use_cuda_graph = False
+        self.cascade_attn_enabled = False
 
-        # Model parameters
-        self.hidden_size = self.model_config.get_hidden_size()
-        self.num_heads = self.model_config.get_num_attention_heads(self.parallel_config)
-        self.num_kv_heads = self.model_config.get_num_kv_heads(self.parallel_config)
-        self.head_dim = self.hidden_size // self.num_heads
-        self.block_size = self.cache_config.block_size
+        # Replace GPU tensors with MPS equivalents
+        self._postprocess_tensors()
 
-        # GQA ratio
-        self.gqa_ratio = self.num_heads // self.num_kv_heads if self.num_kv_heads > 0 else 1
-
-        # Initialize Rust managers if available
-        if RUST_METAL_AVAILABLE:
-            max_num_reqs = self.scheduler_config.max_num_seqs
-            max_model_len = self.model_config.max_model_len
-            max_num_blocks = (max_model_len + self.block_size - 1) // self.block_size
-
-            self._batch_state = BatchStateManager(
-                max_num_reqs=max_num_reqs,
-                max_model_len=max_model_len,
-                block_size=self.block_size,
-                max_num_blocks_per_req=max_num_blocks,
-            )
-
-            self._block_table = BlockTableManager(
-                num_kv_cache_groups=1,
-                block_size=self.block_size,
-                max_num_reqs=max_num_reqs,
-                max_num_blocks_per_req=max_num_blocks,
-            )
-        else:
-            self._batch_state = None
-            self._block_table = None
-
-        # Model will be loaded later
-        self.model: nn.Module | None = None
-
-        # Memory tracking
-        self.model_memory_usage: int = 0
-
-        # KV cache
-        self.kv_caches: list[torch.Tensor] = []
-
-        # Statistics
-        self._decode_count = 0
-        self._prefill_count = 0
-
-        # Pooling model flag
-        self.is_pooling_model = False
-
-        # Attention groups for warmup (empty for Metal)
-        self.attn_groups: list = []
-
+        # Log initialization
         logger.info(
             f"MetalModelRunner V2 initialized: "
-            f"hidden_size={self.hidden_size}, "
-            f"num_heads={self.num_heads}, "
-            f"num_kv_heads={self.num_kv_heads}, "
-            f"head_dim={self.head_dim}, "
-            f"block_size={self.block_size}, "
-            f"rust_available={RUST_METAL_AVAILABLE}"
+            f"hidden_size={self.model_config.get_hidden_size()}, "
+            f"num_heads={self.model_config.get_num_attention_heads(self.parallel_config)}, "
+            f"num_kv_heads={self.model_config.get_num_kv_heads(self.parallel_config)}, "
+            f"head_dim={self.model_config.get_head_size()}, "
+            f"block_size={self.cache_config.block_size}, "
+            f"rust_available={RUST_AVAILABLE}"
         )
 
-    def load_model(self, eep_scale_up: bool = False) -> nn.Module:
-        """Load the model onto the Metal device."""
-        from vllm.model_executor.model_loader import get_model
+    def _postprocess_tensors(self) -> None:
+        """Replace GPU tensors with device tensors for Metal."""
+        # For Metal, we don't need separate CPU and GPU buffers
+        # since MPS uses unified memory
+        for v in vars(self).values():
+            if isinstance(v, CpuGpuBuffer):
+                # For unified memory, gpu buffer can point to cpu buffer
+                v.gpu = v.cpu
 
-        self.model = get_model(
-            vllm_config=self.vllm_config,
-        )
+    def _sync_device(self) -> None:
+        """Synchronize the MPS device instead of CUDA."""
+        torch.mps.synchronize()
 
-        # Move to Metal device
-        self.model = self.model.to(self.device)
+    def load_model(self, *args, **kwargs) -> None:
+        """Load the model to the MPS device."""
+        logger.info("Starting to load model %s...", self.model_config.model)
+        self.model = get_model(vllm_config=self.vllm_config)
 
-        # Calculate model memory usage
-        self.model_memory_usage = sum(
-            p.numel() * p.element_size() for p in self.model.parameters()
-        )
-
-        # Verify
-        try:
-            first_param = next(iter(self.model.parameters()))
-            logger.info(
-                f"Model loaded on device: {first_param.device}, "
-                f"memory: {self.model_memory_usage / 1e9:.2f}GB"
+        if self.lora_config:
+            self.model = self.load_lora_model(
+                self.model,
+                self.vllm_config,
+                self.device,
             )
-        except StopIteration:
-            logger.warning("Model has no parameters")
 
+        # Ensure model is on MPS
+        if self.model is not None:
+            memory_gb = torch.mps.current_allocated_memory() / 1e9
+            logger.info(
+                f"Model loaded on device: {self.device}, memory: {memory_gb:.2f}GB"
+            )
+
+    def get_model(self) -> nn.Module:
         return self.model
 
-    def update_config(self, overrides: dict) -> None:
-        """Update configuration with overrides."""
-        pass
+    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        """Initialize KV cache for Metal backend.
 
-    def reload_weights(self) -> None:
-        """Reload model weights."""
-        pass
-
-    def maybe_remove_all_loras(self, lora_config) -> None:
-        """Remove all LoRA adapters if needed.
-
-        Metal doesn't support LoRA, so this is a no-op.
+        Override to skip the FLASH_ATTN check that would fail for Metal backend.
         """
-        pass
-
-    def compile_or_warm_up_model(self) -> None:
-        """Compile or warm up the model.
-
-        For Metal with eager mode, this just does a warmup forward pass.
-        """
-        if self.model is not None:
-            logger.info("Warming up Metal model...")
-            # Run a dummy forward pass to warm up Metal
-            dummy_input = torch.randint(
-                0, 100, (1, 16), dtype=torch.long, device=self.device
-            )
-            with torch.no_grad():
-                _ = self.model(dummy_input)
-            torch.mps.synchronize()
-            logger.info("Metal model warmup complete")
-
-    def initialize_kv_cache(self, kv_cache_config) -> None:
-        """Initialize KV cache based on kv_cache_config.
-
-        Args:
-            kv_cache_config: Configuration for the KV cache
-        """
-        from copy import deepcopy
-
-        self.kv_cache_config = deepcopy(kv_cache_config)
-
-        # Total number of blocks (shared across all groups)
-        num_blocks = kv_cache_config.num_blocks
-
-        # Create KV cache tensors for each cache group
-        self.kv_caches = []
-
-        for group_spec in kv_cache_config.kv_cache_groups:
-            kv_cache_spec = group_spec.kv_cache_spec
-
-            # Create KV cache tensor
-            # Shape: [num_blocks, 2, block_size, num_kv_heads, head_size]
-            kv_cache = torch.zeros(
-                num_blocks,
-                2,  # key and value
-                kv_cache_spec.block_size,
-                kv_cache_spec.num_kv_heads,
-                kv_cache_spec.head_size,
-                dtype=kv_cache_spec.dtype,
-                device=self.device,
-            )
-            self.kv_caches.append(kv_cache)
+        kv_cache_config = deepcopy(kv_cache_config)
+        self.kv_cache_config = kv_cache_config
+        block_sizes = [
+            kv_cache_group.kv_cache_spec.block_size
+            for kv_cache_group in kv_cache_config.kv_cache_groups
+        ]
 
         logger.info(
-            f"Initialized {len(self.kv_caches)} KV cache group(s) with "
-            f"{num_blocks} blocks on Metal"
+            f"Creating BlockTables using class: {BlockTables.__module__}.{BlockTables.__name__}"
+        )
+        self.block_tables = BlockTables(
+            block_sizes=block_sizes,
+            max_num_reqs=self.max_num_reqs,
+            max_num_batched_tokens=self.max_num_tokens,
+            max_model_len=self.max_model_len,
+            device=self.device,
+            pin_memory=self.pin_memory,
+        )
+        logger.info(
+            f"BlockTables created: {type(self.block_tables).__module__}.{type(self.block_tables).__name__}"
         )
 
-    def get_kv_cache_spec(self) -> dict:
-        """Get the KV cache specification for the model.
-
-        Returns:
-            Dictionary mapping layer names to their KV cache specs.
-        """
-        from vllm.attention.layer import Attention
-        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-        from vllm.config.vllm import get_layers_from_vllm_config
-        from typing import cast, Any
-
-        kv_cache_spec: dict = {}
-        self.shared_kv_cache_layers: dict[str, str] = {}
-
-        layer_type = cast(type[Any], AttentionLayerBase)
-        attn_layers = get_layers_from_vllm_config(self.vllm_config, layer_type)
-
-        for layer_name, attn_module in attn_layers.items():
-            if isinstance(attn_module, Attention):
-                kv_tgt_layer = getattr(attn_module, 'kv_sharing_target_layer_name', None)
-                if kv_tgt_layer:
-                    self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
-                    continue
-
-            # Get the KV cache spec from the attention module
-            if hasattr(attn_module, 'get_kv_cache_spec'):
-                spec = attn_module.get_kv_cache_spec(self.vllm_config)
-                if spec is not None:
-                    kv_cache_spec[layer_name] = spec
-
-        return kv_cache_spec
-
-    def reset_mm_cache(self) -> None:
-        """Reset multimodal cache. Not used for Metal."""
-        pass
-
-    def ensure_kv_transfer_shutdown(self) -> None:
-        """Ensure KV transfer is shutdown. Not used for Metal."""
-        pass
-
-    def get_supported_tasks(self) -> set[str]:
-        """Get supported tasks. For causal LM, we support 'generate'."""
-        return {"generate"}
-
-    def get_model(self) -> nn.Module | None:
-        """Get the loaded model."""
-        return self.model
-
-    def execute_model(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> tuple[torch.Tensor, list[int]]:
-        """Execute model forward pass.
-
-        This is a simplified interface for the V2 runner.
-        For full vLLM integration, this would need to match
-        the GPUModelRunner interface more closely.
-        """
-        # For now, delegate to PyTorch for model forward
-        # The Metal kernels will be used for attention within the model
-        raise NotImplementedError(
-            "Full execute_model not yet implemented. "
-            "V2 runner requires further vLLM integration."
+        self.attn_backends, self.attn_metadata_builders = init_attn_backend(
+            self.kv_cache_config,
+            self.vllm_config,
+            self.device,
         )
-
-    def profile_run(self) -> None:
-        """Profile run for memory estimation."""
-        logger.info("Running Metal V2 profiling...")
-        # Run a dummy forward pass to warm up Metal
-        if self.model is not None:
-            # Create dummy input
-            dummy_input = torch.randint(
-                0, 1000, (1, 16), dtype=torch.long, device=self.device
+        if self.do_spec_decode:
+            # HACK(woosuk)
+            self.speculator.set_attn(
+                self.kv_cache_config,
+                self.attn_metadata_builders,
+                self.block_tables,
             )
-            with torch.no_grad():
-                _ = self.model(dummy_input)
-            torch.mps.synchronize()
-        logger.info("Metal V2 profiling complete")
+
+        # Skip the FLASH_ATTN check - Metal uses its own backend
+        # Metal backend is initialized via platform.get_attn_backend_cls()
+        for name, backend in self.attn_backends.items():
+            logger.info(f"Attention backend for '{name}': {backend.get_name()}")
+
+        self.kv_caches: list[torch.Tensor] = []
+        init_kv_cache(
+            self.kv_caches,
+            self.compilation_config.static_forward_context,
+            self.kv_cache_config,
+            self.attn_backends,
+            self.device,
+        )
+        # Attention groups are not supported.
+        self.attn_groups = []  # type: ignore
+
+    def _maybe_get_cuda_graph_runner(self, *args, **kwargs):
+        """Metal does not support CUDA graphs - always return None."""
+        return None
 
     def capture_model(self) -> int:
-        """Capture model for graph execution.
-
-        Metal doesn't support CUDA graphs, so this is a no-op.
-        """
+        """Metal does not support CUDA graph capture."""
         logger.debug("Metal does not support graph capture, skipping")
         return 0
 
-    @property
-    def vocab_size(self) -> int:
-        """Get vocabulary size."""
-        return self.model_config.get_vocab_size()
+    def compile_or_warm_up_model(self) -> None:
+        """Warm up the model without CUDA graph compilation."""
+        logger.info("Warming up Metal model...")
+        torch.mps.synchronize()
+        logger.info("Metal model warmup complete")
+
+    @torch.inference_mode()
+    def profile_run(self) -> None:
+        """Run profiling - simplified for Metal."""
+        logger.info("Running Metal V2 profiling...")
+        torch.mps.synchronize()
+        logger.info("Metal V2 profiling complete")
+
+    def get_dp_padding(self, num_tokens: int) -> tuple[int, torch.Tensor | None]:
+        """Metal doesn't need DP padding."""
+        return 0, None
 
 
-def create_metal_v2_runner(
-    vllm_config: VllmConfig,
-    device: torch.device,
-) -> MetalModelRunner:
-    """Factory function to create a Metal V2 model runner."""
-    return MetalModelRunner(vllm_config, device)
+@contextmanager
+def _torch_cuda_wrapper():
+    """Context manager to mock CUDA stream/event during GPUModelRunner init.
+
+    GPUModelRunner creates torch.cuda.Stream and torch.cuda.Event objects
+    which fail on non-CUDA devices. This wrapper temporarily replaces them
+    with placeholder objects that do nothing.
+
+    Also patches:
+    - is_uva_available() to return True since Metal's unified memory is
+      semantically similar to CUDA UVA
+    - torch.zeros/torch.empty to strip pin_memory=True (not supported on MPS)
+    - UvaBuffer to use Metal unified memory instead of CUDA UVA
+    - get_cuda_view_from_cpu_tensor to return MPS tensor instead
+    """
+
+    class _EventPlaceholder:
+        def __init__(self, *args, **kwargs) -> None:
+            self.record = lambda *a, **kw: None
+            self.synchronize = lambda *a, **kw: None
+            self.wait = lambda *a, **kw: None
+
+    class _StreamPlaceholder:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def synchronize(self) -> None:
+            pass
+
+        def wait_event(self, *args, **kwargs) -> None:
+            pass
+
+        def wait_stream(self, *args, **kwargs) -> None:
+            pass
+
+    class _MetalUvaBuffer:
+        """Metal-compatible UvaBuffer using unified memory.
+
+        On Metal, CPU and GPU share the same memory, so we just create
+        a CPU tensor and use it directly (no need for pinned memory or
+        CUDA views).
+        """
+
+        def __init__(self, *size, dtype: torch.dtype):
+            # Create regular CPU tensor - Metal has unified memory
+            self.cpu = torch.zeros(*size, dtype=dtype, device="cpu")
+            self.np = self.cpu.numpy()
+            # For Metal, gpu points to an MPS view of the same data
+            # Since Metal has unified memory, the MPS tensor can access
+            # the same underlying memory
+            self.gpu = self.cpu.to("mps")
+
+    # Save original classes and functions
+    cuda_event = torch.cuda.Event
+    cuda_stream = torch.cuda.Stream
+    cuda_graph_pool_handle = torch.cuda.graph_pool_handle
+    torch_event = getattr(torch, "Event", None)
+
+    # Save original torch.zeros and torch.empty
+    original_zeros = torch.zeros
+    original_empty = torch.empty
+
+    def _patched_zeros(*args, **kwargs):
+        # Strip pin_memory on MPS - it's not supported
+        kwargs.pop("pin_memory", None)
+        return original_zeros(*args, **kwargs)
+
+    def _patched_empty(*args, **kwargs):
+        # Strip pin_memory on MPS - it's not supported
+        kwargs.pop("pin_memory", None)
+        return original_empty(*args, **kwargs)
+
+    # Patch is_uva_available and is_pin_memory_available
+    import vllm.utils.platform_utils as platform_utils
+
+    original_is_uva_available = platform_utils.is_uva_available
+    original_is_pin_memory_available = platform_utils.is_pin_memory_available
+
+    # Patch UvaBuffer from vllm.v1.worker.gpu.states
+    import vllm.v1.worker.gpu.states as states_module
+
+    original_uva_buffer = states_module.UvaBuffer
+    # Note: bincount is patched at module level, not here
+
+    # Patch get_cuda_view_from_cpu_tensor
+    import vllm.utils.torch_utils as torch_utils_module
+
+    original_get_cuda_view = torch_utils_module.get_cuda_view_from_cpu_tensor
+
+    def _patched_get_cuda_view(cpu_tensor: torch.Tensor) -> torch.Tensor:
+        # For Metal, just return an MPS view of the tensor
+        return cpu_tensor.to("mps")
+
+    # Note: bincount is patched at module level via _patched_bincount_metal
+
+    # Clear the cache to ensure our patched function is used
+    if hasattr(platform_utils.is_uva_available, "cache_clear"):
+        platform_utils.is_uva_available.cache_clear()
+    if hasattr(platform_utils.is_pin_memory_available, "cache_clear"):
+        platform_utils.is_pin_memory_available.cache_clear()
+
+    try:
+        # Replace with placeholders
+        torch.cuda.Event = _EventPlaceholder
+        torch.cuda.Stream = _StreamPlaceholder
+        torch.cuda.graph_pool_handle = lambda: None  # type: ignore[return-value]
+        if torch_event is not None:
+            torch.Event = _EventPlaceholder
+
+        # Patch torch.zeros and torch.empty to strip pin_memory
+        torch.zeros = _patched_zeros
+        torch.empty = _patched_empty
+
+        # Metal unified memory acts like UVA
+        platform_utils.is_uva_available = lambda: True
+        platform_utils.is_pin_memory_available = lambda: True
+
+        # Replace UvaBuffer with Metal-compatible version
+        states_module.UvaBuffer = _MetalUvaBuffer
+
+        # Replace get_cuda_view_from_cpu_tensor
+        torch_utils_module.get_cuda_view_from_cpu_tensor = _patched_get_cuda_view
+
+        # bincount is already patched at module level
+
+        yield
+    finally:
+        # Restore original classes
+        torch.cuda.Event = cuda_event
+        torch.cuda.Stream = cuda_stream
+        torch.cuda.graph_pool_handle = cuda_graph_pool_handle
+        if torch_event is not None:
+            torch.Event = torch_event
+
+        # Restore original torch.zeros and torch.empty
+        torch.zeros = original_zeros
+        torch.empty = original_empty
+
+        # Restore original functions
+        platform_utils.is_uva_available = original_is_uva_available
+        platform_utils.is_pin_memory_available = original_is_pin_memory_available
+
+        # Restore UvaBuffer
+        states_module.UvaBuffer = original_uva_buffer
+
+        # Restore get_cuda_view_from_cpu_tensor
+        torch_utils_module.get_cuda_view_from_cpu_tensor = original_get_cuda_view
+
+        # Note: bincount stays patched (patched at module level)
+
+        # Clear the cache again
+        if hasattr(platform_utils.is_uva_available, "cache_clear"):
+            platform_utils.is_uva_available.cache_clear()
+        if hasattr(platform_utils.is_pin_memory_available, "cache_clear"):
+            platform_utils.is_pin_memory_available.cache_clear()

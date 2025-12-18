@@ -2,10 +2,10 @@
 """Metal V1 Worker implementation for vLLM."""
 
 import gc
-from typing import TYPE_CHECKING, Any
+from contextlib import AbstractContextManager, nullcontext
+from typing import TYPE_CHECKING
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -97,7 +97,8 @@ class MetalWorker(Worker):
         init_distributed_environment(
             world_size=1,
             rank=0,
-            distributed_init_method=self.distributed_init_method or "tcp://127.0.0.1:12345",
+            distributed_init_method=self.distributed_init_method
+            or "tcp://127.0.0.1:12345",
             local_rank=0,
             backend="gloo",
         )
@@ -138,13 +139,11 @@ class MetalWorker(Worker):
     def compile_or_warm_up_model(self) -> None:
         """Compile or warm up the model.
 
-        For Metal with eager mode, we skip complex warmup.
-        Metal/MPS handles memory management differently from CUDA.
+        Metal uses custom Rust kernels, no graph compilation needed.
         """
         # Skip LoRA handling - not supported on Metal
-        # Skip kernel warmup - not needed for Metal eager mode
         # Skip cuda graph capture - not supported on Metal
-        logger.info("Metal warmup: skipping (eager mode, no compilation needed)")
+        logger.info("Metal warmup: using Rust Metal kernels")
 
     def sleep(self, level: int = 1) -> None:
         """Sleep mode - clear Metal cache."""
@@ -175,3 +174,16 @@ class MetalWorker(Worker):
         )
 
         return available
+
+    def _maybe_get_memory_pool_context(self, tag: str) -> AbstractContextManager:
+        """Metal doesn't use CUDA memory pools, return no-op context."""
+        return nullcontext()
+
+    def load_model(self) -> None:
+        """Load the model onto the Metal device.
+
+        Overrides the parent to avoid CUDA-specific memory pool handling.
+        """
+        logger.info("Loading model on Metal device...")
+        self.model_runner.load_model()
+        logger.info("Model loaded successfully on Metal device")

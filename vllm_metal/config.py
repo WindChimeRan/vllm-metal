@@ -60,9 +60,9 @@ class MetalConfig:
                 f"memory_fraction must be between 0 and 1, got {self.memory_fraction}"
             )
 
-        if self.attention_backend not in ("metal", "eager"):
+        if self.attention_backend != "metal":
             raise ValueError(
-                f"attention_backend must be 'metal' or 'eager', "
+                f"attention_backend must be 'metal' (Rust kernels), "
                 f"got {self.attention_backend}"
             )
 

@@ -16,13 +16,13 @@ class TestMetalPlatform:
         assert MetalPlatform._enum == PlatformEnum.OOT
 
     def test_device_name(self):
-        """Test device name is 'metal'."""
-        assert MetalPlatform.device_name == "metal"
-        assert MetalPlatform.device_type == "metal"
+        """Test device name is 'mps' (PyTorch Metal device)."""
+        assert MetalPlatform.device_name == "mps"
+        assert MetalPlatform.device_type == "mps"
 
     def test_dispatch_key(self):
-        """Test dispatch key."""
-        assert MetalPlatform.dispatch_key == "METAL"
+        """Test dispatch key is 'MPS' (PyTorch dispatch key)."""
+        assert MetalPlatform.dispatch_key == "MPS"
 
     def test_supported_quantization(self):
         """Test supported quantization methods."""
@@ -162,9 +162,9 @@ class TestMetalPlatform:
             kv_cache_dtype="auto",
             block_size=16,
             use_mla=False,
-            use_v1=True,
             has_sink=False,
             use_sparse=False,
+            attn_type=None,
         )
         assert cls == "vllm_metal.attention.backend.MetalAttentionBackend"
 

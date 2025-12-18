@@ -5,8 +5,11 @@ import pytest
 import torch
 from torch.nn import functional
 
-from vllm_metal.attention.backend import MetalAttentionBackend, MetalAttentionMetadata
-from vllm_metal.attention.metal_attention import MetalAttentionImpl
+from vllm_metal.attention.backend import (
+    MetalAttentionBackend,
+    MetalAttentionImpl,
+    MetalAttentionMetadata,
+)
 
 
 class TestMetalAttentionBackend:
@@ -19,12 +22,12 @@ class TestMetalAttentionBackend:
     def test_get_impl_cls(self):
         """Test getting implementation class."""
         impl_cls = MetalAttentionBackend.get_impl_cls()
-        assert impl_cls == MetalAttentionImpl
+        assert impl_cls is MetalAttentionImpl
 
     def test_get_metadata_cls(self):
         """Test getting metadata class."""
         meta_cls = MetalAttentionBackend.get_metadata_cls()
-        assert meta_cls == MetalAttentionMetadata
+        assert meta_cls is MetalAttentionMetadata
 
     def test_get_kv_cache_shape(self):
         """Test KV cache shape calculation."""
@@ -49,44 +52,59 @@ class TestMetalAttentionBackend:
 
 
 class TestMetalAttentionMetadata:
-    """Tests for MetalAttentionMetadata."""
+    """Tests for MetalAttentionMetadata (V1 API)."""
 
-    def test_empty_metadata(self):
-        """Test creating empty metadata."""
-        meta = MetalAttentionMetadata()
-
-        assert meta.num_prefill_tokens == 0
-        assert meta.num_decode_tokens == 0
-        assert meta.num_prefills == 0
-
-    def test_prefill_metadata_property(self):
-        """Test prefill metadata extraction."""
+    def test_metadata_creation(self, metal_device):
+        """Test creating metadata with V1 parameters."""
+        seq_len = 16
         meta = MetalAttentionMetadata(
-            seq_lens=[10, 15],
-            num_prefill_tokens=25,
-            num_decode_tokens=0,
-            num_prefills=2,
-            is_prompt=True,
+            num_actual_tokens=seq_len,
+            max_query_len=seq_len,
+            query_start_loc=torch.tensor([0, seq_len], device=metal_device),
+            max_seq_len=seq_len,
+            seq_lens=torch.tensor([seq_len], device=metal_device),
+            block_table=torch.zeros((1, 1), dtype=torch.int32, device=metal_device),
+            slot_mapping=torch.arange(seq_len, device=metal_device),
         )
 
-        prefill_meta = meta.prefill_metadata
-        assert prefill_meta is not None
-        assert prefill_meta.num_prefill_tokens == 25
-        assert prefill_meta.is_prompt is True
+        assert meta.num_actual_tokens == seq_len
+        assert meta.max_query_len == seq_len
+        assert meta.max_seq_len == seq_len
+        assert meta.use_cascade is False
 
-    def test_decode_metadata_property(self):
-        """Test decode metadata extraction."""
+    def test_prefill_metadata(self, metal_device):
+        """Test metadata for prefill (query_len > 1)."""
+        seq_len = 32
         meta = MetalAttentionMetadata(
-            num_prefill_tokens=0,
-            num_decode_tokens=4,
-            num_prefills=0,
-            is_prompt=False,
+            num_actual_tokens=seq_len,
+            max_query_len=seq_len,
+            query_start_loc=torch.tensor([0, seq_len], device=metal_device),
+            max_seq_len=seq_len,
+            seq_lens=torch.tensor([seq_len], device=metal_device),
+            block_table=torch.zeros((1, 2), dtype=torch.int32, device=metal_device),
+            slot_mapping=torch.arange(seq_len, device=metal_device),
         )
 
-        decode_meta = meta.decode_metadata
-        assert decode_meta is not None
-        assert decode_meta.num_decode_tokens == 4
-        assert decode_meta.is_prompt is False
+        # Prefill is when max_query_len > 1
+        assert meta.max_query_len > 1
+
+    def test_decode_metadata(self, metal_device):
+        """Test metadata for decode (query_len == 1)."""
+        batch_size = 4
+        meta = MetalAttentionMetadata(
+            num_actual_tokens=batch_size,
+            max_query_len=1,  # Decode has query_len of 1
+            query_start_loc=torch.arange(batch_size + 1, device=metal_device),
+            max_seq_len=100,
+            seq_lens=torch.full((batch_size,), 100, device=metal_device),
+            block_table=torch.zeros(
+                (batch_size, 7), dtype=torch.int32, device=metal_device
+            ),
+            slot_mapping=torch.arange(batch_size, device=metal_device),
+        )
+
+        # Decode is when max_query_len == 1
+        assert meta.max_query_len == 1
 
 
 class TestMetalAttentionImpl:
@@ -127,14 +145,17 @@ class TestMetalAttentionImpl:
         )
 
         metadata = MetalAttentionMetadata(
-            seq_lens=[seq_len],
-            num_prefill_tokens=seq_len,
-            num_decode_tokens=0,
-            num_prefills=1,
-            is_prompt=True,
+            num_actual_tokens=seq_len,
+            max_query_len=seq_len,
+            query_start_loc=torch.tensor([0, seq_len], device=metal_device),
+            max_seq_len=seq_len,
+            seq_lens=torch.tensor([seq_len], device=metal_device),
+            block_table=torch.zeros((1, 1), dtype=torch.int32, device=metal_device),
+            slot_mapping=torch.arange(seq_len, device=metal_device),
         )
 
         output = attention_impl.forward(
+            layer=None,  # Not used in Metal impl
             query=query,
             key=key,
             value=value,
@@ -170,14 +191,17 @@ class TestMetalAttentionImpl:
         )
 
         metadata = MetalAttentionMetadata(
-            seq_lens=[seq_len],
-            num_prefill_tokens=seq_len,
-            num_decode_tokens=0,
-            num_prefills=1,
-            is_prompt=True,
+            num_actual_tokens=seq_len,
+            max_query_len=seq_len,
+            query_start_loc=torch.tensor([0, seq_len], device=metal_device),
+            max_seq_len=seq_len,
+            seq_lens=torch.tensor([seq_len], device=metal_device),
+            block_table=torch.zeros((1, 1), dtype=torch.int32, device=metal_device),
+            slot_mapping=torch.arange(seq_len, device=metal_device),
         )
 
         output = impl.forward(
+            layer=None,  # Not used in Metal impl
             query=query,
             key=key,
             value=value,
@@ -216,15 +240,18 @@ class TestAttentionCorrectness:
         )
 
         metadata = MetalAttentionMetadata(
-            seq_lens=[seq_len],
-            num_prefill_tokens=seq_len,
-            num_decode_tokens=0,
-            num_prefills=1,
-            is_prompt=True,
+            num_actual_tokens=seq_len,
+            max_query_len=seq_len,
+            query_start_loc=torch.tensor([0, seq_len], device=metal_device),
+            max_seq_len=seq_len,
+            seq_lens=torch.tensor([seq_len], device=metal_device),
+            block_table=torch.zeros((1, 1), dtype=torch.int32, device=metal_device),
+            slot_mapping=torch.arange(seq_len, device=metal_device),
         )
 
         # Our implementation
         output = impl.forward(
+            layer=None,  # Not used in Metal impl
             query=query,
             key=key,
             value=value,

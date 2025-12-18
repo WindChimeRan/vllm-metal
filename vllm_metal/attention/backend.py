@@ -1,258 +1,334 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Metal attention backend for vLLM."""
+"""Metal attention backend for vLLM V1 architecture."""
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import ClassVar
 
 import torch
-
-from vllm_metal._compat import (
+import torch.nn.functional as nnf  # noqa: N812
+from vllm.attention.backends.abstract import (
     AttentionBackend,
     AttentionImpl,
-    AttentionMetadata,
-    AttentionMetadataBuilder,
-    init_logger,
+    AttentionType,
 )
-
-if TYPE_CHECKING:
-    pass
+from vllm.config import VllmConfig
+from vllm.logger import init_logger
+from vllm.v1.attention.backends.utils import (
+    AttentionCGSupport,
+    AttentionMetadataBuilder,
+    CommonAttentionMetadata,
+)
+from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
 
 @dataclass
-class MetalAttentionMetadata(AttentionMetadata):
-    """Metadata for Metal attention operations.
+class MetalAttentionMetadata:
+    """V1 attention metadata for Metal backend.
 
-    This class stores the metadata needed for attention computation
-    on Apple Metal backend.
+    Follows the same pattern as TritonAttentionMetadata.
     """
 
-    # Sequence lengths for prefill
-    seq_lens: list[int] | None = None
-    # Sequence lengths as tensor
-    seq_lens_tensor: torch.Tensor | None = None
-    # Maximum sequence length in prefill
-    max_prefill_seq_len: int = 0
-    # Maximum sequence length in decode
-    max_decode_seq_len: int = 0
+    num_actual_tokens: int
+    max_query_len: int
+    query_start_loc: torch.Tensor
+    max_seq_len: int
+    seq_lens: torch.Tensor
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
 
-    # Number of prefill tokens
-    num_prefill_tokens: int = 0
-    # Number of decode tokens
-    num_decode_tokens: int = 0
+    # For cascade attention (prefix sharing)
+    use_cascade: bool = False
+    common_prefix_len: int = 0
 
-    # Number of prefill sequences
-    num_prefills: int = 0
 
-    # Block tables for paged attention
-    block_tables: torch.Tensor | None = None
+class MetalAttentionMetadataBuilder(AttentionMetadataBuilder[MetalAttentionMetadata]):
+    """V1 builder for Metal attention metadata."""
 
-    # Slot mapping for KV cache
-    slot_mapping: torch.Tensor | None = None
+    # Metal does not support CUDA graphs
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
 
-    # Context lengths for each sequence
-    context_lens_tensor: torch.Tensor | None = None
+    def __init__(
+        self,
+        kv_cache_spec: AttentionSpec,
+        layer_names: list[str],
+        vllm_config: VllmConfig,
+        device: torch.device,
+    ):
+        super().__init__(kv_cache_spec, layer_names, vllm_config, device)
 
-    # Query start locations for variable-length attention
-    query_start_loc: torch.Tensor | None = None
-
-    # Sequence start locations
-    seq_start_loc: torch.Tensor | None = None
-
-    # Attention mask for prefill (optional, for eager attention)
-    attn_mask: torch.Tensor | None = None
-
-    # Whether we're in prefill phase
-    is_prompt: bool = False
-
-    @property
-    def prefill_metadata(self) -> Optional["MetalAttentionMetadata"]:
-        """Get metadata for prefill phase."""
-        if self.num_prefill_tokens == 0:
-            return None
-
-        return MetalAttentionMetadata(
-            seq_lens=self.seq_lens,
-            seq_lens_tensor=self.seq_lens_tensor,
-            max_prefill_seq_len=self.max_prefill_seq_len,
-            max_decode_seq_len=0,
-            num_prefill_tokens=self.num_prefill_tokens,
-            num_decode_tokens=0,
-            num_prefills=self.num_prefills,
-            block_tables=None,
-            slot_mapping=self.slot_mapping[: self.num_prefill_tokens]
-            if self.slot_mapping is not None
-            else None,
-            context_lens_tensor=None,
-            query_start_loc=self.query_start_loc,
-            seq_start_loc=self.seq_start_loc,
-            attn_mask=self.attn_mask,
-            is_prompt=True,
+        self.block_size = kv_cache_spec.block_size
+        model_config = vllm_config.model_config
+        self.num_heads_q = model_config.get_num_attention_heads(
+            vllm_config.parallel_config
         )
-
-    @property
-    def decode_metadata(self) -> Optional["MetalAttentionMetadata"]:
-        """Get metadata for decode phase."""
-        if self.num_decode_tokens == 0:
-            return None
-
-        return MetalAttentionMetadata(
-            seq_lens=None,
-            seq_lens_tensor=None,
-            max_prefill_seq_len=0,
-            max_decode_seq_len=self.max_decode_seq_len,
-            num_prefill_tokens=0,
-            num_decode_tokens=self.num_decode_tokens,
-            num_prefills=0,
-            block_tables=self.block_tables,
-            slot_mapping=self.slot_mapping[self.num_prefill_tokens :]
-            if self.slot_mapping is not None
-            else None,
-            context_lens_tensor=self.context_lens_tensor,
-            query_start_loc=None,
-            seq_start_loc=None,
-            attn_mask=None,
-            is_prompt=False,
-        )
-
-
-class MetalAttentionMetadataBuilder(AttentionMetadataBuilder):
-    """Builder for Metal attention metadata."""
-
-    def __init__(self, input_builder, runner, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.input_builder = input_builder
-        self.runner = runner
-        self.slot_mapping: list[int] = []
-        self.prefill_seq_lens: list[int] = []
-        self.context_lens: list[int] = []
-        self.block_tables: list[list[int]] = []
-        self.num_prefills = 0
-        self.num_prefill_tokens = 0
-        self.num_decode_tokens = 0
-
-    def __call__(self, seq_group_metadata, seq_lens, query_lens, *args, **kwargs):
-        """Process a sequence group."""
-        is_prompt = seq_group_metadata.is_prompt
-        block_tables = seq_group_metadata.block_tables
-
-        for i, seq_id in enumerate(seq_group_metadata.seq_data):
-            seq_len = seq_lens[i]
-            query_len = query_lens[i]
-            context_len = seq_len - query_len
-
-            if is_prompt:
-                self.num_prefills += 1
-                self.num_prefill_tokens += query_len
-                self.prefill_seq_lens.append(seq_len)
-
-                # Compute slot mapping for prefill
-                if block_tables:
-                    block_table = block_tables[seq_id]
-                    for j in range(query_len):
-                        block_number = block_table[
-                            (context_len + j) // self.runner.block_size
-                        ]
-                        block_offset = (context_len + j) % self.runner.block_size
-                        slot = block_number * self.runner.block_size + block_offset
-                        self.slot_mapping.append(slot)
-            else:
-                self.num_decode_tokens += 1
-                self.context_lens.append(context_len)
-
-                if block_tables:
-                    block_table = block_tables[seq_id]
-                    self.block_tables.append(list(block_table))
-
-                    # Slot for single decode token
-                    block_number = block_table[context_len // self.runner.block_size]
-                    block_offset = context_len % self.runner.block_size
-                    slot = block_number * self.runner.block_size + block_offset
-                    self.slot_mapping.append(slot)
+        self.num_heads_kv = model_config.get_num_kv_heads(vllm_config.parallel_config)
+        self.head_dim = model_config.get_head_size()
 
     def build(
         self,
-        seq_lens: list[int],
-        query_lens: list[int],
-        cuda_graph_pad_size: int = 0,
-        batch_size: int = 0,
+        common_prefix_len: int,
+        common_attn_metadata: CommonAttentionMetadata,
+        fast_build: bool = False,
     ) -> MetalAttentionMetadata:
-        """Build the attention metadata."""
-        device = self.runner.device
-
-        slot_mapping_tensor = (
-            torch.tensor(self.slot_mapping, dtype=torch.long, device=device)
-            if self.slot_mapping
-            else None
-        )
-
-        seq_lens_tensor = (
-            torch.tensor(self.prefill_seq_lens, dtype=torch.int, device=device)
-            if self.prefill_seq_lens
-            else None
-        )
-
-        context_lens_tensor = (
-            torch.tensor(self.context_lens, dtype=torch.int, device=device)
-            if self.context_lens
-            else None
-        )
-
-        # Build block tables tensor
-        block_tables_tensor = None
-        if self.block_tables:
-            max_blocks = max(len(bt) for bt in self.block_tables)
-            padded_block_tables = [
-                bt + [0] * (max_blocks - len(bt)) for bt in self.block_tables
-            ]
-            block_tables_tensor = torch.tensor(
-                padded_block_tables, dtype=torch.int, device=device
-            )
-
-        # Compute query start locations
-        query_start_loc = None
-        if query_lens:
-            query_start_loc = torch.zeros(
-                len(query_lens) + 1, dtype=torch.int32, device=device
-            )
-            query_start_loc[1:] = torch.cumsum(
-                torch.tensor(query_lens, device=device), dim=0
-            )
-
-        # Compute sequence start locations
-        seq_start_loc = None
-        if self.prefill_seq_lens:
-            seq_start_loc = torch.zeros(
-                len(self.prefill_seq_lens) + 1, dtype=torch.int32, device=device
-            )
-            seq_start_loc[1:] = torch.cumsum(
-                torch.tensor(self.prefill_seq_lens, device=device), dim=0
-            )
-
+        """Build attention metadata from common metadata."""
         return MetalAttentionMetadata(
-            seq_lens=self.prefill_seq_lens if self.prefill_seq_lens else None,
-            seq_lens_tensor=seq_lens_tensor,
-            max_prefill_seq_len=max(self.prefill_seq_lens)
-            if self.prefill_seq_lens
-            else 0,
-            max_decode_seq_len=max(self.context_lens) + 1 if self.context_lens else 0,
-            num_prefill_tokens=self.num_prefill_tokens,
-            num_decode_tokens=self.num_decode_tokens,
-            num_prefills=self.num_prefills,
-            block_tables=block_tables_tensor,
-            slot_mapping=slot_mapping_tensor,
-            context_lens_tensor=context_lens_tensor,
-            query_start_loc=query_start_loc,
-            seq_start_loc=seq_start_loc,
-            is_prompt=self.num_prefills > 0,
+            num_actual_tokens=common_attn_metadata.num_actual_tokens,
+            max_query_len=common_attn_metadata.max_query_len,
+            query_start_loc=common_attn_metadata.query_start_loc,
+            max_seq_len=common_attn_metadata.max_seq_len,
+            seq_lens=common_attn_metadata.seq_lens,
+            block_table=common_attn_metadata.block_table_tensor,
+            slot_mapping=common_attn_metadata.slot_mapping,
+            use_cascade=common_prefix_len > 0,
+            common_prefix_len=common_prefix_len,
         )
+
+
+class MetalAttentionImpl(AttentionImpl):
+    """Metal attention implementation using PyTorch SDPA.
+
+    Uses PyTorch's scaled_dot_product_attention which is optimized
+    for Apple Silicon via MPS backend.
+    """
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_size: int,
+        scale: float,
+        num_kv_heads: int | None = None,
+        alibi_slopes: list[float] | None = None,
+        sliding_window: int | None = None,
+        kv_cache_dtype: str = "auto",
+        blocksparse_params: dict | None = None,
+        logits_soft_cap: float | None = None,
+        attn_type: AttentionType = AttentionType.DECODER,
+        **kwargs,
+    ) -> None:
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
+        self.sliding_window = sliding_window
+        self.alibi_slopes = alibi_slopes
+        self.kv_cache_dtype = kv_cache_dtype
+        self.logits_soft_cap = logits_soft_cap
+        self.attn_type = attn_type
+        self.num_queries_per_kv = self.num_heads // self.num_kv_heads
+
+        if blocksparse_params is not None:
+            logger.warning("Block sparse attention not supported on Metal, ignoring")
+
+        if alibi_slopes is not None:
+            self.alibi_slopes_tensor = torch.tensor(alibi_slopes, dtype=torch.float32)
+        else:
+            self.alibi_slopes_tensor = None
+
+    def forward(
+        self,
+        layer: "torch.nn.Module",
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: MetalAttentionMetadata,
+        output: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward pass for Metal attention.
+
+        Args:
+            layer: The Attention layer (required by vLLM interface)
+            query: Query tensor [num_tokens, num_heads * head_size]
+            key: Key tensor [num_tokens, num_kv_heads * head_size]
+            value: Value tensor [num_tokens, num_kv_heads * head_size]
+            kv_cache: KV cache tensor
+            attn_metadata: Attention metadata
+            output: Optional output tensor
+
+        Returns:
+            Output tensor [num_tokens, num_heads * head_size]
+        """
+        num_tokens = query.shape[0]
+
+        # Reshape Q, K, V: [num_tokens, num_heads, head_size]
+        query = query.view(num_tokens, self.num_heads, self.head_size)
+        key = key.view(num_tokens, self.num_kv_heads, self.head_size)
+        value = value.view(num_tokens, self.num_kv_heads, self.head_size)
+
+        # Store new KV to cache
+        if kv_cache is not None and attn_metadata.slot_mapping is not None:
+            self._store_kv_cache(key, value, kv_cache, attn_metadata.slot_mapping)
+
+        # Determine if this is prefill or decode based on query length
+        is_prefill = attn_metadata.max_query_len > 1
+
+        if is_prefill:
+            out = self._prefill_attention(query, key, value, attn_metadata)
+        else:
+            out = self._decode_attention(query, key, value, kv_cache, attn_metadata)
+
+        # Reshape output: [num_tokens, num_heads * head_size]
+        # Use reshape instead of view to handle non-contiguous tensors from SDPA
+        out = out.reshape(num_tokens, self.num_heads * self.head_size)
+
+        if output is not None:
+            output.copy_(out)
+            return output
+        return out
+
+    def _prefill_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attn_metadata: MetalAttentionMetadata,
+    ) -> torch.Tensor:
+        """Compute attention for prefill phase.
+
+        For prefill, use the incoming K, V directly with causal masking.
+        """
+        # Simple case: use SDPA with causal mask
+        # Input: [num_tokens, num_heads, head_size]
+        # SDPA expects: [batch, num_heads, seq_len, head_size]
+
+        # For now, treat the entire batch as one sequence
+        # TODO: Handle variable length sequences properly
+        query = query.transpose(0, 1).unsqueeze(0)  # [1, num_heads, seq, head]
+        key = key.transpose(0, 1).unsqueeze(0)
+        value = value.transpose(0, 1).unsqueeze(0)
+
+        # Expand KV for GQA if needed
+        if self.num_queries_per_kv > 1 and key.shape[1] != query.shape[1]:
+            key = key.repeat_interleave(self.num_queries_per_kv, dim=1)
+            value = value.repeat_interleave(self.num_queries_per_kv, dim=1)
+
+        out = nnf.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            is_causal=True,
+            scale=self.scale,
+        )
+
+        # Reshape: [1, num_heads, seq, head] -> [seq, num_heads, head]
+        out = out.squeeze(0).transpose(0, 1)
+        return out
+
+    def _decode_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: MetalAttentionMetadata,
+    ) -> torch.Tensor:
+        """Compute attention for decode phase.
+
+        For decode, read K, V from cache using block tables.
+        """
+        batch_size = query.shape[0]
+        outputs = []
+
+        for i in range(batch_size):
+            # Get block table for this sequence
+            block_table = attn_metadata.block_table[i]
+            seq_len = int(attn_metadata.seq_lens[i].item())
+
+            # Gather KV from cache
+            k_cache, v_cache = self._gather_from_cache(kv_cache, block_table, seq_len)
+
+            # Single query attention: [1, num_heads, head_size]
+            q = query[i : i + 1]
+
+            # Expand KV for GQA
+            if self.num_queries_per_kv > 1:
+                k_cache = k_cache.repeat_interleave(self.num_queries_per_kv, dim=1)
+                v_cache = v_cache.repeat_interleave(self.num_queries_per_kv, dim=1)
+
+            # SDPA: [1, num_heads, 1, head] vs [1, num_heads, seq, head]
+            q = q.transpose(0, 1).unsqueeze(0)  # [1, heads, 1, head]
+            k = k_cache.transpose(0, 1).unsqueeze(0)  # [1, heads, seq, head]
+            v = v_cache.transpose(0, 1).unsqueeze(0)
+
+            out = nnf.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                is_causal=False,  # No causal for decode
+                scale=self.scale,
+            )
+
+            # [1, heads, 1, head] -> [1, heads, head]
+            out = out.squeeze(0).transpose(0, 1)
+            outputs.append(out)
+
+        return torch.cat(outputs, dim=0)
+
+    def _store_kv_cache(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Store key and value into KV cache using slot mapping.
+
+        KV cache layout: [num_blocks, 2, block_size, num_kv_heads, head_size]
+        """
+        block_size = kv_cache.shape[2]
+        num_tokens = key.shape[0]
+
+        for i in range(num_tokens):
+            slot = int(slot_mapping[i].item())
+            if slot < 0:  # PAD_SLOT_ID = -1
+                continue
+            block_idx = slot // block_size
+            block_offset = slot % block_size
+
+            kv_cache[block_idx, 0, block_offset] = key[i]
+            kv_cache[block_idx, 1, block_offset] = value[i]
+
+    def _gather_from_cache(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        context_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Gather keys and values from paged KV cache.
+
+        Returns:
+            (keys, values) both with shape [context_len, num_kv_heads, head_size]
+        """
+        block_size = kv_cache.shape[2]
+        num_blocks_needed = (context_len + block_size - 1) // block_size
+
+        keys = []
+        values = []
+        tokens_gathered = 0
+
+        for block_idx in range(num_blocks_needed):
+            if block_idx >= len(block_table):
+                break
+
+            physical_block = int(block_table[block_idx].item())
+            tokens_in_block = min(block_size, context_len - tokens_gathered)
+
+            k_block = kv_cache[physical_block, 0, :tokens_in_block]
+            v_block = kv_cache[physical_block, 1, :tokens_in_block]
+
+            keys.append(k_block)
+            values.append(v_block)
+            tokens_gathered += tokens_in_block
+
+        return torch.cat(keys, dim=0), torch.cat(values, dim=0)
 
 
 class MetalAttentionBackend(AttentionBackend):
-    """Attention backend for Apple Metal."""
+    """V1 attention backend for Apple Metal."""
 
-    # Whether this backend accepts an output buffer (for in-place operations)
     accept_output_buffer: bool = False
 
     @staticmethod
@@ -261,8 +337,6 @@ class MetalAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type[AttentionImpl]:
-        from vllm_metal.attention.metal_attention import MetalAttentionImpl
-
         return MetalAttentionImpl
 
     @staticmethod
@@ -280,9 +354,7 @@ class MetalAttentionBackend(AttentionBackend):
         num_kv_heads: int,
         head_size: int,
     ) -> tuple[int, ...]:
-        """Get the shape of the KV cache."""
-        # Shape: [num_blocks, 2, block_size, num_kv_heads, head_size]
-        # The '2' is for key and value
+        """KV cache shape: [num_blocks, 2, block_size, num_kv_heads, head_size]"""
         return (num_blocks, 2, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -291,7 +363,6 @@ class MetalAttentionBackend(AttentionBackend):
         dst_kv_cache: torch.Tensor,
         src_to_dst: torch.Tensor,
     ) -> None:
-        """Swap blocks between source and destination KV caches."""
         src_indices = src_to_dst[:, 0]
         dst_indices = src_to_dst[:, 1]
         dst_kv_cache[dst_indices] = src_kv_cache[src_indices]
@@ -301,7 +372,6 @@ class MetalAttentionBackend(AttentionBackend):
         kv_caches: list[torch.Tensor],
         src_to_dsts: torch.Tensor,
     ) -> None:
-        """Copy blocks within KV caches."""
         for kv_cache in kv_caches:
             src_indices = src_to_dsts[:, 0]
             dst_indices = src_to_dsts[:, 1]
@@ -309,14 +379,4 @@ class MetalAttentionBackend(AttentionBackend):
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
-        """Get supported attention head sizes."""
         return [64, 80, 96, 112, 128, 192, 256]
-
-    @classmethod
-    def get_required_kv_cache_layout(cls):
-        """Return the required KV cache layout for this backend.
-
-        Returns None to indicate no specific layout requirement,
-        allowing the framework to use its default layout.
-        """
-        return None

@@ -54,6 +54,7 @@ download_and_install_wheel() {
 
   local tmp_dir
   tmp_dir=$(mktemp -d)
+  # shellcheck disable=SC2064
   trap "rm -rf '$tmp_dir'" EXIT
 
   echo ""
@@ -89,6 +90,7 @@ download_and_install_wheel() {
     prometheus-client \
     fastapi \
     uvicorn \
+    uvloop \
     pydantic \
     pillow \
     prometheus_fastapi_instrumentator \
@@ -116,15 +118,16 @@ download_and_install_wheel() {
     cachetools \
     regex \
     protobuf \
+    python-multipart \
     "fastapi[standard]" \
     "llguidance>=1.3.0,<1.4.0" \
     "outlines_core==0.2.11" \
     "lark==1.2.2" \
-    "xgrammar==0.1.27" \
+    "xgrammar>=0.1.27" \
     "opencv-python-headless>=4.11.0" \
     six \
     "setuptools>=77.0.3,<81.0.0" \
-    "depyf==0.20.0" \
+    "depyf>=0.20.0" \
     watchfiles \
     python-json-logger \
     scipy \
@@ -132,10 +135,10 @@ download_and_install_wheel() {
     pybase64 \
     setproctitle \
     "openai-harmony>=0.0.3" \
-    "anthropic==0.71.0" \
+    "anthropic>=0.71.0" \
     "model-hosting-container-standards>=0.1.9,<1.0.0" \
     "tokenizers>=0.21.1" \
-    "numba==0.61.2"; then
+    "numba>=0.61.0"; then
     error "Failed to install vllm dependencies."
     exit 1
   fi

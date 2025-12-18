@@ -16,7 +16,11 @@ class MetalAttentionImpl(AttentionImpl):
     """Metal-based attention implementation.
 
     This implementation uses PyTorch's scaled_dot_product_attention
-    which is optimized for Apple Silicon.
+    which is optimized for Apple Silicon via MPS backend.
+
+    Note: Custom Metal kernels (rust_ext/shaders/sdpa_vector.metal) are
+    compiled but not yet integrated. The SDPA kernel dispatch in
+    rust_ext/src/metal/kernels/attention.rs is a stub.
     """
 
     def __init__(
@@ -84,6 +88,7 @@ class MetalAttentionImpl(AttentionImpl):
 
     def forward(
         self,
+        layer,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -97,6 +102,7 @@ class MetalAttentionImpl(AttentionImpl):
         """Forward pass for attention.
 
         Args:
+            layer: The Attention layer calling this impl (vLLM interface requirement)
             query: Query tensor of shape [num_tokens, num_heads * head_size]
             key: Key tensor of shape [num_tokens, num_kv_heads * head_size]
             value: Value tensor of shape [num_tokens, num_kv_heads * head_size]
