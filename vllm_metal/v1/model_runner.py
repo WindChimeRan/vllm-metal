@@ -2,10 +2,10 @@
 """Metal Model Runner for vLLM v1 engine.
 
 Optimized for performance with:
+- True batched decode using BatchKVCache for O(1) forward passes per batch
 - Async evaluation pipeline for pipelined computation
-- Batched decode processing for O(1) forward passes
 - Pre-allocated input buffers to reduce allocation overhead
-- Rust-based input preparation for efficient batch assembly
+- Rust-based token state management for efficient batch operations
 """
 
 import time
@@ -16,7 +16,7 @@ import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_load
 from mlx_lm import stream_generate
-from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.models.cache import BatchKVCache, KVCache, make_prompt_cache
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -27,21 +27,18 @@ from vllm_metal.config import get_config
 
 logger = init_logger(__name__)
 
-# Configuration for batched prefill
-_BATCHED_PREFILL_ENABLED = True
-_MAX_PADDING_RATIO = 0.3  # Max 30% padding allowed in a batch
-_MAX_PREFILL_BATCH_SIZE = 8  # Max requests to batch together
+# Try to import Rust extension for high-performance token state management
+try:
+    from vllm_metal._rs import RequestStateManager as RustRequestStateManager
 
-# Dedicated stream for async generation (enables pipelined computation)
-_generation_stream: mx.Stream | None = None
+    _RUST_AVAILABLE = True
+except ImportError:
+    _RUST_AVAILABLE = False
+    logger.debug("Rust extension not available, using Python fallback")
 
-
-def _get_generation_stream() -> mx.Stream:
-    """Get or create the dedicated generation stream."""
-    global _generation_stream
-    if _generation_stream is None:
-        _generation_stream = mx.new_stream(mx.default_device())
-    return _generation_stream
+# Configuration for batched operations
+_MIN_BATCH_SIZE_FOR_BATCHING = 2  # Minimum requests to use BatchKVCache
+_MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
 
 @dataclass
@@ -57,14 +54,51 @@ class RequestState:
     """State for an ongoing request with KV cache."""
 
     token_ids: list[int]
-    cache: Any  # MLX prompt cache
+    cache: list[KVCache]  # Per-layer KV caches
     generated_tokens: int = 0
+
+
+def _merge_kv_caches(caches_list: list[list[KVCache]]) -> list[BatchKVCache]:
+    """Merge multiple per-request caches into batched caches.
+
+    Args:
+        caches_list: List of per-request caches, each is a list of per-layer KVCache
+
+    Returns:
+        List of BatchKVCache, one per layer
+    """
+    if not caches_list:
+        return []
+
+    num_layers = len(caches_list[0])
+    merged = []
+
+    for layer_idx in range(num_layers):
+        layer_caches = [caches[layer_idx] for caches in caches_list]
+        batch_cache = BatchKVCache.merge(layer_caches)
+        merged.append(batch_cache)
+
+    return merged
+
+
+def _extract_kv_cache(batch_caches: list[BatchKVCache], idx: int) -> list[KVCache]:
+    """Extract a single request's cache from batched caches.
+
+    Args:
+        batch_caches: List of BatchKVCache, one per layer
+        idx: Index of the request in the batch
+
+    Returns:
+        List of KVCache for the request, one per layer
+    """
+    return [cache.extract(idx) for cache in batch_caches]
 
 
 class MetalModelRunner:
     """Model runner for MLX-based inference on Metal.
 
     Implements the vLLM v1 model runner interface for Apple Silicon.
+    Uses true batched decode with BatchKVCache for efficient parallel processing.
     """
 
     def __init__(
@@ -96,14 +130,13 @@ class MetalModelRunner:
         # Request state cache for incremental decoding
         self._request_states: dict[str, RequestState] = {}
 
-        # Pre-allocated buffers for batch decode (Phase 4 optimization)
-        # Max batch size - will grow if needed
-        self._max_batch_size = 64
-        self._decode_input_buffer: mx.array | None = None
+        # Rust-based token state manager (optional, for batch operations)
+        self._rust_state_manager: Any = None
+        if _RUST_AVAILABLE:
+            self._rust_state_manager = RustRequestStateManager()
 
-        # Async evaluation state (Phase 1 optimization)
-        self._pending_logits: mx.array | None = None
-        self._generation_stream = _get_generation_stream()
+        # Pre-allocated buffer for decode input tokens
+        self._max_batch_size = _MAX_BATCH_SIZE
 
     def load_model(self) -> None:
         """Load the model using MLX."""
@@ -237,33 +270,136 @@ class MetalModelRunner:
         except Exception as e:
             logger.warning(f"Model warm-up failed: {e}")
 
-    def _ensure_decode_buffer(self, batch_size: int) -> mx.array:
-        """Ensure decode input buffer is large enough and return a slice.
+    def _prefill_single(
+        self, req_id: str, token_ids: list[int]
+    ) -> tuple[int, list[KVCache]]:
+        """Process a single prefill request.
 
         Args:
-            batch_size: Required batch size
+            req_id: Request ID
+            token_ids: Prompt token IDs
 
         Returns:
-            Input buffer slice of shape (batch_size, 1)
+            Tuple of (next_token, cache)
         """
-        if self._decode_input_buffer is None or batch_size > self._max_batch_size:
-            # Grow buffer if needed (double the size to amortize allocations)
-            self._max_batch_size = max(self._max_batch_size, batch_size * 2)
-            self._decode_input_buffer = mx.zeros(
-                (self._max_batch_size, 1), dtype=mx.int32
+        # Create a new prompt cache for this request
+        cache = make_prompt_cache(self.model)
+
+        # Prefill: process the entire prompt with cache
+        input_ids = mx.array([token_ids], dtype=mx.int32)
+        logits = self.model(input_ids, cache=cache)
+
+        # Get next token (greedy sampling)
+        next_token_logits = logits[:, -1, :]
+        next_token = int(mx.argmax(next_token_logits, axis=-1)[0].item())
+
+        # Evaluate to materialize cache state
+        mx.eval(logits)
+        mx.eval([c.state for c in cache])
+
+        return next_token, cache
+
+    def _batched_decode(self, decode_reqs: list[tuple[str, RequestState]]) -> list[int]:
+        """Process multiple decode requests in a single batched forward pass.
+
+        Uses BatchKVCache to merge individual caches, run ONE forward pass,
+        then extract updated caches back.
+
+        Args:
+            decode_reqs: List of (req_id, state) tuples
+
+        Returns:
+            List of next tokens for each request
+        """
+        batch_size = len(decode_reqs)
+
+        # Use Rust extension for efficient batch token retrieval if available
+        if self._rust_state_manager is not None:
+            last_tokens = self._rust_state_manager.get_last_tokens_batch(
+                [req_id for req_id, _ in decode_reqs]
             )
-        return self._decode_input_buffer[:batch_size]
+        else:
+            last_tokens = [
+                state.token_ids[-1] if state.token_ids else 0
+                for _, state in decode_reqs
+            ]
+
+        # Collect individual caches for merging
+        caches_list = [state.cache for _, state in decode_reqs]
+
+        # Merge individual KV caches into batched cache (one per layer)
+        batch_cache = _merge_kv_caches(caches_list)
+
+        # Create batched input: shape (batch_size, 1) for single-token decode
+        batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
+
+        # === SINGLE FORWARD PASS FOR ALL REQUESTS ===
+        logits = self.model(batched_input, cache=batch_cache)
+
+        # Evaluate to materialize results
+        mx.eval(logits)
+
+        # Extract next tokens (greedy sampling)
+        next_token_logits = logits[:, -1, :]  # Shape: (batch_size, vocab_size)
+        next_tokens_arr = mx.argmax(next_token_logits, axis=-1)
+        mx.eval(next_tokens_arr)
+        next_tokens = [int(next_tokens_arr[i].item()) for i in range(batch_size)]
+
+        # Extract updated caches back to individual requests
+        for i, (req_id, state) in enumerate(decode_reqs):
+            state.cache = _extract_kv_cache(batch_cache, i)
+            state.token_ids.append(next_tokens[i])
+            state.generated_tokens += 1
+
+            # Update Rust state manager if available
+            if self._rust_state_manager is not None:
+                self._rust_state_manager.append_token(req_id, next_tokens[i])
+
+        return next_tokens
+
+    def _sequential_decode(
+        self, decode_reqs: list[tuple[str, RequestState]]
+    ) -> list[int]:
+        """Fallback: process decode requests sequentially.
+
+        Used when batch size is 1 (no benefit from batching).
+
+        Args:
+            decode_reqs: List of (req_id, state) tuples
+
+        Returns:
+            List of next tokens for each request
+        """
+        next_tokens = []
+
+        for req_id, state in decode_reqs:
+            last_token = state.token_ids[-1] if state.token_ids else 0
+            input_ids = mx.array([[last_token]], dtype=mx.int32)
+
+            logits = self.model(input_ids, cache=state.cache)
+            mx.eval(logits)
+
+            next_token_logits = logits[:, -1, :]
+            next_token = int(mx.argmax(next_token_logits, axis=-1)[0].item())
+            next_tokens.append(next_token)
+
+            # Update state
+            state.token_ids.append(next_token)
+            state.generated_tokens += 1
+
+            # Update Rust state manager if available
+            if self._rust_state_manager is not None:
+                self._rust_state_manager.append_token(req_id, next_token)
+
+        return next_tokens
 
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | None:
-        """Execute model inference with optimized batched processing.
+        """Execute model inference with true batched decode.
 
-        Optimizations applied:
-        - Async evaluation for pipelined computation
-        - Batched decode: process all decode requests in ONE forward pass
-        - Pre-allocated input buffers to reduce allocation overhead
-        - Combined evaluations to reduce synchronization points
+        Key optimization: Uses BatchKVCache.merge() to combine individual
+        KV caches and run a SINGLE forward pass for all decode requests.
 
         Args:
             scheduler_output: Scheduler output with batch information
@@ -280,67 +416,35 @@ class MetalModelRunner:
         sampled_tokens: list[list[int]] = []
 
         # === PHASE 1: Process new requests (prefill phase) ===
-        # Optimization: Pipeline multiple prefills with async evaluation
         new_reqs = scheduler_output.scheduled_new_reqs
 
-        if new_reqs:
-            # Collect all prefill data
-            prefill_data: list[tuple[str, list[int], Any, mx.array]] = []
-            prefill_caches_to_eval: list[Any] = []
+        for new_req in new_reqs:
+            req_id = new_req.req_id
+            token_ids = new_req.prompt_token_ids or []
 
-            # First pass: launch all prefill computations asynchronously
-            for new_req in new_reqs:
-                req_id = new_req.req_id
-                token_ids = new_req.prompt_token_ids or []
+            req_ids.append(req_id)
+            req_id_to_index[req_id] = len(req_ids) - 1
 
-                req_ids.append(req_id)
-                req_id_to_index[req_id] = len(req_ids) - 1
+            if token_ids:
+                next_token, cache = self._prefill_single(req_id, token_ids)
+                sampled_tokens.append([next_token])
 
-                if token_ids:
-                    # Create a new prompt cache for this request
-                    cache = make_prompt_cache(self.model)
+                # Store request state with cache for future decoding
+                self._request_states[req_id] = RequestState(
+                    token_ids=list(token_ids) + [next_token],
+                    cache=cache,
+                    generated_tokens=1,
+                )
 
-                    # Prefill: process the entire prompt with cache
-                    input_ids = mx.array([token_ids], dtype=mx.int32)
-
-                    # Use async stream for pipelined computation
-                    with mx.stream(self._generation_stream):
-                        logits = self.model(input_ids, cache=cache)
-
-                    # Queue for async evaluation (don't block yet)
-                    mx.async_eval(logits)
-
-                    # Store for later processing
-                    prefill_data.append((req_id, token_ids, cache, logits))
-                    prefill_caches_to_eval.extend(cache)
-                else:
-                    sampled_tokens.append([0])  # Fallback
-
-            # Second pass: sync all logits at once and extract tokens
-            if prefill_data:
-                # Single sync point for all prefill logits
-                all_logits = [data[3] for data in prefill_data]
-                mx.eval(all_logits)
-
-                for req_id, token_ids, cache, logits in prefill_data:
-                    # Get next token (greedy sampling)
-                    next_token_logits = logits[:, -1, :]
-                    next_token = int(mx.argmax(next_token_logits, axis=-1)[0].item())
-                    sampled_tokens.append([next_token])
-
-                    # Store request state with cache for future decoding
-                    self._request_states[req_id] = RequestState(
-                        token_ids=list(token_ids) + [next_token],
-                        cache=cache,
-                        generated_tokens=1,
+                # Register with Rust state manager if available
+                if self._rust_state_manager is not None:
+                    self._rust_state_manager.add_request(
+                        req_id, list(token_ids) + [next_token]
                     )
+            else:
+                sampled_tokens.append([0])  # Fallback
 
-            # Batch evaluate all prefill cache states at once (reduces sync points)
-            if prefill_caches_to_eval:
-                mx.eval([c.state for c in prefill_caches_to_eval])
-
-        # === PHASE 2: Process cached requests (batched decode) ===
-        # This is the key optimization: process ALL decode requests in ONE forward pass
+        # === PHASE 2: Process cached requests (TRUE batched decode) ===
         cached_reqs = scheduler_output.scheduled_cached_reqs
         decode_req_ids = list(cached_reqs.req_ids)
 
@@ -353,57 +457,11 @@ class MetalModelRunner:
                     valid_decode_reqs.append((req_id, state))
 
             if valid_decode_reqs:
-                batch_size = len(valid_decode_reqs)
-
-                # Get pre-allocated buffer slice and fill with last tokens
-                # This is Phase 4: pre-allocated buffers
-                self._ensure_decode_buffer(batch_size)
-
-                # Collect last tokens into a list for batch array creation
-                last_tokens = [
-                    state.token_ids[-1] if state.token_ids else 0
-                    for _, state in valid_decode_reqs
-                ]
-
-                # Create batched input tensor
-                # Shape: (batch_size, 1) for single-token decode
-                batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
-
-                # OPTIMIZATION: Single forward pass for ALL decode requests
-                # This requires using the FIRST request's cache as reference
-                # In full batched mode, we'd use BatchKVCache, but for now
-                # we process sequentially but with async evaluation
-                decode_logits_list: list[mx.array] = []
-                decode_tokens: list[int] = []
-
-                for i, (_req_id, state) in enumerate(valid_decode_reqs):
-                    # Single token input for this request
-                    single_input = batched_input[i : i + 1]
-
-                    # Use async stream for pipelined computation
-                    with mx.stream(self._generation_stream):
-                        logits = self.model(single_input, cache=state.cache)
-
-                    # Queue for async evaluation (don't block)
-                    mx.async_eval(logits)
-                    decode_logits_list.append(logits)
-
-                # Now sync and extract tokens (batch the sync)
-                if decode_logits_list:
-                    # Single sync point for all decode logits
-                    mx.eval(decode_logits_list)
-
-                    for i, (_req_id, state) in enumerate(valid_decode_reqs):
-                        logits = decode_logits_list[i]
-                        next_token_logits = logits[:, -1, :]
-                        next_token = int(
-                            mx.argmax(next_token_logits, axis=-1)[0].item()
-                        )
-                        decode_tokens.append(next_token)
-
-                        # Update state
-                        state.token_ids.append(next_token)
-                        state.generated_tokens += 1
+                # Use batched decode for multiple requests, sequential for single
+                if len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
+                    decode_tokens = self._batched_decode(valid_decode_reqs)
+                else:
+                    decode_tokens = self._sequential_decode(valid_decode_reqs)
 
                 # Add decode results to output
                 for i, (req_id, _) in enumerate(valid_decode_reqs):
@@ -423,9 +481,12 @@ class MetalModelRunner:
             for req_id in scheduler_output.finished_req_ids:
                 state = self._request_states.pop(req_id, None)
                 if state is not None:
-                    # Explicitly delete cache to help MLX release memory
                     del state.cache
                     del state
+
+                # Remove from Rust state manager if available
+                if self._rust_state_manager is not None:
+                    self._rust_state_manager.remove_request(req_id)
 
             # Clear MLX's memory cache after finishing requests
             mx.clear_cache()
