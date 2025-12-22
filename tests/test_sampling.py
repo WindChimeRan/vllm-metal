@@ -202,8 +202,6 @@ class TestMLXToTorchSampling:
             assert (output.sampled_token_ids == 0).sum() >= batch_size // 2
 
 
-
-
 class TestBatchedPerRequestSampling:
     """Test batched sampling with different params per request."""
 
@@ -249,4 +247,3 @@ class TestBatchedPerRequestSampling:
         # Greedy requests (0, 2) should pick the max
         assert output.sampled_token_ids[0, 0].item() == 0
         assert output.sampled_token_ids[2, 0].item() == 20
-

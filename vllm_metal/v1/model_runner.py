@@ -316,6 +316,24 @@ class MetalModelRunner:
                     gen.manual_seed(sp.seed)
                 generators[i] = gen
 
+        # top_k: pass None if all values are -1 (no filtering)
+        # vLLM's sampler expects None to skip top-k entirely
+        top_k_values = [sp.top_k for sp in sampling_params_list]
+        top_k = (
+            None
+            if all(k == -1 for k in top_k_values)
+            else torch.tensor(top_k_values, dtype=torch.int32)
+        )
+
+        # top_p: pass None if all values are 1.0 (no filtering)
+        # vLLM's sampler expects None to skip top-p entirely
+        top_p_values = [sp.top_p for sp in sampling_params_list]
+        top_p = (
+            None
+            if all(p == 1.0 for p in top_p_values)
+            else torch.tensor(top_p_values, dtype=torch.float32)
+        )
+
         return SamplingMetadata(
             temperature=None
             if all_greedy
@@ -324,12 +342,8 @@ class MetalModelRunner:
             ),
             all_greedy=all_greedy,
             all_random=all_random,
-            top_p=torch.tensor(
-                [sp.top_p for sp in sampling_params_list], dtype=torch.float32
-            ),
-            top_k=torch.tensor(
-                [sp.top_k for sp in sampling_params_list], dtype=torch.int32
-            ),
+            top_p=top_p,
+            top_k=top_k,
             generators=generators,
             max_num_logprobs=None,
             prompt_token_ids=None,
@@ -480,7 +494,9 @@ class MetalModelRunner:
 
             # Sample using vLLM's Sampler with request's params
             # Cast to float32 for numpy conversion (numpy doesn't support bfloat16)
-            logits_torch = mlx_to_torch(logits[:, -1, :].astype(mx.float32), device="cpu")
+            logits_torch = mlx_to_torch(
+                logits[:, -1, :].astype(mx.float32), device="cpu"
+            )
             metadata = self._make_sampling_metadata(
                 [state.sampling_params], [state.token_ids]
             )
