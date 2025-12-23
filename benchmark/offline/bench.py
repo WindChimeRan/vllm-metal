@@ -24,9 +24,12 @@ class MinimalConfig:
 
 def main():
     seed(0)
-    num_seqs = 256
-    max_input_len = 1024
-    max_output_len = 1024
+    # num_seqs = 256
+    # max_input_len = 1024
+    # max_output_len = 1024
+    num_seqs = 4
+    max_input_len = 128
+    max_output_len = 128
 
     # Use MetalModelRunner to load the model
     runner = MetalModelRunner(MinimalConfig("Qwen/Qwen3-0.6B"))
