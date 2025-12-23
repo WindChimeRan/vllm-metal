@@ -7,7 +7,6 @@ Provides zero-copy conversion when possible using Apple Silicon's unified memory
 from typing import Literal
 
 import mlx.core as mx
-import numpy as np
 import torch
 
 # MLX to PyTorch dtype mapping
@@ -83,9 +82,18 @@ def mlx_to_torch(
     # Evaluate any pending MLX operations
     mx.eval(array)
 
-    # Convert via numpy
-    np_array = np.array(array)
-    tensor = torch.from_numpy(np_array)
+    # Use memoryview for zero-copy conversion (bypasses numpy for bfloat16)
+    # reference: https://github.com/ml-explore/mlx/issues/403
+    torch_dtype = MLX_TO_TORCH_DTYPE.get(array.dtype)
+    if torch_dtype is not None:
+        tensor = torch.frombuffer(memoryview(array), dtype=torch_dtype).reshape(
+            array.shape
+        )
+    else:
+        # Fallback to numpy path for unsupported dtypes
+        raise ValueError(f"Unsupported MLX dtype: {array.dtype}")
+        # np_array = np.array(array)
+        # tensor = torch.from_numpy(np_array)
 
     # Move to target device
     if device.type != "cpu":
