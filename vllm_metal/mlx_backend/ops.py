@@ -49,6 +49,9 @@ def rotary_embedding(
     Returns:
         Tuple of (rotated_q, rotated_k) with same shapes as inputs
     """
+    if head_dim % 2 != 0:
+        raise ValueError(f"head_dim must be even for RoPE, got {head_dim}")
+
     # Compute inverse frequencies
     dim = head_dim // 2
     inv_freq = 1.0 / (rope_theta ** (mx.arange(0, dim, dtype=mx.float32) / dim))
@@ -81,11 +84,11 @@ def rotary_embedding(
         cos = cos[:, :, None, :]
         sin = sin[:, :, None, :]
         # Apply rotation
-        rotated = mx.concatenate(
-            [x1 * cos - x2 * sin, x1 * sin + x2 * cos],
-            axis=-1,
-        )
-        return rotated
+        rotated_even = x1 * cos - x2 * sin
+        rotated_odd = x1 * sin + x2 * cos
+        rotated = mx.stack([rotated_even, rotated_odd], axis=-1)
+
+        return mx.reshape(rotated, x.shape)
 
     q_rotated = apply_rope(q, cos, sin)
     k_rotated = apply_rope(k, cos, sin)
