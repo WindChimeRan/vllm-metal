@@ -3,10 +3,9 @@
 
 import pytest
 from mlx_lm import load as mlx_lm_load
-
-from vllm_metal.v1.model_runner import MetalModelRunner
 from vllm.sampling_params import SamplingParams
 
+from vllm_metal.v1.model_runner import MetalModelRunner
 
 TEST_MODEL = "HuggingFaceTB/SmolLM2-135M-Instruct"
 
