@@ -575,6 +575,114 @@ class MetalModelRunner:
 
         return next_token, cache
 
+    def _prefill_chunked(
+        self,
+        req_id: str,
+        token_ids: list[int],
+        num_computed: int,
+        num_scheduled: int,
+        sampling_params: SamplingParams,
+        generator: torch.Generator | None = None,
+    ) -> tuple[int | None, list[KVCache]]:
+        """Process a prefill request with chunking support.
+
+        Supports chunked prefill where a long prompt is processed in multiple
+        chunks across scheduler iterations. The KV cache is accumulated across
+        chunks, and sampling only happens on the final chunk.
+
+        Args:
+            req_id: Request ID
+            token_ids: Full prompt token IDs (not just the chunk)
+            num_computed: Number of tokens already computed (offset into token_ids)
+            num_scheduled: Number of tokens to process in this chunk
+            sampling_params: Sampling parameters for this request
+            generator: Optional random generator for sampling
+
+        Returns:
+            Tuple of (next_token, cache) where next_token is None for non-final
+            chunks, or the sampled token for the final chunk.
+        """
+        # Calculate chunk boundaries
+        start = num_computed
+        end = start + num_scheduled
+        chunk_token_ids = token_ids[start:end]
+        is_final_chunk = end >= len(token_ids)
+
+        # Get or create cache
+        if num_computed == 0:
+            # First chunk: create new cache
+            cache_model = (
+                self.model.language_model
+                if self._is_vlm and hasattr(self.model, "language_model")
+                else self.model
+            )
+            cache = make_prompt_cache(cache_model)
+        else:
+            # Continuation: retrieve existing cache from partial state
+            cache = self._request_states[req_id].cache
+
+        # Process this chunk
+        input_ids = mx.array([chunk_token_ids], dtype=mx.int32)
+        model_output = self.model(input_ids, cache=cache)
+
+        if is_final_chunk:
+            # Final chunk: sample the next token
+            logits = self._extract_logits(model_output)
+            last_logits = logits[:, -1, :]
+
+            # Use native MLX greedy sampling when possible
+            is_greedy = sampling_params.temperature < 1e-5
+            needs_advanced_sampling = (
+                sampling_params.top_k > 0
+                or sampling_params.top_p < 1.0
+                or sampling_params.frequency_penalty != 0
+                or sampling_params.presence_penalty != 0
+                or sampling_params.repetition_penalty != 1.0
+            )
+
+            if is_greedy and not needs_advanced_sampling:
+                # Fast path: native MLX greedy sampling
+                next_token_mlx = _mlx_greedy_sample(last_logits)
+                mx.eval(next_token_mlx, *[c.state for c in cache])
+                next_token = int(next_token_mlx.item())
+            else:
+                # Slow path: use vLLM sampler for advanced sampling
+                mx.eval(last_logits, *[c.state for c in cache])
+                logits_torch = mlx_to_torch(
+                    last_logits.astype(mx.float32), device=self.device
+                )
+                generators = {} if generator is None else {0: generator}
+                metadata = self._make_sampling_metadata(
+                    [sampling_params],
+                    [[]],
+                    generators=generators,
+                )
+                output = self._sampler.forward(logits_torch, metadata)
+                next_token = int(output.sampled_token_ids[0, 0].item())
+
+            # Store final state with generated token
+            self._request_states[req_id] = RequestState(
+                token_ids=list(token_ids) + [next_token],
+                cache=cache,
+                sampling_params=sampling_params,
+                generator=generator,
+                generated_tokens=1,
+            )
+            return next_token, cache
+        else:
+            # Non-final chunk: just update cache state, no sampling
+            mx.eval(*[c.state for c in cache])
+
+            # Store partial state for next chunk
+            self._request_states[req_id] = RequestState(
+                token_ids=list(token_ids[:end]),
+                cache=cache,
+                sampling_params=sampling_params,
+                generator=generator,
+                generated_tokens=0,
+            )
+            return None, cache
+
     def _batched_decode(self, decode_reqs: list[tuple[str, RequestState]]) -> list[int]:
         """Process multiple decode requests in a single batched forward pass.
 
