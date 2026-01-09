@@ -758,7 +758,9 @@ class MetalModelRunner:
         )
 
         for new_req in scheduler_output.scheduled_new_reqs:
-            prompt_len = len(new_req.prompt_token_ids) if new_req.prompt_token_ids else 0
+            prompt_len = (
+                len(new_req.prompt_token_ids) if new_req.prompt_token_ids else 0
+            )
             logger.info(
                 f"[SCHED] NEW req_id={new_req.req_id}, "
                 f"prompt_len={prompt_len}, "
