@@ -897,35 +897,68 @@ class MetalModelRunner:
             req_id = new_req.req_id
             token_ids = new_req.prompt_token_ids or []
             sampling_params = new_req.sampling_params or SamplingParams()
+            num_computed = new_req.num_computed_tokens
+            num_scheduled = scheduler_output.num_scheduled_tokens.get(
+                req_id, len(token_ids)
+            )
 
-            req_ids.append(req_id)
-            req_id_to_index[req_id] = len(req_ids) - 1
+            # === Original _prefill_single code (for reference) ===
+            # req_ids.append(req_id)
+            # req_id_to_index[req_id] = len(req_ids) - 1
+            #
+            # if token_ids:
+            #     generator = _create_request_generator(self.device, sampling_params)
+            #     next_token, cache = self._prefill_single(
+            #         req_id,
+            #         token_ids,
+            #         sampling_params,
+            #         generator=generator,
+            #     )
+            #     sampled_tokens.append([next_token])
+            #
+            #     # Store request state with cache for future decoding
+            #     self._request_states[req_id] = RequestState(
+            #         token_ids=list(token_ids) + [next_token],
+            #         cache=cache,
+            #         sampling_params=sampling_params,
+            #         generator=generator,
+            #         generated_tokens=1,
+            #     )
+            #
+            #     # Register with Rust state manager if available
+            #     if self._rust_state_manager is not None:
+            #         self._rust_state_manager.add_request(
+            #             req_id, list(token_ids) + [next_token]
+            #         )
+            # else:
+            #     sampled_tokens.append([0])  # Fallback
+            # === End original code ===
 
             if token_ids:
                 generator = _create_request_generator(self.device, sampling_params)
-                next_token, cache = self._prefill_single(
+                next_token, cache = self._prefill_chunked(
                     req_id,
                     token_ids,
+                    num_computed,
+                    num_scheduled,
                     sampling_params,
                     generator=generator,
                 )
-                sampled_tokens.append([next_token])
 
-                # Store request state with cache for future decoding
-                self._request_states[req_id] = RequestState(
-                    token_ids=list(token_ids) + [next_token],
-                    cache=cache,
-                    sampling_params=sampling_params,
-                    generator=generator,
-                    generated_tokens=1,
-                )
+                # Only add to output if this is the final chunk (token generated)
+                if next_token is not None:
+                    req_ids.append(req_id)
+                    req_id_to_index[req_id] = len(req_ids) - 1
+                    sampled_tokens.append([next_token])
 
-                # Register with Rust state manager if available
-                if self._rust_state_manager is not None:
-                    self._rust_state_manager.add_request(
-                        req_id, list(token_ids) + [next_token]
-                    )
+                    # Register with Rust state manager if available
+                    if self._rust_state_manager is not None:
+                        self._rust_state_manager.add_request(
+                            req_id, list(token_ids) + [next_token]
+                        )
             else:
+                req_ids.append(req_id)
+                req_id_to_index[req_id] = len(req_ids) - 1
                 sampled_tokens.append([0])  # Fallback
 
         # === PHASE 2: Process cached requests (TRUE batched decode) ===
