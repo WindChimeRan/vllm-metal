@@ -12,12 +12,17 @@ Optimized for performance with:
 import time
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any
+from typing import Any, TypeAlias
 
 import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_lm import stream_generate
+from mlx_lm.models.cache import (
+    ArraysCache,
+    KVCache,
+    MambaCache,
+)
 
 # mlx_vlm for vision-language models
 from mlx_vlm import load as mlx_vlm_load
@@ -39,6 +44,7 @@ from vllm_metal.mlx_backend.paged_cache_adapter import (
     PagedKVCacheAdapterList,
 )
 from vllm_metal.pytorch_backend.tensor_bridge import mlx_to_torch
+from vllm_metal.utils import get_model_download_path
 
 logger = init_logger(__name__)
 
@@ -61,6 +67,61 @@ _MAX_BATCH_SIZE = 64  # Maximum batch size for decode
 
 # Performance tuning
 _CACHE_CLEAR_INTERVAL = 50  # Clear cache every N finished requests
+
+# Type alias for any cache type supported by the model
+AnyCache: TypeAlias = KVCache | MambaCache | ArraysCache
+
+
+class BatchMambaCache:
+    """Batched cache for Mamba/SSM layers.
+
+    Wraps multiple MambaCache instances into a single batched cache
+    for efficient batched forward passes on hybrid models.
+    """
+
+    def __init__(self, caches: list[MambaCache | ArraysCache]):
+        """Create a batched Mamba cache from individual caches.
+
+        Args:
+            caches: List of MambaCache instances to batch
+        """
+        self._batch_size = len(caches)
+        self._cache_size = len(caches[0].cache) if caches else 0
+
+        # Stack each state array across the batch dimension
+        self.cache: list[mx.array | None] = []
+        for i in range(self._cache_size):
+            states = [c.cache[i] for c in caches]
+            if all(s is not None for s in states):
+                self.cache.append(mx.concatenate(states, axis=0))
+            else:
+                self.cache.append(None)
+
+    def __getitem__(self, idx: int) -> mx.array | None:
+        return self.cache[idx]
+
+    def __setitem__(self, idx: int, value: mx.array | None) -> None:
+        self.cache[idx] = value
+
+    def extract(self, idx: int) -> MambaCache:
+        """Extract a single request's cache from the batch.
+
+        Args:
+            idx: Index of the request in the batch
+
+        Returns:
+            MambaCache for the individual request
+        """
+        cache = MambaCache()
+        for i in range(self._cache_size):
+            if self.cache[i] is not None:
+                cache.cache[i] = self.cache[i][idx : idx + 1]
+        return cache
+
+
+def _is_mamba_cache(cache: AnyCache) -> bool:
+    """Check if a cache is a Mamba-style cache (ArraysCache or MambaCache)."""
+    return isinstance(cache, (MambaCache, ArraysCache))
 
 
 def _safe_mx_eval(tensor: mx.array) -> None:
@@ -329,7 +390,7 @@ class MetalModelRunner:
 
         Uses mlx_vlm for vision-language models and mlx_lm for text-only models.
         """
-        model_name = self.model_config.model
+        model_name = get_model_download_path(self.model_config.model)
         is_vlm = self._is_vlm_model()
 
         logger.info(f"Loading model: {model_name} (VLM: {is_vlm})")

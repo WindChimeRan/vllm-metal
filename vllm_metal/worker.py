@@ -5,7 +5,11 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from vllm_metal.config import get_config
+from vllm_metal.config import (
+    AUTO_MEMORY_MIN_BLOCKS_BUFFER_FACTOR,
+    AUTO_MEMORY_OVERHEAD_FACTOR,
+    get_config,
+)
 from vllm_metal.platform import MetalPlatform
 
 if TYPE_CHECKING:
@@ -149,13 +153,19 @@ class MetalWorker:
             # Default estimate: ~4KB per block
             block_memory = 4096
 
+        if block_memory <= 0:
+            msg = (
+                "Computed KV cache block size is invalid "
+                f"({block_memory} bytes). Check model config and VLLM_METAL_BLOCK_SIZE."
+            )
+            raise ValueError(msg)
+
         # Get the maximum buffer size allowed by the device to prevent allocation errors
-        from vllm_metal.platform import get_max_buffer_size
+        from vllm_metal.utils import get_max_buffer_size
 
         max_buffer_size = get_max_buffer_size()
 
-        # Limit the total cache size to be less than the max buffer size to prevent allocation errors
-        # The KV cache pool is one large tensor, so we need to ensure it fits within the limit
+        # Limit the total cache size to be less than the max buffer size
         max_blocks_by_buffer_size = (
             max_buffer_size // block_memory if max_buffer_size > 0 else float("inf")
         )
@@ -196,6 +206,27 @@ class MetalWorker:
             # Ensure minimum for at least one full sequence
             min_cache_memory = int(blocks_per_seq * block_memory * 1.1)
             cache_memory = max(cache_memory, min_cache_memory)
+
+            # Fail fast if minimum needed exceeds total memory
+            minimal_needed = int(
+                (model_memory + min_cache_memory) * AUTO_MEMORY_OVERHEAD_FACTOR
+            )
+            needed_fraction = minimal_needed / total_memory
+
+            if minimal_needed > total_memory:
+                raise ValueError(
+                    "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
+                    "memory than is available. "
+                    f"total={total_memory / 1e9:.2f}GB, "
+                    f"model={model_memory / 1e9:.2f}GB, "
+                    f"min_kv_cache={min_cache_memory / 1e9:.2f}GB, "
+                    f"overhead_factor={AUTO_MEMORY_OVERHEAD_FACTOR:.1f} "
+                    f"(max_model_len={max_model_len}, "
+                    f"block_size={self.config.block_size}, "
+                    f"needed_fraction={needed_fraction:.3f}). "
+                    "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
+                    "or use a smaller model."
+                )
 
             # Apply buffer size constraint
             num_blocks = min(

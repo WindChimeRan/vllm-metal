@@ -22,8 +22,12 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec  # noqa: TC002
 from vllm.v1.outputs import ModelRunnerOutput  # noqa: TC002
 from vllm.v1.worker.worker_base import WorkerBase
 
-from vllm_metal.config import get_config
-from vllm_metal.platform import MetalPlatform, set_wired_limit
+from vllm_metal.config import (
+    AUTO_MEMORY_OVERHEAD_FACTOR,
+    get_config,
+)
+from vllm_metal.platform import MetalPlatform
+from vllm_metal.utils import set_wired_limit
 
 if TYPE_CHECKING:
     from vllm_metal.v1.model_runner import MetalModelRunner
@@ -263,7 +267,6 @@ class MetalWorker(WorkerBase):
         target_cache_memory = target_blocks * block_size_bytes
 
         # Use 50% of total memory for cache (more conservative to prevent allocation errors)
-        # This allows more parallel requests to run while staying within buffer limits
         memory_cap = int((total_memory - model_memory) * 0.5)
         kv_cache_memory = min(target_cache_memory, max(0, memory_cap))
 
@@ -271,9 +274,24 @@ class MetalWorker(WorkerBase):
         min_cache_memory = int(blocks_per_seq * block_size_bytes * 1.1)
         kv_cache_memory = max(kv_cache_memory, min_cache_memory)
 
-        # Total memory limit: model + KV cache + 5% overhead (reduced from 15%)
-        # This provides more headroom to prevent allocation errors
+        # Total memory limit: model + KV cache + 5% overhead
         memory_limit = int((model_memory + kv_cache_memory) * 1.05)
+
+        # Fail fast if minimum needed exceeds total memory
+        if memory_limit > total_memory:
+            needed_fraction = memory_limit / total_memory
+            raise ValueError(
+                "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
+                "memory than is available. "
+                f"total={total_memory / 1e9:.2f}GB, "
+                f"model={model_memory / 1e9:.2f}GB, "
+                f"min_kv_cache={kv_cache_memory / 1e9:.2f}GB, "
+                f"(max_model_len={max_model_len}, "
+                f"block_size={block_size_tokens}, "
+                f"needed_fraction={needed_fraction:.3f}). "
+                "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
+                "or use a smaller model."
+            )
 
         # Set MLX memory limit
         if hasattr(mx, "set_memory_limit"):
@@ -289,15 +307,12 @@ class MetalWorker(WorkerBase):
 
             # If max buffer size is known and our limit is higher, use a safer limit
             if max_buffer_size > 0 and memory_limit > max_buffer_size * 0.9:
-                # Use 60% of max buffer size to be more conservative and prevent allocation errors
-                # The original 75% was still too aggressive for some CI environments
                 memory_limit = int(max_buffer_size * 0.60)
 
             mx.set_memory_limit(memory_limit)
             logger.info(
                 "Auto mode: set MLX memory limit to %.2fGB "
-                "(model=%.2fGB, kv_cache=%.2fGB, "
-                "max_num_seqs=%d)",
+                "(model=%.2fGB, kv_cache=%.2fGB, max_num_seqs=%d)",
                 memory_limit / 1e9,
                 model_memory / 1e9,
                 kv_cache_memory / 1e9,
@@ -317,10 +332,9 @@ class MetalWorker(WorkerBase):
         """
         import psutil  # noqa: PLC0415
 
-        total_memory = psutil.virtual_memory().total
-
         # Handle auto memory mode
         if self.metal_config.is_auto_memory:
+            total_memory = psutil.virtual_memory().total
             # Get actual model memory usage
             model_memory = self._get_model_memory_usage()
 
@@ -335,7 +349,6 @@ class MetalWorker(WorkerBase):
             ) // block_size_tokens
 
             # Get max concurrent sequences from scheduler config
-            # This determines how many sequences can run simultaneously
             max_num_seqs = getattr(
                 self.vllm_config.scheduler_config,
                 "max_num_seqs",
@@ -343,26 +356,38 @@ class MetalWorker(WorkerBase):
             )
 
             # Scale for concurrency: allocate blocks for concurrent sequences
-            # Use a reasonable estimate - not all sequences will be at max_model_len
             # Assume average sequence uses ~25% of max_model_len worth of blocks initially
             avg_blocks_per_seq = max(1, blocks_per_seq // 4)
-            target_blocks = max_num_seqs * avg_blocks_per_seq
-
-            # Add 10% safety buffer
-            target_blocks = int(target_blocks * 1.1)
+            target_blocks = int(max_num_seqs * avg_blocks_per_seq * 1.1)
 
             # Calculate memory needed
             target_cache_memory = target_blocks * block_size_bytes
 
             # Calculate available memory for cache (45% of remaining memory after model)
-            # This is more conservative to prevent allocation errors seen in CI
-            # The original 65% was still too aggressive for some CI environments
             available_for_cache = int((total_memory - model_memory) * 0.45)
             cache_memory = min(target_cache_memory, available_for_cache)
 
             # Ensure minimum for at least one full sequence
             min_cache_memory = int(blocks_per_seq * block_size_bytes * 1.1)
             cache_memory = max(cache_memory, min_cache_memory)
+
+            # Fail fast if minimum needed exceeds total memory
+            minimal_needed = int((model_memory + min_cache_memory) * AUTO_MEMORY_OVERHEAD_FACTOR)
+            if minimal_needed > total_memory:
+                needed_fraction = minimal_needed / total_memory
+                raise ValueError(
+                    "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
+                    "memory than is available. "
+                    f"total={total_memory / 1e9:.2f}GB, "
+                    f"model={model_memory / 1e9:.2f}GB, "
+                    f"min_kv_cache={min_cache_memory / 1e9:.2f}GB, "
+                    f"overhead_factor={AUTO_MEMORY_OVERHEAD_FACTOR:.1f} "
+                    f"(max_model_len={max_model_len}, "
+                    f"block_size={block_size_tokens}, "
+                    f"needed_fraction={needed_fraction:.3f}). "
+                    "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
+                    "or use a smaller model."
+                )
 
             logger.info(
                 "Auto memory mode: model=%.2fGB, "
@@ -379,8 +404,8 @@ class MetalWorker(WorkerBase):
 
             available = cache_memory
         else:
-            # Use configured fraction of system memory (45% instead of 65% for more safety)
-            # The original 65% was still too aggressive for some CI environments
+            total_memory = psutil.virtual_memory().total
+            # Use configured fraction of system memory
             available = int(total_memory * self.metal_config.memory_fraction * 0.45)
 
         logger.info("Metal available memory for KV cache: %.2f GB", available / 1e9)
