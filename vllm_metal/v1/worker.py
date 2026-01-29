@@ -372,7 +372,9 @@ class MetalWorker(WorkerBase):
             cache_memory = max(cache_memory, min_cache_memory)
 
             # Fail fast if minimum needed exceeds total memory
-            minimal_needed = int((model_memory + min_cache_memory) * AUTO_MEMORY_OVERHEAD_FACTOR)
+            minimal_needed = int(
+                (model_memory + min_cache_memory) * AUTO_MEMORY_OVERHEAD_FACTOR
+            )
             if minimal_needed > total_memory:
                 needed_fraction = minimal_needed / total_memory
                 raise ValueError(
