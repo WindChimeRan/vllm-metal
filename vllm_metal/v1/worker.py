@@ -22,10 +22,7 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec  # noqa: TC002
 from vllm.v1.outputs import ModelRunnerOutput  # noqa: TC002
 from vllm.v1.worker.worker_base import WorkerBase
 
-from vllm_metal.config import (
-    AUTO_MEMORY_OVERHEAD_FACTOR,
-    get_config,
-)
+from vllm_metal.config import get_config
 from vllm_metal.platform import MetalPlatform
 from vllm_metal.utils import set_wired_limit
 
@@ -91,6 +88,8 @@ class MetalWorker(WorkerBase):
 
     def init_device(self) -> None:
         """Initialize the Metal device and distributed environment."""
+        import psutil  # noqa: PLC0415
+
         # Set up MLX device
         if self.metal_config.use_mlx:
             device_type = (
@@ -102,28 +101,25 @@ class MetalWorker(WorkerBase):
             logger.info("MLX device set to: %s", mx.default_device())
             set_wired_limit()
 
-            # Additionally, set memory limits to prevent large allocations
-            try:
-                device_info = mx.metal.device_info()
-                max_buffer_size = device_info.get("max_buffer_size", 0)
-                if isinstance(max_buffer_size, str):
-                    max_buffer_size = (
-                        int(max_buffer_size) if max_buffer_size.isdigit() else 0
-                    )
-                elif isinstance(max_buffer_size, float):
-                    max_buffer_size = int(max_buffer_size)
+            # Log system memory info for debugging OOM issues
+            total_memory = psutil.virtual_memory().total
+            available_memory = psutil.virtual_memory().available
+            device_info = mx.metal.device_info()
+            max_buffer_size = device_info.get("max_buffer_length", 0)
+            if isinstance(max_buffer_size, str):
+                max_buffer_size = (
+                    int(max_buffer_size) if max_buffer_size.isdigit() else 0
+                )
+            elif isinstance(max_buffer_size, float):
+                max_buffer_size = int(max_buffer_size)
 
-                if max_buffer_size > 0 and hasattr(mx, "set_memory_limit"):
-                    # Set memory limit to 60% of max buffer size to leave more headroom
-                    # This is more conservative to prevent the allocation error seen in CI
-                    memory_limit = int(max_buffer_size * 0.60)
-                    mx.set_memory_limit(memory_limit)
-                    logger.info(
-                        "Set MLX memory limit to %.1f GB (60%% of max buffer size)",
-                        memory_limit / (1024**3),
-                    )
-            except (RuntimeError, ValueError, OSError) as e:
-                logger.warning("Failed to set memory limit: %s", e)
+            logger.info(
+                "[Memory] System: total=%.2fGB, available=%.2fGB, max_buffer=%.2fGB",
+                total_memory / (1024**3),
+                available_memory / (1024**3),
+                max_buffer_size / (1024**3) if max_buffer_size > 0 else 0,
+            )
+            # Note: MLX memory limit is set after model load in _set_auto_memory_limit()
 
         # Use MetalPlatform.get_torch_device() to properly support MPS when available.
         # This ensures consistency with the platform's device selection logic and
@@ -191,9 +187,9 @@ class MetalWorker(WorkerBase):
         """Load the model onto the Metal device."""
         self.model_runner.load_model()
 
-        # In auto mode, set MLX memory limit to prevent unbounded growth
-        if self.metal_config.is_auto_memory:
-            self._set_auto_memory_limit()
+        # Always calculate memory budget after model loads
+        # This sets both MLX memory limit and _kv_cache_budget
+        self._set_auto_memory_limit()
 
         # Clear cache after model loading to free up memory
         try:
@@ -240,83 +236,61 @@ class MetalWorker(WorkerBase):
         return 0
 
     def _set_auto_memory_limit(self) -> None:
-        """Set MLX memory limit based on auto calculation.
+        """Set MLX memory limit and calculate KV cache budget.
 
-        This prevents MLX from using unbounded memory in auto mode.
+        This is the unified memory calculation - called after model loads.
+        Sets both the MLX memory limit and stores _kv_cache_budget for
+        determine_available_memory() to return.
         """
         import psutil  # noqa: PLC0415
 
         # Get model memory after loading
         model_memory = self._get_model_memory_usage()
-        total_memory = psutil.virtual_memory().total
 
-        # Calculate KV cache memory for concurrent sequences
-        block_size_bytes = self.get_cache_block_size_bytes()
-        block_size_tokens = self.metal_config.block_size
-        max_model_len = self.model_config.max_model_len
+        # Get constraints
+        available_memory = psutil.virtual_memory().available
+        device_info = mx.metal.device_info()
+        max_buffer = device_info.get("max_buffer_length", 0)
+        if isinstance(max_buffer, str):
+            max_buffer = int(max_buffer) if max_buffer.isdigit() else 0
+        elif isinstance(max_buffer, float):
+            max_buffer = int(max_buffer)
 
-        # Blocks needed per sequence at max length
-        blocks_per_seq = (max_model_len + block_size_tokens - 1) // block_size_tokens
+        # Calculate max allowed (respect both system RAM and Metal limits)
+        if max_buffer > 0:
+            max_allowed = min(available_memory, max_buffer)
+        else:
+            max_allowed = available_memory
 
-        # Get max concurrent sequences
-        max_num_seqs = getattr(self.vllm_config.scheduler_config, "max_num_seqs", 256)
+        # TODO: overhead should be profiled; using 0.2 * model_memory for now
+        overhead = int(model_memory * 0.2)
 
-        # Estimate cache memory for concurrent sequences (avg 25% of max length initially)
-        avg_blocks_per_seq = max(1, blocks_per_seq // 4)
-        target_blocks = int(max_num_seqs * avg_blocks_per_seq * 1.1)
-        target_cache_memory = target_blocks * block_size_bytes
+        # KV cache budget = what's left after model and overhead
+        kv_cache_budget = max_allowed - model_memory - overhead
+        kv_cache_budget = max(0, kv_cache_budget)  # safety floor
 
-        # Use 50% of total memory for cache (more conservative to prevent allocation errors)
-        memory_cap = int((total_memory - model_memory) * 0.5)
-        kv_cache_memory = min(target_cache_memory, max(0, memory_cap))
+        # Store for determine_available_memory() to use
+        self._kv_cache_budget = kv_cache_budget
 
-        # Ensure minimum for at least one full sequence
-        min_cache_memory = int(blocks_per_seq * block_size_bytes * 1.1)
-        kv_cache_memory = max(kv_cache_memory, min_cache_memory)
+        # MLX limit = everything we plan to use
+        mlx_limit = model_memory + kv_cache_budget + overhead
 
-        # Total memory limit: model + KV cache + 5% overhead
-        memory_limit = int((model_memory + kv_cache_memory) * 1.05)
-
-        # Fail fast if minimum needed exceeds total memory
-        if memory_limit > total_memory:
-            needed_fraction = memory_limit / total_memory
-            raise ValueError(
-                "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
-                "memory than is available. "
-                f"total={total_memory / 1e9:.2f}GB, "
-                f"model={model_memory / 1e9:.2f}GB, "
-                f"min_kv_cache={kv_cache_memory / 1e9:.2f}GB, "
-                f"(max_model_len={max_model_len}, "
-                f"block_size={block_size_tokens}, "
-                f"needed_fraction={needed_fraction:.3f}). "
-                "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
-                "or use a smaller model."
-            )
+        logger.info(
+            "[Memory] Budget: available=%.2fGB, max_buffer=%.2fGB, "
+            "model=%.2fGB, overhead=%.2fGB, kv_cache=%.2fGB",
+            available_memory / (1024**3),
+            max_buffer / (1024**3) if max_buffer > 0 else 0,
+            model_memory / (1024**3),
+            overhead / (1024**3),
+            kv_cache_budget / (1024**3),
+        )
 
         # Set MLX memory limit
         if hasattr(mx, "set_memory_limit"):
-            # Check if the calculated memory limit exceeds the device's max buffer size
-            device_info = mx.metal.device_info()
-            max_buffer_size = device_info.get("max_buffer_size", 0)
-            if isinstance(max_buffer_size, str):
-                max_buffer_size = (
-                    int(max_buffer_size) if max_buffer_size.isdigit() else 0
-                )
-            elif isinstance(max_buffer_size, float):
-                max_buffer_size = int(max_buffer_size)
-
-            # If max buffer size is known and our limit is higher, use a safer limit
-            if max_buffer_size > 0 and memory_limit > max_buffer_size * 0.9:
-                memory_limit = int(max_buffer_size * 0.60)
-
-            mx.set_memory_limit(memory_limit)
+            mx.set_memory_limit(mlx_limit)
             logger.info(
-                "Auto mode: set MLX memory limit to %.2fGB "
-                "(model=%.2fGB, kv_cache=%.2fGB, max_num_seqs=%d)",
-                memory_limit / 1e9,
-                model_memory / 1e9,
-                kv_cache_memory / 1e9,
-                max_num_seqs,
+                "[Memory] Set MLX limit: %.2fGB",
+                mlx_limit / (1024**3),
             )
         else:
             logger.warning(
@@ -324,94 +298,26 @@ class MetalWorker(WorkerBase):
             )
 
     def determine_available_memory(self) -> int:
-        """Determine available memory for KV cache.
+        """Return available memory for KV cache.
+
+        Returns the budget calculated by _set_auto_memory_limit() after model load.
 
         Returns:
             Available memory in bytes
 
         """
+        if hasattr(self, "_kv_cache_budget"):
+            logger.info(
+                "[Memory] Returning KV cache budget: %.2fGB",
+                self._kv_cache_budget / (1024**3),
+            )
+            return self._kv_cache_budget
+
+        # Fallback: if called before model load (shouldn't happen)
         import psutil  # noqa: PLC0415
 
-        # Handle auto memory mode
-        if self.metal_config.is_auto_memory:
-            total_memory = psutil.virtual_memory().total
-            # Get actual model memory usage
-            model_memory = self._get_model_memory_usage()
-
-            # Get block size for cache calculation
-            block_size_bytes = self.get_cache_block_size_bytes()
-            block_size_tokens = self.metal_config.block_size
-
-            # Calculate blocks needed per sequence at max_model_len
-            max_model_len = self.model_config.max_model_len
-            blocks_per_seq = (
-                max_model_len + block_size_tokens - 1
-            ) // block_size_tokens
-
-            # Get max concurrent sequences from scheduler config
-            max_num_seqs = getattr(
-                self.vllm_config.scheduler_config,
-                "max_num_seqs",
-                256,
-            )
-
-            # Scale for concurrency: allocate blocks for concurrent sequences
-            # Assume average sequence uses ~25% of max_model_len worth of blocks initially
-            avg_blocks_per_seq = max(1, blocks_per_seq // 4)
-            target_blocks = int(max_num_seqs * avg_blocks_per_seq * 1.1)
-
-            # Calculate memory needed
-            target_cache_memory = target_blocks * block_size_bytes
-
-            # Calculate available memory for cache (45% of remaining memory after model)
-            available_for_cache = int((total_memory - model_memory) * 0.45)
-            cache_memory = min(target_cache_memory, available_for_cache)
-
-            # Ensure minimum for at least one full sequence
-            min_cache_memory = int(blocks_per_seq * block_size_bytes * 1.1)
-            cache_memory = max(cache_memory, min_cache_memory)
-
-            # Fail fast if minimum needed exceeds total memory
-            minimal_needed = int(
-                (model_memory + min_cache_memory) * AUTO_MEMORY_OVERHEAD_FACTOR
-            )
-            if minimal_needed > total_memory:
-                needed_fraction = minimal_needed / total_memory
-                raise ValueError(
-                    "Auto memory mode (VLLM_METAL_MEMORY_FRACTION=auto) requires more "
-                    "memory than is available. "
-                    f"total={total_memory / 1e9:.2f}GB, "
-                    f"model={model_memory / 1e9:.2f}GB, "
-                    f"min_kv_cache={min_cache_memory / 1e9:.2f}GB, "
-                    f"overhead_factor={AUTO_MEMORY_OVERHEAD_FACTOR:.1f} "
-                    f"(max_model_len={max_model_len}, "
-                    f"block_size={block_size_tokens}, "
-                    f"needed_fraction={needed_fraction:.3f}). "
-                    "Mitigations: reduce max_model_len, reduce VLLM_METAL_BLOCK_SIZE, "
-                    "or use a smaller model."
-                )
-
-            logger.info(
-                "Auto memory mode: model=%.2fGB, "
-                "max_model_len=%d, max_num_seqs=%d, "
-                "blocks_per_seq=%d, target_blocks=%d, "
-                "cache_memory=%.2fGB",
-                model_memory / 1e9,
-                max_model_len,
-                max_num_seqs,
-                blocks_per_seq,
-                target_blocks,
-                cache_memory / 1e9,
-            )
-
-            available = cache_memory
-        else:
-            total_memory = psutil.virtual_memory().total
-            # Use configured fraction of system memory
-            available = int(total_memory * self.metal_config.memory_fraction * 0.45)
-
-        logger.info("Metal available memory for KV cache: %.2f GB", available / 1e9)
-        return available
+        logger.warning("[Memory] determine_available_memory called before model load")
+        return int(psutil.virtual_memory().available * 0.5)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         """Get KV cache specification.

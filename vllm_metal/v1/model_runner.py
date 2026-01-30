@@ -142,7 +142,7 @@ def _safe_mx_eval(tensor: mx.array) -> None:
             # Get device info to determine safe chunk sizes
             device_info = mx.metal.device_info()
             max_buffer_size = device_info.get(
-                "max_buffer_size", 3 * 1024**3
+                "max_buffer_length", 3 * 1024**3
             )  # Default to 3GB
             if isinstance(max_buffer_size, str):
                 max_buffer_size = (
@@ -563,10 +563,27 @@ class MetalModelRunner:
             dtype=mx.float16,
         )
 
+        # Calculate actual memory used (may differ from requested if reduced)
+        actual_blocks = self._paged_cache.num_blocks
+        dtype_size = 2  # float16
+        actual_memory = (
+            actual_blocks
+            * num_layers
+            * 2
+            * self.metal_config.block_size
+            * num_kv_heads
+            * head_dim
+            * dtype_size
+        )
         logger.info(
-            f"PagedKVCache initialized: {self.num_kv_cache_blocks} blocks, "
-            f"block_size={self.metal_config.block_size}, "
-            f"layers={num_layers}, kv_heads={num_kv_heads}, head_dim={head_dim}"
+            "[Memory] PagedKVCache ready: %d blocks (%.2fGB), "
+            "block_size=%d, layers=%d, kv_heads=%d, head_dim=%d",
+            actual_blocks,
+            actual_memory / (1024**3),
+            self.metal_config.block_size,
+            num_layers,
+            num_kv_heads,
+            head_dim,
         )
         self.kv_cache_initialized = True
 

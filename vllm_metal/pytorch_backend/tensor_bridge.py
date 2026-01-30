@@ -142,7 +142,7 @@ def mlx_to_torch(
                         # Calculate chunk size based on available buffer size
                         device_info = mx.metal.device_info()
                         max_buffer_size_raw = device_info.get(
-                            "max_buffer_size", 3 * 1024**3
+                            "max_buffer_length", 3 * 1024**3
                         )
 
                         # Ensure max_buffer_size is an integer
@@ -217,7 +217,7 @@ def mlx_to_torch(
                         # Calculate chunk size based on available buffer size
                         device_info = mx.metal.device_info()
                         max_buffer_size_raw = device_info.get(
-                            "max_buffer_size", 3 * 1024**3
+                            "max_buffer_length", 3 * 1024**3
                         )
 
                         # Ensure max_buffer_size is an integer

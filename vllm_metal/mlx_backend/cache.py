@@ -167,6 +167,30 @@ class PagedKVCache:
 
         # Block pool: (num_blocks, num_layers, 2, block_size, num_kv_heads, head_dim)
         # where 2 = key + value
+        # Calculate memory required for block pool
+        dtype_size = 2  # float16
+        block_pool_bytes = (
+            num_blocks
+            * num_layers
+            * 2
+            * block_size
+            * num_kv_heads
+            * head_dim
+            * dtype_size
+        )
+        logger.info(
+            "[Memory] KV cache allocation: num_blocks=%d, "
+            "shape=(%d, %d, 2, %d, %d, %d), "
+            "total=%.2fGB",
+            num_blocks,
+            num_blocks,
+            num_layers,
+            block_size,
+            num_kv_heads,
+            head_dim,
+            block_pool_bytes / (1024**3),
+        )
+
         try:
             self.block_pool = mx.zeros(
                 (num_blocks, num_layers, 2, block_size, num_kv_heads, head_dim),
@@ -178,7 +202,9 @@ class PagedKVCache:
             ) and "greater than the maximum allowed buffer size" in str(e):
                 # Memory allocation error - try with fewer blocks
                 logger.warning(
-                    f"Initial block allocation failed: {e}. Reducing cache size..."
+                    "[Memory] Block pool allocation failed (requested %.2fGB): %s",
+                    block_pool_bytes / (1024**3),
+                    e,
                 )
 
                 # Try to reduce the number of blocks by half iteratively until it works
@@ -186,8 +212,20 @@ class PagedKVCache:
                 while reduced_num_blocks > 1:
                     try:
                         reduced_num_blocks //= 2
+                        reduced_bytes = (
+                            reduced_num_blocks
+                            * num_layers
+                            * 2
+                            * block_size
+                            * num_kv_heads
+                            * head_dim
+                            * dtype_size
+                        )
                         logger.info(
-                            f"Trying with {reduced_num_blocks} blocks instead of {num_blocks}"
+                            "[Memory] Retrying with %d blocks (%.2fGB) instead of %d",
+                            reduced_num_blocks,
+                            reduced_bytes / (1024**3),
+                            num_blocks,
                         )
                         self.block_pool = mx.zeros(
                             (
@@ -202,8 +240,11 @@ class PagedKVCache:
                         )
                         self.num_blocks = reduced_num_blocks
                         logger.warning(
-                            f"Successfully allocated with reduced cache: {reduced_num_blocks} blocks "
-                            f"(was {num_blocks}). Performance may be impacted."
+                            "[Memory] Allocated reduced cache: %d blocks (%.2fGB), "
+                            "originally requested %d blocks. Performance may be impacted.",
+                            reduced_num_blocks,
+                            reduced_bytes / (1024**3),
+                            num_blocks,
                         )
                         break
                     except RuntimeError:
