@@ -266,8 +266,9 @@ class MetalWorker(WorkerBase):
         overhead = int(model_memory * 0.2)
 
         # KV cache budget = what's left after model and overhead
-        kv_cache_budget = max_allowed - model_memory - overhead
+        kv_cache_budget = max_allowed - overhead
         kv_cache_budget = max(0, kv_cache_budget)  # safety floor
+        kv_cache_budget = int(0.6 * kv_cache_budget)  # for debugging
 
         # Store for determine_available_memory() to use
         self._kv_cache_budget = kv_cache_budget

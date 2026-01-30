@@ -427,11 +427,12 @@ class PagedBatchKVCacheAdapterLayer:
             adapter = adapter_list[self.layer_idx]
             seq_len = adapter.offset
 
-            # Get this sequence's KV
+            # Get this sequence's KV using adapter's block IDs
+            # (not the internal allocator, which doesn't know about scheduler-provided blocks)
             if self.paged_cache is None:
                 raise RuntimeError("Paged cache not initialized")
-            cached_k, cached_v = self.paged_cache.get_sequence_kv(
-                seq_id=adapter.seq_id,
+            cached_k, cached_v = self.paged_cache.get_kv_from_blocks(
+                block_ids=adapter.get_block_ids(),
                 layer_idx=self.layer_idx,
                 seq_len=seq_len,
             )
