@@ -20,7 +20,7 @@ from vllm_metal.metal_kernel_backend.paged_attention import (
     MetalKernelPagedAttentionWrapper,
     patch_model_attention_metal_kernel,
 )
-from vllm_metal.mlx_backend.paged_attention import (
+from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
     prepare_decode,

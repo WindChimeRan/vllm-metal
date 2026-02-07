@@ -10,7 +10,7 @@ Decode: MLX projections + per-request RoPE, bridge Q/K/V to MPS, call
 block tables), bridge output back to MLX.
 
 Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_prefill``,
-``prepare_decode``, ``clear_context`` from ``mlx_backend.paged_attention``.
+``prepare_decode``, ``clear_context`` from ``paged_attention_common``.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import torch
 
 from vllm_metal.metal_kernel_backend.cache import MPSPagedKVCache
 from vllm_metal.metal_kernel_backend.kernel_loader import get_paged_attention_ops
-from vllm_metal.mlx_backend.paged_attention import (
+from vllm_metal.paged_attention_common import (
     PagedAttentionContext,
     _find_layers_and_attr,
     get_context,

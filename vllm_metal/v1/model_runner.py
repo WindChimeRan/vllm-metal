@@ -43,7 +43,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_metal.config import get_config
-from vllm_metal.mlx_backend.paged_attention import (
+from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
     prepare_decode,

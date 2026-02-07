@@ -7,7 +7,7 @@ Run with:
 
 from __future__ import annotations
 
-from vllm_metal.mlx_backend.paged_attention import (
+from vllm_metal.paged_attention_common import (
     OffsetCache,
     clear_context,
     prepare_decode,
@@ -32,7 +32,7 @@ class TestOffsetCache:
 class TestPrepare:
     def test_prepare_prefill_slot_mapping(self):
         prepare_prefill([10, 11], num_tokens=5, block_size=4)
-        from vllm_metal.mlx_backend.paged_attention import get_context
+        from vllm_metal.paged_attention_common import get_context
 
         ctx = get_context()
         assert ctx is not None
@@ -43,7 +43,7 @@ class TestPrepare:
 
     def test_prepare_decode(self):
         prepare_decode([([5, 6], 7)], block_size=4)
-        from vllm_metal.mlx_backend.paged_attention import get_context
+        from vllm_metal.paged_attention_common import get_context
 
         ctx = get_context()
         assert ctx is not None
