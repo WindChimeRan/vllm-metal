@@ -1043,11 +1043,21 @@ class MetalModelRunner:
             getattr(getattr(cache_model, "model", cache_model), "layers", [None] * 32)
         )
 
-        # Set up paged context and thin cache
+        # Stash per-request metadata (slot_mapping) in thread-local so the
+        # patched attention wrappers can read it during the forward pass.
         prepare_prefill(block_ids, num_tokens, self._paged_block_size)
+
+        # OffsetCache is a fake cache — it stores no KV data.  It only
+        # satisfies mlx_lm's RoPE offset and mask protocol.  Real KV is
+        # written to the MPS paged cache by the attention wrapper.
         offset_caches = [OffsetCache(0) for _ in range(num_layers)]
 
-        # Forward pass (attention wrapper handles reshape_and_cache)
+        # The model forward calls each layer's self_attn, which has been
+        # replaced by MetalKernelPagedAttentionWrapper.  The wrapper:
+        # - ignores cache= (OffsetCache) for KV storage
+        # - reads get_context() for slot_mapping
+        # - computes attention via MLX SDPA
+        # - writes K/V to MPS paged cache via reshape_and_cache
         input_ids = mx.array([token_ids], dtype=mx.int32)
         model_output = self.model(input_ids, cache=offset_caches)
         logits = self._extract_logits(model_output)
@@ -1103,6 +1113,8 @@ class MetalModelRunner:
             block_ids = self._allocate_blocks_for_seq(req_id, seq_len + 1)
             requests_info.append((block_ids, seq_len))
 
+        # Stash per-request metadata (slot_mapping, block_tables, context_lens,
+        # offsets) in thread-local for the attention wrappers.
         prepare_decode(requests_info, self._paged_block_size)
 
         # Determine number of layers
@@ -1115,7 +1127,10 @@ class MetalModelRunner:
             getattr(getattr(cache_model, "model", cache_model), "layers", [None] * 32)
         )
 
-        # Use max offset so create_attention_mask returns None for N=1
+        # OffsetCache is a fake cache — no KV stored.  The offset value
+        # only matters for make_mask(); for single-token decode make_mask(1)
+        # returns None regardless, so a shared max_offset is fine.  Actual
+        # per-request RoPE offsets come from ctx.offsets in the wrapper.
         max_offset = max(info[1] for info in requests_info)
         offset_caches = [OffsetCache(max_offset) for _ in range(num_layers)]
 
@@ -1132,7 +1147,13 @@ class MetalModelRunner:
 
         batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
 
-        # Forward pass (attention wrapper handles kernel calls)
+        # The model forward calls each layer's self_attn, which has been
+        # replaced by MetalKernelPagedAttentionWrapper.  The wrapper:
+        # - ignores cache= (OffsetCache) for KV storage
+        # - reads get_context() for block_tables, slot_mapping, offsets
+        # - applies per-request RoPE using ctx.offsets
+        # - writes new K/V to MPS paged cache via reshape_and_cache
+        # - reads all cached K/V via paged_attention_v1 (zero-copy)
         model_output = self.model(batched_input, cache=offset_caches)
         logits = self._extract_logits(model_output)
         next_token_logits = logits[:, -1, :]

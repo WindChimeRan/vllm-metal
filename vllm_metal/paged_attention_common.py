@@ -23,6 +23,12 @@ from mlx_lm.models.base import create_causal_mask
 # Global context (thread-local)
 # ---------------------------------------------------------------------------
 
+# Thread-local storage used to pass per-request metadata (slot_mapping,
+# block_tables, etc.) to attention wrappers buried inside the model.
+# We cannot add extra arguments to the mlx_lm forward signature, so
+# instead: prepare_prefill/decode() stashes context here before the
+# forward pass, each attention wrapper reads it via get_context(), and
+# clear_context() cleans up afterwards.
 _thread_local = threading.local()
 
 
@@ -56,11 +62,22 @@ def clear_context() -> None:
 
 
 class OffsetCache:
-    """Minimal cache-like object that provides ``offset`` and ``make_mask``.
+    """Fake KV cache that stores no data — only satisfies mlx_lm's protocol.
 
-    The mlx_lm model reads ``cache.offset`` for RoPE and calls
-    ``cache.make_mask(N)`` (delegated from ``create_attention_mask``).
-    We satisfy both without storing any KV data.
+    The mlx_lm model expects ``cache=`` to be a list of cache objects (one
+    per layer) and reads two things from each:
+    - ``cache.offset``: RoPE position index for the current token(s).
+    - ``cache.make_mask(N)``: attention mask (``"causal"`` for multi-token
+      prefill, ``None`` for single-token decode where no mask is needed).
+
+    With paged attention, real K/V lives in the MPS paged cache (managed by
+    the attention wrapper), NOT in these objects.  OffsetCache is a shim so
+    that mlx_lm's RoPE and masking logic work without changes.
+
+    Note: during batched decode the model runner passes a single shared
+    ``OffsetCache(max_offset)`` per layer.  The actual per-request RoPE
+    offsets come from ``ctx.offsets`` inside the attention wrapper, not
+    from this object.
     """
 
     def __init__(self, offset: int) -> None:
