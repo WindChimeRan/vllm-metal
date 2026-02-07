@@ -11,6 +11,53 @@ block tables), bridge output back to MLX.
 
 Reuses ``PagedAttentionContext``, ``OffsetCache``, ``prepare_prefill``,
 ``prepare_decode``, ``clear_context`` from ``paged_attention_common``.
+
+Backend replacement guide
+-------------------------
+This module exists because there is no flash attention library for Apple
+Silicon.  The HF Metal kernel is no longer actively maintained, so it may
+be replaced in the future.  To swap in a new attention backend:
+
+1. **Cache**: Create a new cache class that allocates per-layer KV storage
+   addressable by block index.  The model runner calls
+   ``allocate_blocks(seq_id, n)`` and ``free_sequence(seq_id)`` — keep
+   this interface.
+
+2. **Prefill**: Receives ``(queries, keys, values)`` after projection and
+   RoPE, all as MLX arrays shaped ``(1, heads, seq_len, head_dim)``.
+   Must compute attention output AND write K/V into the paged cache at
+   positions given by ``ctx.slot_mapping``.
+
+3. **Decode**: Receives ``(queries, keys, values)`` for the new token
+   only, shaped ``(B, heads, 1, head_dim)``.  Must write the new K/V
+   into the cache at ``ctx.slot_mapping``, then compute attention against
+   ALL previously cached K/V using ``ctx.block_tables`` (list of block
+   ids per request) and ``ctx.context_lens`` (total length including the
+   new token).
+
+4. **RoPE**: Currently applied inside this wrapper with per-request
+   offsets (``ctx.offsets``).  If your kernel expects pre-RoPE'd inputs,
+   keep this logic.  If it handles RoPE internally, remove it.
+
+5. **OffsetCache**: The model runner passes ``OffsetCache`` objects as
+   ``cache=`` to the model forward call.  These are NOT real KV caches —
+   they are shims that satisfy mlx_lm's ``create_attention_mask`` /
+   RoPE offset protocol.  The wrapper reads the real paged cache from
+   its own ``_mk_kv_cache`` attribute, not from this argument.
+
+6. **Patch function**: ``patch_model_attention_*(model, cache,
+   block_size)`` walks transformer layers and replaces each attention
+   module with a wrapper.  Keep this pattern — the worker calls it once
+   at startup (``worker._setup_paged_attention``).
+
+Files that do NOT need changes when replacing the backend:
+- ``paged_attention_common.py`` (shared context / prepare functions)
+- ``model_runner.py`` (only uses prepare/clear API)
+
+Files that DO need changes:
+- This module (attention wrapper + patch function)
+- ``cache.py`` (cache class + layout)
+- ``worker.py`` (``_setup_paged_attention`` — one function)
 """
 
 from __future__ import annotations
