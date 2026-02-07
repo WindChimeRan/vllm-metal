@@ -213,8 +213,7 @@ def _metal_kernel_decode_attention(
 class MetalKernelPagedAttentionWrapper(nn.Module):
     """Wraps an mlx_lm Attention module to use the HF Metal kernel for paged KV.
 
-    Same pattern as ``PagedAttentionWrapper`` in ``mlx_backend/paged_attention.py``:
-    uses ``object.__setattr__`` to bypass MLX nn.Module's ``__setattr__``.
+    Uses ``object.__setattr__`` to bypass MLX nn.Module's ``__setattr__``.
 
     When no ``PagedAttentionContext`` is set, falls back to original attention.
     """

@@ -407,13 +407,10 @@ class MetalModelRunner:
             self._prefix_cache = PrefixCacheManager()
 
         # Paged attention state (set by worker when enabled)
-        self._paged_kv_cache: Any = None  # PagedKVCache, set by worker
+        self._paged_kv_cache: Any = None  # MPSPagedKVCache, set by worker
         self._paged_block_size: int = 0
         self._paged_request_blocks: dict[str, list[int]] = {}  # req_id → block_ids
         self._paged_request_seq_lens: dict[str, int] = {}  # req_id → seq_len
-
-        # Metal kernel paged attention state (set by worker when enabled)
-        self._metal_kernel_kv_cache: Any = None  # MPSPagedKVCache, set by worker
 
     def _is_vlm_model(self) -> bool:
         """Check if the model is a vision-language model (VLM).
@@ -1015,7 +1012,7 @@ class MetalModelRunner:
         if len(existing) >= num_blocks:
             return existing
         needed = num_blocks - len(existing)
-        cache = self._metal_kernel_kv_cache or self._paged_kv_cache
+        cache = self._paged_kv_cache
         new_blocks = cache.allocate_blocks(hash(req_id), needed)
         all_blocks = existing + new_blocks
         self._paged_request_blocks[req_id] = all_blocks
@@ -1030,186 +1027,8 @@ class MetalModelRunner:
     ) -> int:
         """Paged-attention prefill for a single request.
 
-        Returns the next token.
-        """
-        num_tokens = len(token_ids)
-        block_ids = self._allocate_blocks_for_seq(req_id, num_tokens)
-
-        # Determine number of layers for OffsetCache list
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
-        )
-        num_layers = len(
-            getattr(getattr(cache_model, "model", cache_model), "layers", [None] * 32)
-        )
-
-        # Set up paged context and thin cache
-        prepare_prefill(block_ids, num_tokens, self._paged_block_size)
-        offset_caches = [OffsetCache(0) for _ in range(num_layers)]
-
-        # Forward pass
-        input_ids = mx.array([token_ids], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=offset_caches)
-        logits = self._extract_logits(model_output)
-        last_logits = logits[:, -1, :]
-
-        clear_context()
-
-        # Sample
-        is_greedy = sampling_params.temperature < 1e-5
-        needs_advanced = (
-            sampling_params.top_k > 0
-            or sampling_params.top_p < 1.0
-            or sampling_params.frequency_penalty != 0
-            or sampling_params.presence_penalty != 0
-            or sampling_params.repetition_penalty != 1.0
-        )
-
-        if is_greedy and not needs_advanced:
-            next_token_mlx = _mlx_greedy_sample(last_logits)
-            mx.eval(next_token_mlx, self._paged_kv_cache.block_pool)
-            next_token = int(next_token_mlx.item())
-        else:
-            mx.eval(last_logits, self._paged_kv_cache.block_pool)
-            logits_torch = mlx_to_torch(
-                last_logits.astype(mx.float32), device=self.device
-            )
-            generators = {} if generator is None else {0: generator}
-            metadata = self._make_sampling_metadata(
-                [sampling_params], [token_ids], [[]], generators=generators
-            )
-            output = self._sampler.forward(logits_torch, metadata)
-            next_token = int(output.sampled_token_ids[0, 0].item())
-
-        # Track sequence length
-        self._paged_request_seq_lens[req_id] = num_tokens
-
-        return next_token
-
-    def _batched_decode_paged(
-        self, decode_reqs: list[tuple[str, RequestState]]
-    ) -> list[int]:
-        """Paged-attention batched decode.
-
-        All requests processed in one forward pass with per-request RoPE.
-        """
-        batch_size = len(decode_reqs)
-
-        # Build request info for prepare_decode
-        requests_info: list[tuple[list[int], int]] = []
-        for req_id, state in decode_reqs:
-            seq_len = self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 1)
-            block_ids = self._allocate_blocks_for_seq(req_id, seq_len + 1)
-            requests_info.append((block_ids, seq_len))
-
-        prepare_decode(requests_info, self._paged_block_size)
-
-        # Determine number of layers
-        cache_model = (
-            self.model.language_model
-            if self._is_vlm and hasattr(self.model, "language_model")
-            else self.model
-        )
-        num_layers = len(
-            getattr(getattr(cache_model, "model", cache_model), "layers", [None] * 32)
-        )
-
-        # Use max offset so create_attention_mask returns None for N=1
-        max_offset = max(info[1] for info in requests_info)
-        offset_caches = [OffsetCache(max_offset) for _ in range(num_layers)]
-
-        # Build batched input
-        if self._rust_state_manager is not None:
-            last_tokens = self._rust_state_manager.get_last_tokens_batch(
-                [req_id for req_id, _ in decode_reqs]
-            )
-        else:
-            last_tokens = [
-                state.token_ids[-1] if state.token_ids else 0
-                for _, state in decode_reqs
-            ]
-
-        batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
-
-        # Forward pass
-        model_output = self.model(batched_input, cache=offset_caches)
-        logits = self._extract_logits(model_output)
-        next_token_logits = logits[:, -1, :]
-
-        clear_context()
-
-        # Sample
-        sampling_params_list = [state.sampling_params for _, state in decode_reqs]
-        all_greedy = all(sp.temperature < 1e-5 for sp in sampling_params_list)
-        any_advanced = any(
-            sp.top_k > 0
-            or sp.top_p < 1.0
-            or sp.frequency_penalty != 0
-            or sp.presence_penalty != 0
-            or sp.repetition_penalty != 1.0
-            for sp in sampling_params_list
-        )
-
-        if all_greedy and not any_advanced:
-            next_tokens_mlx = _mlx_greedy_sample(next_token_logits)
-            mx.eval(next_tokens_mlx, self._paged_kv_cache.block_pool)
-            next_tokens: list[int] = next_tokens_mlx.tolist()
-        else:
-            mx.eval(next_token_logits, self._paged_kv_cache.block_pool)
-            prompt_token_ids_list = [
-                state.token_ids[: state.prompt_len] for _, state in decode_reqs
-            ]
-            output_tokens_list = [
-                state.token_ids[state.prompt_len :] for _, state in decode_reqs
-            ]
-            generators = {
-                i: state.generator
-                for i, (_, state) in enumerate(decode_reqs)
-                if state.generator is not None
-            }
-            logits_torch = mlx_to_torch(
-                next_token_logits.astype(mx.float32), device=self.device
-            )
-            metadata = self._make_sampling_metadata(
-                sampling_params_list,
-                prompt_token_ids_list,
-                output_tokens_list,
-                generators=generators,
-            )
-            output = self._sampler.forward(logits_torch, metadata)
-            next_tokens = [
-                int(output.sampled_token_ids[i, 0].item()) for i in range(batch_size)
-            ]
-
-        # Update state
-        for i, (req_id, state) in enumerate(decode_reqs):
-            state.token_ids.append(next_tokens[i])
-            state.generated_tokens += 1
-            self._paged_request_seq_lens[req_id] = (
-                self._paged_request_seq_lens.get(req_id, len(state.token_ids) - 2) + 1
-            )
-            if self._rust_state_manager is not None:
-                self._rust_state_manager.append_token(req_id, next_tokens[i])
-
-        return next_tokens
-
-    # ------------------------------------------------------------------
-    # Metal kernel paged attention paths
-    # ------------------------------------------------------------------
-
-    def _prefill_single_metal_kernel(
-        self,
-        req_id: str,
-        token_ids: list[int],
-        sampling_params: SamplingParams,
-        generator: torch.Generator | None = None,
-    ) -> int:
-        """Metal-kernel paged-attention prefill for a single request.
-
         Uses MLX for inline SDPA, then writes K/V to MPS paged cache via
-        the HF reshape_and_cache kernel.
+        the HF reshape_and_cache kernel. Returns the next token.
         """
         num_tokens = len(token_ids)
         block_ids = self._allocate_blocks_for_seq(req_id, num_tokens)
@@ -1267,10 +1086,10 @@ class MetalModelRunner:
 
         return next_token
 
-    def _batched_decode_metal_kernel(
+    def _batched_decode_paged(
         self, decode_reqs: list[tuple[str, RequestState]]
     ) -> list[int]:
-        """Metal-kernel paged-attention batched decode.
+        """Paged-attention batched decode.
 
         Uses MLX for projections + per-request RoPE, then the HF kernel for
         reshape_and_cache + paged_attention_v1 (zero-copy from block tables).
@@ -1411,24 +1230,15 @@ class MetalModelRunner:
             if token_ids:
                 generator = _create_request_generator(self.device, sampling_params)
 
-                if self._metal_kernel_kv_cache is not None:
-                    # Metal kernel paged attention path
-                    next_token = self._prefill_single_metal_kernel(
-                        req_id,
-                        token_ids,
-                        sampling_params,
-                        generator=generator,
-                    )
-                    cache: list[AnyCache] = []  # No per-request KV cache needed
-                elif self._paged_kv_cache is not None:
-                    # MLX paged attention path
+                if self._paged_kv_cache is not None:
+                    # Paged attention path (Metal kernel)
                     next_token = self._prefill_single_paged(
                         req_id,
                         token_ids,
                         sampling_params,
                         generator=generator,
                     )
-                    cache = []
+                    cache: list[AnyCache] = []  # No per-request KV cache needed
                 else:
                     next_token, cache = self._prefill_single(
                         req_id,
@@ -1469,11 +1279,8 @@ class MetalModelRunner:
                     valid_decode_reqs.append((req_id, state))
 
             if valid_decode_reqs:
-                if self._metal_kernel_kv_cache is not None:
-                    # Metal kernel paged attention path (always batched)
-                    decode_tokens = self._batched_decode_metal_kernel(valid_decode_reqs)
-                elif self._paged_kv_cache is not None:
-                    # MLX paged attention path (always batched)
+                if self._paged_kv_cache is not None:
+                    # Paged attention path (always batched)
                     decode_tokens = self._batched_decode_paged(valid_decode_reqs)
                 elif len(valid_decode_reqs) >= _MIN_BATCH_SIZE_FOR_BATCHING:
                     decode_tokens = self._batched_decode(valid_decode_reqs)
@@ -1502,9 +1309,9 @@ class MetalModelRunner:
                         del state.cache
                     del state
 
-                # Free paged KV blocks (MLX or Metal kernel)
-                paged_cache = self._metal_kernel_kv_cache or self._paged_kv_cache
-                if paged_cache is not None:
+                # Free paged KV blocks
+                if self._paged_kv_cache is not None:
+                    paged_cache = self._paged_kv_cache
                     req_hash = hash(req_id)
                     if paged_cache.has_sequence(req_hash):
                         paged_cache.free_sequence(req_hash)
