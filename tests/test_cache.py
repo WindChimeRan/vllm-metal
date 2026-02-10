@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for KV cache implementations."""
+"""Tests for KV cache implementations.
+
+NOTE: PagedKVCache is not used in production (see MPSPagedKVCache).
+These tests are kept as a reference for future development.
+"""
 
 import mlx.core as mx
 import pytest

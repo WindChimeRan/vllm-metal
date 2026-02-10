@@ -132,6 +132,10 @@ class KVCache:
 class PagedKVCache:
     """Paged KV cache for batched inference with variable sequence lengths.
 
+    NOTE: This class is not used in production. The active paged attention
+    implementation uses MPSPagedKVCache from metal_kernel_backend.cache.
+    Kept as a reference for future development.
+
     Uses Rust-based O(1) block allocation via VecDeque, providing 355x faster
     allocation compared to Python's list.pop(0) at scale.
     """
