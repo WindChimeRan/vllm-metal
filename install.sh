@@ -7,8 +7,16 @@
 # publishes macOS wheels only under a commit's flat /<sha>/<file> path, never in
 # its PEP 503 indexes, so --extra-index-url cannot see them.
 #
-# To bump: paste the macOS wheel URL of a newer vllm main commit.
-VLLM_WHEEL_URL="https://wheels.vllm.ai/56557d98703c30190ddb70de23ed7d0297474564/vllm-0.23.1rc1.dev958%2Bg56557d987.cpu-cp312-cp312-macosx_11_0_arm64.whl"
+# The version string counts from main's last tag (v0.23.1rc1), not from the
+# latest release — release tags are cut off main's lineage. So "0.23.1rc1.devNNNN"
+# is NOT older than 0.26.0; this wheel is main ahead of that release. It carries
+# CacheConfig.prefix_match_unit, which platform.py:823 requires.
+#
+# To bump: only the daily nightly commit gets wheels, not every main commit. Read
+# the newest nightly's sha out of https://wheels.vllm.ai/nightly/vllm/ (its hrefs
+# are ../../<sha>/...), then take the macosx_11_0_arm64 wheel that the matching
+# https://wheels.vllm.ai/<sha>/cpu/vllm/ index lists.
+VLLM_WHEEL_URL="https://wheels.vllm.ai/1240c74c0a47473449cf0c3a9c2d87a1e159f73b/vllm-0.23.1rc1.dev1502%2Bg1240c74c0.cpu-cp312-cp312-macosx_11_0_arm64.whl"
 
 _cleanup_dirs=()
 
