@@ -172,7 +172,10 @@ build_wheel() {
   build_native_artifacts
 
   section "Building wheel"
-  uv build
+  # --wheel: never produce an sdist. Publishing one would let pip fall back to a
+  # source build on any platform we ship no wheel for, which needs the Metal
+  # toolchain — the compile-on-install this project exists to avoid.
+  uv build --wheel
 
   local wheels=(dist/*.whl)
   if [ ! -f "${wheels[0]}" ]; then

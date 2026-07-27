@@ -9,7 +9,11 @@ version = "0.3.0"
 description = "vLLM hardware plugin for Apple Silicon - unifies MLX and PyTorch under a single lowering path"
 readme = "README.md"
 license = {text = "Apache-2.0"}
-requires-python = ">=3.12,<3.14"
+# 3.12 only: the native extensions are version-specific (not abi3) and vLLM's
+# own macOS wheel is cp312, so there is nothing to pair a cp313 build with.
+# Claiming 3.13 here turns "requires Python 3.12" into a confusing
+# "no matching distribution" for anyone on a newer default interpreter.
+requires-python = ">=3.12,<3.13"
 authors = [
     {name = "vLLM Community"}
 ]
@@ -21,7 +25,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
