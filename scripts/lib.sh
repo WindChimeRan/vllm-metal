@@ -163,3 +163,21 @@ for _name in METALLIB_NAMES:
 
   success "Wheel bundles all native artifacts"
 }
+
+# Build the wheel into dist/ and fail unless it bundles the native artifacts.
+# Needs setup_dev_env first, and builds whatever version pyproject.toml holds —
+# release.sh dev-stamps it beforehand, build.sh leaves it alone.
+build_wheel() {
+  ensure_metal_toolchain
+  build_native_artifacts
+
+  section "Building wheel"
+  uv build
+
+  local wheels=(dist/*.whl)
+  if [ ! -f "${wheels[0]}" ]; then
+    error "No wheel found in dist/ after uv build."
+    return 1
+  fi
+  verify_wheel_artifacts "${wheels[0]}"
+}

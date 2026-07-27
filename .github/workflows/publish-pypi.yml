@@ -1,0 +1,66 @@
+name: Publish to PyPI
+
+# Manual, unlike release.yml's per-push dev wheels: a PyPI version can only be
+# uploaded once, so publishing on every merge would burn version numbers.
+# Publishes whatever version pyproject.toml holds — bump it first.
+#
+# Needs a one-time Trusted Publisher registration; see docs/releasing.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Index to publish to"
+        type: choice
+        options:
+          - testpypi
+          - pypi
+        default: testpypi
+
+jobs:
+  build:
+    name: Build macOS arm64 wheel
+    # macOS runner: the wheel bundles compiled .metallib shaders.
+    runs-on: macos-15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build wheel
+        run: ./scripts/build.sh
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*.whl
+          if-no-files-found: error
+
+  publish:
+    name: Publish to ${{ inputs.target }}
+    needs: build
+    # Linux despite the macOS wheel: gh-action-pypi-publish is a container action.
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.target }}
+    permissions:
+      id-token: write # mint the OIDC token for Trusted Publishing
+    steps:
+      - name: Download wheel artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish to TestPyPI
+        if: ${{ inputs.target == 'testpypi' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+
+      - name: Publish to PyPI
+        if: ${{ inputs.target == 'pypi' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
