@@ -1,22 +1,10 @@
 #!/bin/bash
 
-# Prebuilt macOS arm64 vLLM core wheel. Installing this is what keeps the
-# installer compiler-free — vLLM used to be built here from its sdist.
-#
-# Pinned by full URL because there is nothing to resolve against: wheels.vllm.ai
-# publishes macOS wheels only under a commit's flat /<sha>/<file> path, never in
-# its PEP 503 indexes, so --extra-index-url cannot see them.
-#
-# The version string counts from main's last tag (v0.23.1rc1), not from the
-# latest release — release tags are cut off main's lineage. So "0.23.1rc1.devNNNN"
-# is NOT older than 0.26.0; this wheel is main ahead of that release. It carries
-# CacheConfig.prefix_match_unit, which platform.py:823 requires.
-#
-# To bump: only the daily nightly commit gets wheels, not every main commit. Read
-# the newest nightly's sha out of https://wheels.vllm.ai/nightly/vllm/ (its hrefs
-# are ../../<sha>/...), then take the macosx_11_0_arm64 wheel that the matching
-# https://wheels.vllm.ai/<sha>/cpu/vllm/ index lists.
-VLLM_WHEEL_URL="https://wheels.vllm.ai/1240c74c0a47473449cf0c3a9c2d87a1e159f73b/vllm-0.23.1rc1.dev1502%2Bg1240c74c0.cpu-cp312-cp312-macosx_11_0_arm64.whl"
+# Pinned by full URL because no index serves it: PyPI's vllm has no macOS
+# wheel yet. To bump, raise VLLM_VERSION to a release that attaches one —
+# not every release does; v0.26.0 was the first.
+VLLM_VERSION="0.26.0"
+VLLM_WHEEL_URL="https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}%2Bcpu-cp312-cp312-macosx_11_0_arm64.whl"
 
 _cleanup_dirs=()
 
@@ -80,10 +68,9 @@ except Exception as e:
 install_vllm() {
   echo ""
   section "Installing vLLM core"
-  echo "Wheel: $(basename "$VLLM_WHEEL_URL")"
+  echo "Wheel: vLLM ${VLLM_VERSION} (prebuilt macOS arm64)"
 
-  # The wheel's metadata carries vLLM's macOS dependency set (torch et al.), all
-  # resolvable from PyPI — no requirements/cpu.txt, no --index-strategy needed.
+  # The wheel's own metadata pulls torch et al. from PyPI.
   if ! uv pip install "$VLLM_WHEEL_URL"; then
     error "Failed to install vLLM core from ${VLLM_WHEEL_URL}"
     echo "Please check your internet connection and try again." >&2
