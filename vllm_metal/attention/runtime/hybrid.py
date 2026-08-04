@@ -132,6 +132,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._gdn_state_manager: HybridGDNStateManager | None = None
         self._scheduler_group_indices = (0,)
         self._group_block_sizes = (block_size,)
+        self._state_group_indices: tuple[int, ...] = ()
 
     def initialize(self, num_blocks: int) -> None:
         self._cache = MetalPagedKVCache(
@@ -169,8 +170,19 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             self._max_num_seqs,
         )
 
-    def adopt_scheduler_group(self, group_index: int, block_size: int) -> None:
-        """Select the vLLM scheduler group that owns SDPA KV blocks."""
+    def adopt_scheduler_group(
+        self,
+        group_index: int,
+        block_size: int,
+        *,
+        state_group_indices: tuple[int, ...] = (),
+    ) -> None:
+        """Select the vLLM scheduler groups backing this runtime.
+
+        ``group_index`` is the group owning SDPA KV blocks (kernel block
+        tables); ``state_group_indices`` are the mamba cache groups whose
+        block ids key the GDN recurrent state slabs.
+        """
         self._require_initialized("adopt_scheduler_group")
         if block_size != self._block_size:
             raise NotImplementedError(
@@ -179,6 +191,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             )
         self._scheduler_group_indices = (group_index,)
         self._group_block_sizes = (block_size,)
+        self._state_group_indices = tuple(state_group_indices)
 
     def kv_scheduler_group_indices(self) -> tuple[int, ...]:
         """Return scheduler KV groups consumed by SDPA layers."""
@@ -189,6 +202,11 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         """Return SDPA scheduler group page sizes."""
         self._require_initialized("kv_group_block_sizes")
         return self._group_block_sizes
+
+    def state_scheduler_group_indices(self) -> tuple[int, ...]:
+        """Return the mamba scheduler groups keying GDN state slabs."""
+        self._require_initialized("state_scheduler_group_indices")
+        return self._state_group_indices
 
     def patch_model(self, model: nn.Module) -> int:
         kv_cache = self._require_initialized("patch_model")
@@ -253,9 +271,20 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return True
 
     def populate_step_context(
-        self, *, req_ids: list[str], ctx: PagedAttentionContext
+        self,
+        *,
+        req_ids: list[str],
+        ctx: PagedAttentionContext,
+        state_block_ids: list[list[list[int]]] | None = None,
     ) -> None:
-        self.gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
+        if state_block_ids is None:
+            raise RuntimeError(
+                "hybrid paged attention requires per-request mamba block ids "
+                "(state_block_ids) in populate_step_context"
+            )
+        self.gdn_state_manager.populate_step_context(
+            req_ids=req_ids, ctx=ctx, state_block_ids=state_block_ids
+        )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         self.gdn_state_manager.extend_forward_eval_outputs(outputs)

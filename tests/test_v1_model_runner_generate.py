@@ -27,6 +27,11 @@ from vllm_metal.v1.proposer import Gemma4MTPProposer
 class HybridRuntimeStub:
     def __init__(self, state_cache: GDNPagedStateCache) -> None:
         self._gdn_state_manager = HybridGDNStateManager(state_cache)
+        # Synthesizes stable per-request mamba block ids the way the
+        # scheduler would (unique while live, released with the request) for
+        # tests that drive the runner without full scheduler plumbing.
+        self._next_block_id = 100
+        self._req_block_ids: dict[str, int] = {}
 
     def needs_step_context(self) -> bool:
         return True
@@ -35,13 +40,32 @@ class HybridRuntimeStub:
     def gdn_state_manager(self) -> HybridGDNStateManager:
         return self._gdn_state_manager
 
-    def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
-        self._gdn_state_manager.populate_step_context(req_ids=req_ids, ctx=ctx)
+    def block_ids_for(self, req_ids: list[str]) -> list[list[list[int]]]:
+        ids = []
+        for req_id in req_ids:
+            block_id = self._req_block_ids.get(req_id)
+            if block_id is None:
+                block_id = self._next_block_id
+                self._next_block_id += 1
+                self._req_block_ids[req_id] = block_id
+            ids.append([[block_id]])
+        return ids
+
+    def populate_step_context(
+        self, *, req_ids: list[str], ctx, state_block_ids=None
+    ) -> None:
+        if state_block_ids is None:
+            state_block_ids = self.block_ids_for(req_ids)
+        self._gdn_state_manager.populate_step_context(
+            req_ids=req_ids, ctx=ctx, state_block_ids=state_block_ids
+        )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         self._gdn_state_manager.extend_forward_eval_outputs(outputs)
 
     def release_requests(self, req_ids: set[str]) -> None:
+        for req_id in req_ids:
+            self._req_block_ids.pop(req_id, None)
         self._gdn_state_manager.release_requests(req_ids)
 
     def materialize_pending_state(self) -> None:
@@ -55,8 +79,10 @@ class ForwardOutputRuntimeStub:
     def needs_step_context(self) -> bool:
         return False
 
-    def populate_step_context(self, *, req_ids: list[str], ctx) -> None:
-        del req_ids, ctx
+    def populate_step_context(
+        self, *, req_ids: list[str], ctx, state_block_ids=None
+    ) -> None:
+        del req_ids, ctx, state_block_ids
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
         outputs.extend(self._arrays)
@@ -1408,7 +1434,9 @@ class TestV1MetalModelRunnerExecuteModel:
             generator=None,
             generated_tokens=0,
         )
-        slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        slot = runtime.gdn_state_manager.assign_step_slots(
+            ["done"], runtime.block_ids_for(["done"])
+        )[0]
         cache.set_pending_conv_state(0, [slot], mx.full((1, 1, 4), 7, dtype=mx.float32))
         cache.set_pending_recurrent_state(
             0,
@@ -1691,9 +1719,13 @@ class TestV1MetalModelRunnerGDNSubmit:
         )
         runner._paged_request_seq_lens["done"] = 1
 
-        released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        released_slot = runtime.gdn_state_manager.assign_step_slots(
+            ["done"], runtime.block_ids_for(["done"])
+        )[0]
         runner._reconcile_request_lifecycle({"done"}, materialize_runtime_state=False)
-        reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
+        reused_slot = runtime.gdn_state_manager.assign_step_slots(
+            ["next"], runtime.block_ids_for(["next"])
+        )[0]
         assert reused_slot == released_slot
 
         cache.set_pending_conv_state(
@@ -1793,7 +1825,9 @@ class TestV1MetalModelRunnerGDNLifecycle:
         )
         runner._request_states[req_id] = state
         runner._paged_request_seq_lens[req_id] = 2
-        slot = runtime.gdn_state_manager.assign_step_slots([req_id])[0]
+        slot = runtime.gdn_state_manager.assign_step_slots(
+            [req_id], runtime.block_ids_for([req_id])
+        )[0]
 
         cache.set_pending_conv_state(
             0,
@@ -1916,9 +1950,13 @@ class TestV1MetalModelRunnerGDNLifecycle:
         )
         runner._paged_request_seq_lens["done"] = 1
 
-        released_slot = runtime.gdn_state_manager.assign_step_slots(["done"])[0]
+        released_slot = runtime.gdn_state_manager.assign_step_slots(
+            ["done"], runtime.block_ids_for(["done"])
+        )[0]
         runner._reconcile_request_lifecycle({"done"}, materialize_runtime_state=False)
-        reused_slot = runtime.gdn_state_manager.assign_step_slots(["next"])[0]
+        reused_slot = runtime.gdn_state_manager.assign_step_slots(
+            ["next"], runtime.block_ids_for(["next"])
+        )[0]
         assert reused_slot == released_slot
 
         cache.set_pending_conv_state(

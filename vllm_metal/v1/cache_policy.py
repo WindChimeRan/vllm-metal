@@ -528,10 +528,28 @@ class ModelCachePolicy:
                 "scheduler KV group"
             )
         group_index = group_indices[0]
+        # The engine stripes same-spec linear layers across several mamba
+        # cache groups (one layer from each group shares a block-table shape);
+        # each group hands every request one state block, so the runtime needs
+        # all of them to key GDN slabs by scheduler block id.
+        linear_layer_names = tuple(
+            f"layers.{layer_idx}.linear_attn"
+            for layer_idx in range(self._runner.num_layers)
+            if layer_idx not in self._runner.sdpa_layer_indices
+        )
+        state_group_indices = tuple(
+            sorted(
+                self._scheduler_group_indices_for_layers(
+                    kv_cache_config, linear_layer_names
+                )
+            )
+        )
         block_size = kv_cache_config.kv_cache_groups[
             group_index
         ].kv_cache_spec.block_size
-        runtime.adopt_scheduler_group(group_index, block_size)
+        runtime.adopt_scheduler_group(
+            group_index, block_size, state_group_indices=state_group_indices
+        )
         self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
 
     def _scheduler_group_indices_for_layers(

@@ -29,12 +29,17 @@ def _make_context() -> PagedAttentionContext:
     return PagedAttentionContext(slot_mapping=[])
 
 
+def _ids(*block_ids: int) -> list[list[list[int]]]:
+    """One mamba group per request holding a single scheduler block id."""
+    return [[[block_id]] for block_id in block_ids]
+
+
 class TestHybridGDNStateManager:
     def test_assign_step_slots_grows_state_cache_once(self) -> None:
         cache = _make_cache(max_seqs=3)
         manager = HybridGDNStateManager(cache)
 
-        slots = manager.assign_step_slots(["req-A", "req-B"])
+        slots = manager.assign_step_slots(["req-A", "req-B"], _ids(101, 102))
 
         assert slots == [0, 1]
         assert cache.allocated_seqs == 2
@@ -46,7 +51,7 @@ class TestHybridGDNStateManager:
         manager = HybridGDNStateManager(cache)
 
         with pytest.raises(RuntimeError, match="more slots than max_num_seqs"):
-            manager.assign_step_slots(["req-A", "req-B"])
+            manager.assign_step_slots(["req-A", "req-B"], _ids(101, 102))
 
         assert cache.allocated_seqs == 0
         assert manager.request_slots == {}
@@ -57,7 +62,9 @@ class TestHybridGDNStateManager:
         manager = HybridGDNStateManager(cache)
         ctx = _make_context()
 
-        manager.populate_step_context(req_ids=["req-A", "req-B"], ctx=ctx)
+        manager.populate_step_context(
+            req_ids=["req-A", "req-B"], ctx=ctx, state_block_ids=_ids(101, 102)
+        )
 
         assert ctx.gdn_slot_mapping == [0, 1]
         assert manager.request_slots == {"req-A": 0, "req-B": 1}
@@ -75,7 +82,7 @@ class TestHybridGDNStateManager:
             dtype=mx.float32,
         )
         manager = HybridGDNStateManager(cache)
-        manager.assign_step_slots(["req-A", "req-B"])
+        manager.assign_step_slots(["req-A", "req-B"], _ids(101, 102))
         cache.set_pending_conv_state(0, [1], mx.full((1, 1, 4), 7, dtype=mx.float32))
         cache.set_pending_recurrent_state(
             0,
@@ -104,7 +111,7 @@ class TestHybridGDNStateManager:
             dtype=mx.float32,
         )
         manager = HybridGDNStateManager(cache)
-        manager.assign_step_slots(["done"])
+        manager.assign_step_slots(["done"], _ids(101))
         slot = manager.request_slots["done"]
 
         cache.set_pending_conv_state(0, [slot], mx.full((1, 1, 4), 7, dtype=mx.float32))
@@ -127,7 +134,7 @@ class TestHybridGDNStateManager:
     def test_materialize_pending_state_clears_flag_once(self) -> None:
         cache = _make_cache(max_seqs=2)
         manager = HybridGDNStateManager(cache)
-        manager.assign_step_slots(["req-A", "req-B"])
+        manager.assign_step_slots(["req-A", "req-B"], _ids(101, 102))
 
         manager.release_requests({"req-A", "req-B"})
         manager.materialize_pending_state()
@@ -152,10 +159,10 @@ class TestHybridGDNStateManager:
             dtype=mx.float32,
         )
         manager = HybridGDNStateManager(cache)
-        released_slot = manager.assign_step_slots(["done"])[0]
+        released_slot = manager.assign_step_slots(["done"], _ids(101))[0]
 
         manager.release_requests({"done"})
-        reused_slot = manager.assign_step_slots(["next"])[0]
+        reused_slot = manager.assign_step_slots(["next"], _ids(102))[0]
         assert reused_slot == released_slot
 
         next_conv_state = mx.full((1, 1, 4), 7, dtype=mx.float32)
@@ -178,7 +185,7 @@ class TestHybridGDNStateManager:
     def test_reused_slot_is_zeroed_before_new_request_uses_it(self) -> None:
         cache = _make_cache(num_layers=1, max_seqs=2)
         manager = HybridGDNStateManager(cache)
-        slot = manager.assign_step_slots(["req-A"])[0]
+        slot = manager.assign_step_slots(["req-A"], _ids(101))[0]
 
         conv = cache.conv_states[0]
         conv[slot] = 1
@@ -189,7 +196,7 @@ class TestHybridGDNStateManager:
         mx.eval(cache.conv_states[0], cache.recurrent_states[0])
 
         manager.release_requests({"req-A"})
-        reused_slot = manager.assign_step_slots(["req-B"])[0]
+        reused_slot = manager.assign_step_slots(["req-B"], _ids(102))[0]
         mx.eval(cache.conv_states[0], cache.recurrent_states[0])
 
         assert reused_slot == slot
@@ -199,7 +206,7 @@ class TestHybridGDNStateManager:
     def test_reused_slot_does_not_touch_other_live_slot(self) -> None:
         cache = _make_cache(num_layers=1, max_seqs=2)
         manager = HybridGDNStateManager(cache)
-        slot_a, slot_b = manager.assign_step_slots(["req-A", "req-B"])
+        slot_a, slot_b = manager.assign_step_slots(["req-A", "req-B"], _ids(101, 102))
 
         conv_states = cache.conv_states[0]
         conv_states[slot_a] = 5
@@ -213,7 +220,7 @@ class TestHybridGDNStateManager:
         mx.eval(cache.conv_states[0], cache.recurrent_states[0])
 
         manager.release_requests({"req-A"})
-        reused_slot = manager.assign_step_slots(["req-C"])[0]
+        reused_slot = manager.assign_step_slots(["req-C"], _ids(103))[0]
         mx.eval(cache.conv_states[0], cache.recurrent_states[0])
 
         assert reused_slot == slot_a
@@ -242,7 +249,9 @@ class TestHybridPagedAttentionRuntime:
         runtime.initialize(num_blocks=2)
 
         ctx = _make_context()
-        runtime.populate_step_context(req_ids=["req-A"], ctx=ctx)
+        runtime.populate_step_context(
+            req_ids=["req-A"], ctx=ctx, state_block_ids=_ids(101)
+        )
 
         assert ctx.gdn_slot_mapping == [0]
 
@@ -261,3 +270,57 @@ class TestHybridPagedAttentionRuntime:
         assert not cache.has_pending_conv_state(0)
         assert not cache.has_pending_recurrent_state(0)
         assert runtime.gdn_state_manager.needs_materialize is False
+
+class TestBlockIdOwnership:
+    def test_block_id_reuse_before_release_transfers_slab(self) -> None:
+        """Async scheduling can hand a finished request's block id to a new
+        request before the old owner's release lands; the slab must be reset
+        and re-owned in place, and the stale release must not free it."""
+        cache = _make_cache(num_layers=1, max_seqs=2)
+        manager = HybridGDNStateManager(cache)
+        slot = manager.assign_step_slots(["req-old"], _ids(101))[0]
+
+        conv = cache.conv_states[0]
+        conv[slot] = 1
+        cache.conv_states[0] = conv
+        mx.eval(cache.conv_states[0])
+
+        # Same block id arrives for a new request before req-old's release.
+        reused = manager.assign_step_slots(["req-new"], _ids(101))[0]
+        assert reused == slot
+        mx.eval(cache.conv_states[0])
+        assert np.all(np.array(cache.conv_states[0][slot]) == 0)
+
+        # The stale owner's release must leave the transferred slab alone.
+        manager.release_requests({"req-old"})
+        assert manager.free_slots == ()
+        assert manager.request_slots == {"req-new": slot}
+
+    def test_request_changing_block_id_without_release_raises(self) -> None:
+        cache = _make_cache()
+        manager = HybridGDNStateManager(cache)
+        manager.assign_step_slots(["req-A"], _ids(101))
+
+        with pytest.raises(RuntimeError, match="changed its\n?\\s*mamba block id"):
+            manager.assign_step_slots(["req-A"], _ids(202))
+
+    def test_one_block_id_for_two_live_requests_raises(self) -> None:
+        cache = _make_cache()
+        manager = HybridGDNStateManager(cache)
+
+        with pytest.raises(RuntimeError, match="two live requests"):
+            manager.assign_step_slots(["req-A", "req-B"], _ids(101, 101))
+
+    def test_empty_block_table_raises(self) -> None:
+        cache = _make_cache()
+        manager = HybridGDNStateManager(cache)
+
+        with pytest.raises(RuntimeError, match="empty block table"):
+            manager.assign_step_slots(["req-A"], [[]])
+
+    def test_mismatched_table_count_raises(self) -> None:
+        cache = _make_cache()
+        manager = HybridGDNStateManager(cache)
+
+        with pytest.raises(RuntimeError, match="one mamba block table per request"):
+            manager.assign_step_slots(["req-A", "req-B"], _ids(101))
