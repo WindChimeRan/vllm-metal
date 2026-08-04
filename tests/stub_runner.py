@@ -34,9 +34,13 @@ def make_stub_runner(
 
     defaults: dict[str, Any] = {
         "vllm_config": SimpleNamespace(speculative_config=None),
-        "cache_config": SimpleNamespace(mamba_page_size_padded=None),
+        "cache_config": SimpleNamespace(
+            mamba_page_size_padded=None,
+            mamba_block_size=2048,
+            mamba_cache_mode="none",
+        ),
         "model_config": SimpleNamespace(
-            runner_type="generate", get_head_size=lambda: 128
+            runner_type="generate", get_head_size=lambda: 128, max_model_len=2048
         ),
         "model": object(),
         "_is_vlm": False,

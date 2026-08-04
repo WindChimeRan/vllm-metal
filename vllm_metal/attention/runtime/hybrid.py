@@ -17,6 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import torch
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
@@ -46,25 +47,24 @@ def _build_linear_layer_spec(
     key_head_dim: int,
     torch_dtype: torch.dtype,
     page_size_padded: int | None = None,
-    block_size: int,
+    mamba_block_size: int,
+    mamba_cache_mode: str = "none",
 ) -> MambaSpec:
-    """Build a MambaSpec for one GDN linear attention layer.
+    """Build the scheduler-visible GDN state spec.
 
-    Args:
-        page_size_padded: Optional padded page size from cache_config to
-            align Mamba page size with attention page size in hybrid models.
-        block_size: Tokens per block.  Must match the SDPA block_size so
-            the scheduler's unified block pool can serve both layer types
-            without running out of blocks prematurely.
+    A max-length Mamba block gives each request one block in ``none`` mode.
     """
     return MambaSpec(
         shapes=(
             (conv_kernel_dim - 1, conv_dim),
             (num_v_heads, value_head_dim, key_head_dim),
         ),
-        dtypes=(torch_dtype, torch_dtype),
-        block_size=block_size,
+        # Match the fp32 recurrent pool used for kernel accumulation.
+        dtypes=(torch_dtype, torch.float32),
+        block_size=mamba_block_size,
         page_size_padded=page_size_padded,
+        mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        mamba_cache_mode=mamba_cache_mode,
     )
 
 

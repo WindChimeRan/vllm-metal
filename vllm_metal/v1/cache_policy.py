@@ -325,6 +325,10 @@ class ModelCachePolicy:
                 and layer_idx not in self._runner.sdpa_layer_indices
             ):
                 layer_name = f"layers.{layer_idx}.linear_attn"
+                cache_config = self._runner.cache_config
+                mamba_block_size = cache_config.mamba_block_size
+                # Upstream resolves this during config setup and asserts it here.
+                assert mamba_block_size is not None
                 specs[layer_name] = _build_linear_layer_spec(
                     conv_kernel_dim=self._runner.linear_conv_kernel_dim,
                     conv_dim=self._runner.linear_conv_dim,
@@ -332,8 +336,9 @@ class ModelCachePolicy:
                     value_head_dim=self._runner.linear_value_head_dim,
                     key_head_dim=self._runner.linear_key_head_dim,
                     torch_dtype=torch_dtype,
-                    page_size_padded=self._runner.cache_config.mamba_page_size_padded,
-                    block_size=block_size,
+                    page_size_padded=cache_config.mamba_page_size_padded,
+                    mamba_block_size=mamba_block_size,
+                    mamba_cache_mode=cache_config.mamba_cache_mode,
                 )
             elif use_turboquant:
                 layer_name = f"layers.{layer_idx}.self_attn"

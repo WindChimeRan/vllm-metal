@@ -7,8 +7,9 @@ from types import SimpleNamespace
 
 import mlx.core as mx
 import torch
+from vllm.utils.math_utils import cdiv
 from vllm.v1.core.kv_cache_utils import get_uniform_page_size
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, MLAAttentionSpec
 
 from tests.stub_runner import make_stub_runner
 
@@ -90,3 +91,41 @@ def test_plain_attention_spec_is_unchanged() -> None:
 
     metal_per_block = 2 * BLOCK_SIZE * DTYPE.itemsize * layers * 4 * 256
     assert _engine_blocks(specs, metal_per_block) == POOL_BLOCKS
+
+
+def test_hybrid_mamba_spec_reserves_one_state_block_per_request() -> None:
+    attention_block_size = 544
+    max_model_len = 2048
+    runner = make_stub_runner(
+        model_args={"full_attention_interval": 2},
+        model_config=SimpleNamespace(
+            runner_type="generate",
+            get_head_size=lambda: 128,
+            max_model_len=max_model_len,
+        ),
+        num_layers=2,
+        num_sdpa_layers=1,
+        num_linear_layers=1,
+        sdpa_layer_indices={1},
+        num_kv_heads=1,
+        head_dim=128,
+        kv_cache_dtype=mx.float16,
+        cache_config=SimpleNamespace(
+            block_size=attention_block_size,
+            mamba_page_size_padded=None,
+            mamba_block_size=max_model_len,
+            mamba_cache_mode="none",
+        ),
+        linear_conv_kernel_dim=4,
+        linear_conv_dim=64,
+        linear_num_v_heads=1,
+        linear_value_head_dim=64,
+        linear_key_head_dim=64,
+    )
+
+    spec = runner._cache_policy.get_kv_cache_spec()["layers.0.linear_attn"]
+    prompt_tokens = 1301
+    assert isinstance(spec, MambaSpec)
+    assert cdiv(prompt_tokens, attention_block_size) == 3
+    assert spec.block_size == max_model_len
+    assert cdiv(prompt_tokens, spec.block_size) == 1

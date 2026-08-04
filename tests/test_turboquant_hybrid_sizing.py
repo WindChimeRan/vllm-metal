@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Hybrid + TurboQuant sizing must match the runtime's packed KV layout."""
 
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -28,6 +29,7 @@ NUM_LAYERS = 8
 SDPA_LAYERS = [3, 7]
 KV_HEADS = 4
 HEAD_DIM = 128
+MAMBA_BLOCK_SIZE = 2048
 K_QUANT = "q4_0"
 V_QUANT = "q4_0"
 
@@ -52,7 +54,10 @@ def _hybrid_runner():
         head_dim=HEAD_DIM,
         kv_cache_dtype=mx.float16,
         cache_config=SimpleNamespace(
-            block_size=BLOCK_SIZE, mamba_page_size_padded=None
+            block_size=BLOCK_SIZE,
+            mamba_page_size_padded=None,
+            mamba_block_size=MAMBA_BLOCK_SIZE,
+            mamba_cache_mode="none",
         ),
         scheduler_config=SimpleNamespace(max_num_seqs=4),
         linear_conv_kernel_dim=4,
@@ -109,7 +114,10 @@ class TestHybridTurboQuantCachePolicy:
                 head_dim=HEAD_DIM,
                 kv_cache_dtype=mx.float16,
                 cache_config=SimpleNamespace(
-                    block_size=BLOCK_SIZE, mamba_page_size_padded=None
+                    block_size=BLOCK_SIZE,
+                    mamba_page_size_padded=None,
+                    mamba_block_size=MAMBA_BLOCK_SIZE,
+                    mamba_cache_mode="none",
                 ),
                 scheduler_config=SimpleNamespace(max_num_seqs=4),
                 linear_conv_kernel_dim=4,
@@ -156,10 +164,12 @@ class TestTurboQuantHybridAlignment:
         )
 
     def _vllm_config_with_cache(self, cache_config: CacheConfig) -> SimpleNamespace:
+        cache_config.mamba_block_size = MAMBA_BLOCK_SIZE
         return SimpleNamespace(
             model_config=SimpleNamespace(
                 is_hybrid=True,
                 architecture="StubHybridForCausalLM",
+                max_model_len=MAMBA_BLOCK_SIZE,
                 dtype=torch.float16,
                 use_mla=False,
                 get_num_kv_heads=lambda parallel_config: KV_HEADS,
@@ -277,12 +287,12 @@ class TestTurboQuantHybridAlignment:
         assert {group.kv_cache_spec.page_size_bytes for group in groups} == {
             cache_config.block_size * self._TQ_PAGE_1_TOKEN
         }
-        if cache_config.prefix_match_unit is None:
-            assert hash_block_size == scheduler_block_size
-        else:
+        expected_scheduler = math.lcm(expected_block, runner.model_config.max_model_len)
+        assert scheduler_block_size == expected_scheduler
+        if cache_config.prefix_match_unit is not None:
             assert cache_config.block_size % cache_config.prefix_match_unit == 0
-            assert scheduler_block_size % cache_config.prefix_match_unit == 0
-            assert hash_block_size == cache_config.prefix_match_unit
+        # Divergent Mamba block sizes disable fine-grained hashing upstream.
+        assert hash_block_size == scheduler_block_size
 
     def test_initialize_kv_cache_selects_sdpa_scheduler_group(
         self, monkeypatch
