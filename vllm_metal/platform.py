@@ -448,6 +448,14 @@ class MetalPlatform(Platform):
 
         if model_config is not None and model_config.is_hybrid:
             cache_config = vllm_config.cache_config
+            if cache_config.mamba_ssm_cache_dtype == "auto":
+                cache_config.mamba_ssm_cache_dtype = "float32"
+            elif cache_config.mamba_ssm_cache_dtype != "float32":
+                raise NotImplementedError(
+                    "Hybrid GDN models on Metal require "
+                    "--mamba-ssm-cache-dtype float32 because recurrent state is "
+                    "stored in fp32."
+                )
             if (
                 cache_config.enable_prefix_caching
                 or cache_config.mamba_cache_mode != "none"

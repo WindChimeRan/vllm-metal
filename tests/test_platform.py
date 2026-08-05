@@ -8,7 +8,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
-from vllm.config import ParallelConfig, VllmConfig
+from vllm.config import CacheConfig, ParallelConfig, VllmConfig
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.selector import AttentionSelectorConfig
 from vllm.v1.core.kv_cache_utils import (
@@ -999,6 +999,7 @@ class TestMetalPlatform:
                     kv_cache_dtype_skip_layers=[],
                     enable_prefix_caching=True,
                     mamba_cache_mode="none",
+                    mamba_ssm_cache_dtype="float32",
                 ),
                 "Prefix caching",
             ),
@@ -1008,6 +1009,7 @@ class TestMetalPlatform:
                     kv_cache_dtype_skip_layers=[],
                     enable_prefix_caching=False,
                     mamba_cache_mode="all",
+                    mamba_ssm_cache_dtype="float32",
                 ),
                 "Mamba cache modes",
             ),
@@ -1024,37 +1026,62 @@ class TestMetalPlatform:
         monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
         reset_config()
         try:
-            vllm_config = SimpleNamespace(
-                speculative_config=None,
-                parallel_config=SimpleNamespace(
-                    worker_cls="auto",
-                    distributed_executor_backend="auto",
-                    pipeline_parallel_size=1,
-                    tensor_parallel_size=1,
-                    disable_custom_all_reduce=False,
-                ),
-                cache_config=cache_config,
-                model_config=SimpleNamespace(
-                    model="test-model",
-                    disable_cascade_attn=False,
-                    tokenizer=None,
-                    max_model_len=32768,
-                    multimodal_config=None,
-                    hf_config=SimpleNamespace(model_type="qwen3"),
-                    is_hybrid=True,
-                ),
-                scheduler_config=SimpleNamespace(
-                    async_scheduling=True,
-                    enable_chunked_prefill=True,
-                    max_num_batched_tokens=2048,
-                    max_num_scheduled_tokens=None,
-                ),
-            )
+            vllm_config = self._hybrid_vllm_config(cache_config)
 
             with pytest.raises(NotImplementedError, match=err_match):
                 MetalPlatform.check_and_update_config(vllm_config)
         finally:
             reset_config()
+
+    @pytest.mark.parametrize(
+        ("dtype", "reject"),
+        [("auto", False), ("float16", True), ("bfloat16", True)],
+    )
+    def test_check_and_update_config_hybrid_gdn_state_dtype(
+        self, dtype: str, reject: bool, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cache_config = CacheConfig(
+            enable_prefix_caching=False, mamba_ssm_cache_dtype=dtype
+        )
+        vllm_config = self._hybrid_vllm_config(cache_config)
+
+        if reject:
+            with pytest.raises(NotImplementedError, match="require.*float32"):
+                MetalPlatform.check_and_update_config(vllm_config)
+        else:
+            self._patch_stt_resolution(monkeypatch, is_stt=False)
+            MetalPlatform.check_and_update_config(vllm_config)
+            assert cache_config.mamba_ssm_cache_dtype == "float32"
+
+    @staticmethod
+    def _hybrid_vllm_config(cache_config: object) -> SimpleNamespace:
+        return SimpleNamespace(
+            speculative_config=None,
+            lora_config=None,
+            parallel_config=SimpleNamespace(
+                worker_cls="auto",
+                distributed_executor_backend="auto",
+                pipeline_parallel_size=1,
+                tensor_parallel_size=1,
+                disable_custom_all_reduce=False,
+            ),
+            cache_config=cache_config,
+            model_config=SimpleNamespace(
+                model="test-model",
+                disable_cascade_attn=False,
+                tokenizer=None,
+                max_model_len=32768,
+                multimodal_config=None,
+                hf_config=SimpleNamespace(model_type="qwen3"),
+                is_hybrid=True,
+            ),
+            scheduler_config=SimpleNamespace(
+                async_scheduling=True,
+                enable_chunked_prefill=True,
+                max_num_batched_tokens=2048,
+                max_num_scheduled_tokens=None,
+            ),
+        )
 
     def test_check_and_update_config_increases_max_num_scheduled_tokens_below_max_model_len(
         self, monkeypatch: pytest.MonkeyPatch
