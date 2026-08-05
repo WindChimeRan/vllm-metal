@@ -71,8 +71,17 @@ class HybridGDNStateManager:
         req_ids: list[str],
         ctx: PagedAttentionContext,
         state_block_ids: list[list[list[int]]],
+        step_positions: list[tuple[int, int]] | None = None,
     ) -> None:
-        """Attach stable GDN slab ids to one forward-pass context."""
+        """Attach stable GDN slab ids to one forward-pass context.
+
+        ``step_positions`` is align-mode's per-request
+        ``(num_computed, num_scheduled)``; none mode keeps one slab per
+        request for its whole lifetime, so it needs no step positions.
+        Accepting and ignoring the argument keeps both managers on one
+        signature, so the runtime delegates without dispatching on type.
+        """
+        del step_positions
         ctx.gdn_slot_mapping = self.assign_step_slots(req_ids, state_block_ids)
 
     @staticmethod

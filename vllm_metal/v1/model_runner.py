@@ -1137,6 +1137,7 @@ class MetalModelRunner:
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
                 step_state_ids: list[list[list[int]]] | None = None
+                step_positions: list[tuple[int, int]] | None = None
                 if self._paged_state_group_indices:
                     try:
                         step_state_ids = [
@@ -1149,8 +1150,21 @@ class MetalModelRunner:
                             "scheduler admission and state tracking are out "
                             "of sync"
                         ) from exc
+                    # (num_computed, num_scheduled) per request, decode rows
+                    # first — same order as step_req_ids (decode_segments is
+                    # built by iterating decode_reqs).
+                    step_positions = [
+                        (segment.cache_start_pos, segment.num_query_tokens)
+                        for segment in decode_segments
+                    ]
+                    step_positions.extend(
+                        (pr.start_pos, len(pr.token_ids)) for pr in prefill_reqs
+                    )
                 runtime.populate_step_context(
-                    req_ids=step_req_ids, ctx=ctx, state_block_ids=step_state_ids
+                    req_ids=step_req_ids,
+                    ctx=ctx,
+                    state_block_ids=step_state_ids,
+                    step_positions=step_positions,
                 )
 
             # ---- forward (lazy graph + async submit) ----

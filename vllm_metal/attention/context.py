@@ -64,7 +64,14 @@ class PagedAttentionContext:
     cu_seqlens: list[int] | None = None
     # GDN state pool slot mapping: request batch position → stable slot ID.
     # Populated by model_runner for hybrid models; None for non-hybrid.
+    # Mirrors ``gdn_group_slot_mappings[0]`` when per-group mappings exist.
     gdn_slot_mapping: list[int] | None = None
+    # Per mamba-cache-group slot mappings (one list per adopted state group,
+    # each request batch position → state slab id for that group's layers).
+    # In mamba_cache_mode "none" every group broadcasts the same slab list;
+    # under align-mode prefix caching each group carries its own scheduler
+    # block ids.
+    gdn_group_slot_mappings: tuple[list[int], ...] | None = None
     # Number of decode requests packed at the front of the batch.
     # This lets attention wrappers distinguish pure prefill from mixed prefill+decode
     # without reverse-engineering one-token segments from ``cu_seqlens``.

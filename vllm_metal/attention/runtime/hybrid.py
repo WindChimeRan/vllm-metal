@@ -33,7 +33,7 @@ from vllm_metal.attention.impls.sdpa_wrapper import (
 )
 from vllm_metal.attention.patching import walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
-from vllm_metal.attention.state import HybridGDNStateManager
+from vllm_metal.attention.state import AlignGDNStateManager, HybridGDNStateManager
 
 logger = init_logger(__name__)
 
@@ -93,6 +93,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         # Common
         block_size: int,
         dtype: mx.Dtype,
+        # Scheduler-side mamba caching strategy ("none" or "align").
+        mamba_cache_mode: str = "none",
         # TurboQuant (SDPA layers only)
         turboquant: bool = False,
         k_quant: str | None = None,
@@ -101,6 +103,12 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._max_num_seqs = max_num_seqs
         self._block_size = block_size
         self._dtype = dtype
+        if mamba_cache_mode not in ("none", "align"):
+            raise NotImplementedError(
+                f"hybrid paged attention does not support mamba_cache_mode="
+                f"{mamba_cache_mode!r} (only 'none' and 'align')"
+            )
+        self._mamba_cache_mode = mamba_cache_mode
 
         # SDPA params
         self._num_kv_heads = num_kv_heads
@@ -129,7 +137,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
         self._cache = None
         self._state_cache: GDNPagedStateCache | None = None
-        self._gdn_state_manager: HybridGDNStateManager | None = None
+        self._gdn_state_manager: (
+            HybridGDNStateManager | AlignGDNStateManager | None
+        ) = None
         self._scheduler_group_indices = (0,)
         self._group_block_sizes = (block_size,)
         self._state_group_indices: tuple[int, ...] = ()
@@ -147,27 +157,48 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             v_quant=self._v_quant,
         )
 
-        self._state_cache = GDNPagedStateCache(
-            num_layers=len(self._linear_indices),
-            max_seqs=self._max_num_seqs,
-            conv_kernel_dim=self._linear_conv_kernel_dim,
-            conv_dim=self._linear_conv_dim,
-            num_v_heads=self._linear_num_v_heads,
-            value_head_dim=self._linear_value_head_dim,
-            key_head_dim=self._linear_key_head_dim,
-            initial_seqs=0,
-            dtype=self._dtype,
-        )
-        self._gdn_state_manager = HybridGDNStateManager(self._state_cache)
+        if self._mamba_cache_mode == "align":
+            # Align-mode slabs are addressed directly by scheduler block id;
+            # any of the pool's blocks can become a mamba state block (the
+            # block pool is fungible across cache groups), so the pool covers
+            # the full id space up front.
+            self._state_cache = GDNPagedStateCache(
+                num_layers=len(self._linear_indices),
+                max_seqs=num_blocks,
+                conv_kernel_dim=self._linear_conv_kernel_dim,
+                conv_dim=self._linear_conv_dim,
+                num_v_heads=self._linear_num_v_heads,
+                value_head_dim=self._linear_value_head_dim,
+                key_head_dim=self._linear_key_head_dim,
+                initial_seqs=num_blocks,
+                dtype=self._dtype,
+            )
+            self._gdn_state_manager = AlignGDNStateManager(
+                self._state_cache, self._block_size
+            )
+        else:
+            self._state_cache = GDNPagedStateCache(
+                num_layers=len(self._linear_indices),
+                max_seqs=self._max_num_seqs,
+                conv_kernel_dim=self._linear_conv_kernel_dim,
+                conv_dim=self._linear_conv_dim,
+                num_v_heads=self._linear_num_v_heads,
+                value_head_dim=self._linear_value_head_dim,
+                key_head_dim=self._linear_key_head_dim,
+                initial_seqs=0,
+                dtype=self._dtype,
+            )
+            self._gdn_state_manager = HybridGDNStateManager(self._state_cache)
 
         logger.info(
             "Hybrid cache initialized: %d SDPA layers (%d blocks), "
-            "%d linear layers (%d/%d GDN slots allocated)",
+            "%d linear layers (%d/%d GDN slots allocated, mamba_cache_mode=%s)",
             len(self._sdpa_indices),
             num_blocks,
             len(self._linear_indices),
             self._state_cache.allocated_seqs,
-            self._max_num_seqs,
+            self._state_cache.max_seqs,
+            self._mamba_cache_mode,
         )
 
     def adopt_scheduler_group(
@@ -176,12 +207,16 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         block_size: int,
         *,
         state_group_indices: tuple[int, ...] = (),
+        layer_group_ordinals: list[int] | None = None,
     ) -> None:
         """Select the vLLM scheduler groups backing this runtime.
 
         ``group_index`` is the group owning SDPA KV blocks (kernel block
         tables); ``state_group_indices`` are the mamba cache groups whose
-        block ids key the GDN recurrent state slabs.
+        block ids key the GDN recurrent state slabs;
+        ``layer_group_ordinals[cache_idx]`` records which of those groups
+        each linear layer belongs to (the engine stripes same-spec layers
+        across several groups).
         """
         self._require_initialized("adopt_scheduler_group")
         if block_size != self._block_size:
@@ -192,6 +227,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         self._scheduler_group_indices = (group_index,)
         self._group_block_sizes = (block_size,)
         self._state_group_indices = tuple(state_group_indices)
+        if layer_group_ordinals is not None:
+            self.state_cache.set_layer_group_ordinals(layer_group_ordinals)
 
     def kv_scheduler_group_indices(self) -> tuple[int, ...]:
         """Return scheduler KV groups consumed by SDPA layers."""
@@ -262,7 +299,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return self._state_cache
 
     @property
-    def gdn_state_manager(self) -> HybridGDNStateManager:
+    def gdn_state_manager(self) -> HybridGDNStateManager | AlignGDNStateManager:
         if self._gdn_state_manager is None:
             raise RuntimeError("gdn_state_manager accessed before initialize()")
         return self._gdn_state_manager
@@ -276,14 +313,19 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         req_ids: list[str],
         ctx: PagedAttentionContext,
         state_block_ids: list[list[list[int]]] | None = None,
+        step_positions: list[tuple[int, int]] | None = None,
     ) -> None:
         if state_block_ids is None:
             raise RuntimeError(
                 "hybrid paged attention requires per-request mamba block ids "
                 "(state_block_ids) in populate_step_context"
             )
-        self.gdn_state_manager.populate_step_context(
-            req_ids=req_ids, ctx=ctx, state_block_ids=state_block_ids
+        manager = self.gdn_state_manager
+        manager.populate_step_context(
+            req_ids=req_ids,
+            ctx=ctx,
+            state_block_ids=state_block_ids,
+            step_positions=step_positions,
         )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
