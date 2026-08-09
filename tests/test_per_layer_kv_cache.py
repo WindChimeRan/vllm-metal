@@ -154,6 +154,26 @@ class TestMetalPagedKVCachePerLayer:
                 kv_heads_per_layer=[8, 8, 8],
             )
 
+    def test_copy_blocks_preserves_source_and_populates_destination(self) -> None:
+        cache = MetalPagedKVCache(
+            num_layers=1,
+            num_kv_heads=1,
+            head_dim=4,
+            num_blocks=4,
+            block_size=2,
+            dtype=mx.float32,
+        )
+        cache.key_caches[0][1] = 3
+        cache.value_caches[0][1] = 4
+
+        cache.copy_blocks([(1, 3)])
+        mx.eval(cache.key_caches[0], cache.value_caches[0])
+
+        assert mx.all(cache.key_caches[0][1] == 3).item()
+        assert mx.all(cache.value_caches[0][1] == 4).item()
+        assert mx.all(cache.key_caches[0][3] == 3).item()
+        assert mx.all(cache.value_caches[0][3] == 4).item()
+
 
 class TestMHABackendPerLayer:
     """MHAPagedAttentionRuntime passes per-layer shapes to cache."""

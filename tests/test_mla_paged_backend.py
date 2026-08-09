@@ -59,6 +59,22 @@ class TestMLAPagedLatentCache:
                 dtype=mx.int32,
             )
 
+    def test_copy_blocks_preserves_source_and_populates_destination(self) -> None:
+        cache = MLAPagedLatentCache(
+            num_layers=1,
+            latent_dim=4,
+            num_blocks=4,
+            block_size=2,
+            dtype=mx.float32,
+        )
+        cache.latent_caches[0][1] = 7
+
+        cache.copy_blocks([(1, 3)])
+        mx.eval(cache.latent_caches[0])
+
+        assert mx.all(cache.latent_caches[0][1] == 7).item()
+        assert mx.all(cache.latent_caches[0][3] == 7).item()
+
 
 class TestMLAPagedAttentionRuntime:
     def _make_backend(self) -> MLAPagedAttentionRuntime:

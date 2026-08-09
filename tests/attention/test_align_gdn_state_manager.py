@@ -6,6 +6,7 @@ import numpy as np
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
 from vllm_metal.attention.context import PagedAttentionContext
+from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
 from vllm_metal.attention.state import AlignGDNStateManager
 
 BLOCK = 4
@@ -177,3 +178,50 @@ class TestAlignGDNStateManager:
         assert cache.allocated_seqs == 6
         conv, rec = _slab(cache, 0, 5)
         assert np.all(conv == 0) and np.all(rec == 0)
+
+
+class TestHybridAlignRuntime:
+    def _make_runtime(self) -> HybridPagedAttentionRuntime:
+        return HybridPagedAttentionRuntime(
+            num_layers=4,
+            full_attention_interval=2,
+            max_num_seqs=2,
+            num_kv_heads=1,
+            head_dim=4,
+            linear_num_v_heads=1,
+            linear_key_head_dim=32,
+            linear_value_head_dim=4,
+            linear_conv_kernel_dim=2,
+            linear_conv_dim=4,
+            block_size=BLOCK,
+            dtype=mx.float32,
+            mamba_cache_mode="align",
+        )
+
+    def test_scheduler_cow_copy_updates_sdpa_and_gdn_blocks(self) -> None:
+        runtime = self._make_runtime()
+        runtime.initialize(num_blocks=8)
+        runtime.adopt_scheduler_group(
+            0,
+            BLOCK,
+            state_group_indices=(1, 2),
+            layer_group_ordinals=[0, 1],
+            layer_pool_ordinals=[0, 0],
+        )
+
+        kv = runtime.kv_cache
+        kv.key_caches[0][2] = 3
+        kv.value_caches[0][2] = 4
+        runtime.state_cache.ensure_capacity(3)
+        _fill_slab(runtime.state_cache, 0, 2, 5)
+
+        runtime.copy_blocks([(2, 6)])
+        mx.eval(kv.key_caches[0], kv.value_caches[0])
+
+        np.testing.assert_array_equal(np.array(kv.key_caches[0][2]), 3)
+        np.testing.assert_array_equal(np.array(kv.value_caches[0][2]), 4)
+        np.testing.assert_array_equal(np.array(kv.key_caches[0][6]), 3)
+        np.testing.assert_array_equal(np.array(kv.value_caches[0][6]), 4)
+        conv, rec = _slab(runtime.state_cache, 0, 6)
+        np.testing.assert_array_equal(conv, 5)
+        np.testing.assert_array_equal(rec, 5)

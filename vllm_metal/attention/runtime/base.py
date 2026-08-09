@@ -9,6 +9,7 @@ one copy instead of three.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
@@ -63,6 +64,10 @@ class PagedAttentionRuntimeBase:
     def state_scheduler_group_indices(self) -> tuple[int, ...]:
         """Return scheduler groups holding per-request state (mamba) blocks."""
         return self._state_group_indices
+
+    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
+        """Apply scheduler copy-on-write operations to the primary cache."""
+        self._require_initialized("copy_blocks").copy_blocks(block_copies)
 
     def needs_step_context(self) -> bool:
         """Return whether this runtime attaches request-ordered step metadata."""

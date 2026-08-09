@@ -11,6 +11,7 @@ GDN layers use MLX-native state management via ``GDNPagedAttentionWrapper``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import Any
 
 import mlx.core as mx
@@ -304,6 +305,12 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
     def needs_step_context(self) -> bool:
         return True
+
+    def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
+        """Apply scheduler CoW copies to SDPA KV and align-mode GDN state."""
+        self.kv_cache.copy_blocks(block_copies)
+        if self._mamba_cache_mode == "align":
+            self.state_cache.copy_blocks(block_copies)
 
     def populate_step_context(
         self,

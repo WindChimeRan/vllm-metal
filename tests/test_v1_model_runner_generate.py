@@ -575,6 +575,43 @@ class TestV1MetalModelRunnerSpecDecodeVerification:
         assert runner._execute_model_state.target_hidden_states is None
         assert runner._execute_model_state.cu_seqlens == [0, 1]
 
+    def test_start_paged_forward_applies_cow_before_step_context(
+        self, monkeypatch
+    ) -> None:
+        runtime = Mock()
+        runtime.needs_step_context.return_value = True
+        runner = self._make_runner()
+        runner._paged_attention_runtime = runtime
+        runner.num_layers = 0
+        runner._paged_block_size = 4
+        runner._paged_group_block_sizes = (4,)
+        runner._paged_request_seq_lens["r0"] = 1
+        monkeypatch.setattr(
+            runner,
+            "_target_forward",
+            lambda *args, **kwargs: mr.TargetModelForwardOutput(
+                logits=mx.zeros((1, 1, 16))
+            ),
+        )
+
+        req_state = self._make_state([1, 6])
+        req_state.block_ids = [[0, 1]]
+        scheduler_output = self._make_scheduler_output({"r0": 1}, {})
+        scheduler_output.kv_cache_block_copies = [(2, 6)]
+
+        runner._start_paged_forward(
+            mr._ExecutionBatch(),
+            prefill_reqs=[],
+            decode_reqs=[("r0", req_state)],
+            scheduler_output=scheduler_output,
+        )
+
+        runtime.copy_blocks.assert_called_once_with([(2, 6)])
+        method_order = [call[0] for call in runtime.mock_calls]
+        assert method_order.index("copy_blocks") < method_order.index(
+            "populate_step_context"
+        )
+
     def test_start_paged_forward_clears_context_on_gdn_slot_error(self) -> None:
         state_cache = GDNPagedStateCache(
             num_layers=1,

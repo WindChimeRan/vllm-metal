@@ -1148,6 +1148,11 @@ class MetalModelRunner:
         try:
             ctx = get_context()
             runtime = self._paged_attention_runtime
+            if runtime is not None and scheduler_output.kv_cache_block_copies:
+                # vLLM has already rewritten request block tables to the CoW
+                # destinations. Populate those physical blocks before the
+                # hybrid state manager reads the rewritten tables.
+                runtime.copy_blocks(scheduler_output.kv_cache_block_copies)
             if ctx is not None and runtime is not None and runtime.needs_step_context():
                 step_req_ids = [req_id for req_id, _ in decode_reqs]
                 step_req_ids.extend(pr.req_id for pr in prefill_reqs)
