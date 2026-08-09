@@ -164,11 +164,11 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         # bytes (admission worst case), but the pool materializes lazily by
         # high-water block id — vLLM's BlockPool hands out low ids first, so
         # resident state memory tracks the live + cached set instead of
-        # wiring the whole worst case up front.  None mode keeps one slab per
-        # resident request and grows on demand.
+        # wiring the whole worst case up front. Start empty so the scheduler's
+        # shared tensor layout is adopted before any physical pool exists.
+        # None mode keeps one slab per resident request and grows on demand.
         align = self._mamba_cache_mode == "align"
         state_slots = num_blocks if align else self._max_num_seqs
-        initial_slots = min(num_blocks, 2 * self._max_num_seqs) if align else 0
         self._state_cache = GDNPagedStateCache(
             num_layers=len(self._linear_indices),
             max_seqs=state_slots,
@@ -177,7 +177,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             num_v_heads=self._linear_num_v_heads,
             value_head_dim=self._linear_value_head_dim,
             key_head_dim=self._linear_key_head_dim,
-            initial_seqs=initial_slots,
+            initial_seqs=0,
             dtype=self._dtype,
         )
         self._gdn_state_manager = (

@@ -198,6 +198,27 @@ class TestHybridAlignRuntime:
             mamba_cache_mode="align",
         )
 
+    def test_adopts_shared_layout_before_materializing_state(self) -> None:
+        runtime = self._make_runtime()
+        runtime.initialize(num_blocks=8)
+
+        assert runtime.state_cache.allocated_seqs == 0
+        runtime.adopt_scheduler_group(
+            0,
+            BLOCK,
+            state_group_indices=(1, 2),
+            layer_group_ordinals=[0, 1],
+            layer_pool_ordinals=[0, 0],
+        )
+        runtime.state_cache.ensure_capacity(2)
+
+        assert runtime.state_cache.num_state_pools == 1
+        assert runtime.state_cache.conv_states[0] is runtime.state_cache.conv_states[1]
+        assert (
+            runtime.state_cache.recurrent_states[0]
+            is runtime.state_cache.recurrent_states[1]
+        )
+
     def test_scheduler_cow_copy_updates_sdpa_and_gdn_blocks(self) -> None:
         runtime = self._make_runtime()
         runtime.initialize(num_blocks=8)
