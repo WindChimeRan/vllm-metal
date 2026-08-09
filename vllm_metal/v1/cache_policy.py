@@ -1056,7 +1056,10 @@ class WorkerCachePlanner:
         # any pool block can become a mamba state slab, so every planned block
         # carries the linear-state bytes alongside its SDPA pages (the pool is
         # fungible; the per-request reservation below stays zero instead).
+        # Growing the lazy state cache holds one old physical pool while its
+        # replacement materializes, so budget that one-pool overlap too.
         per_block_bytes += self._hybrid_align_state_bytes_per_block()
+        per_block_bytes += self._hybrid_align_growth_bytes_per_block()
         usable_metal = int(metal_limit * fraction)
         base_kv_budget = self.base_kv_budget_bytes(
             metal_limit,
@@ -1113,6 +1116,16 @@ class WorkerCachePlanner:
         num_linear = runner.num_layers - len(runner.sdpa_layer_indices)
         pools = _align_state_pool_count(num_linear, len(runner.sdpa_layer_indices))
         return runner.linear_cache_bytes_per_slot() * pools // num_linear
+
+    def _hybrid_align_growth_bytes_per_block(self) -> int:
+        """One old physical state pool retained during align-cache growth."""
+        runner = self._worker.model_runner
+        if not runner.is_hybrid:
+            return 0
+        if runner.cache_config.mamba_cache_mode != "align":
+            return 0
+        num_linear = runner.num_layers - len(runner.sdpa_layer_indices)
+        return runner.linear_cache_bytes_per_slot() // num_linear
 
     def _hybrid_gdn_reservation(self) -> _HybridGDNReservation:
         """Return lazy GDN headroom reserved outside the paged KV pool."""

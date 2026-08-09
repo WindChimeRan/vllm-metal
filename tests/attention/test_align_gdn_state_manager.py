@@ -134,8 +134,8 @@ class TestAlignGDNStateManager:
 
     def test_ensure_capacity_releases_old_pools_while_growing(self) -> None:
         # Growing 32 -> 64 slots across 8 pools must not hold every old pool
-        # alongside every new pool: the memory plan budgets the final size
-        # only, so the transient peak stays within a few pools of it.
+        # alongside every new pool: the memory plan reserves one old physical
+        # pool, so the transient peak stays within a few pools of final size.
         cache = GDNPagedStateCache(
             num_layers=8,
             max_seqs=64,
