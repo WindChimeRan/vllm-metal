@@ -168,9 +168,8 @@ class GDNPagedStateCache:
             if old_allocated:
                 recurrent[:old_allocated] = old_recurrent
 
-            # Materialize now so each old pool is released as it is copied;
-            # the transient peak stays ~one pool above the new size (the
-            # plan budgets the final size only).
+            # Materialize now so each old pool is released as it is copied.
+            # The memory plan reserves one old physical pool for this overlap.
             mx.eval(conv, recurrent)
             self.store_conv_state(layer_idx, conv)
             self.store_recurrent_state(layer_idx, recurrent)

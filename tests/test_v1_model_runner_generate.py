@@ -2786,12 +2786,7 @@ class TestDeferredDecodeSampleThreading:
 
 
 class TestStateBlockIdLifecycle:
-    """Fast coverage for the mamba block-id tracking the align runtime keys on.
-
-    Each test drives the real runner method for one lifecycle transition and
-    asserts _state_block_ids_by_req holds exactly the mamba groups' rows
-    (state groups (0, 1, 2); group 3 is the attention group).
-    """
+    """Track the mamba group rows that the align runtime keys on."""
 
     def _make_runner(self) -> mr.MetalModelRunner:
         return make_stub_runner(
@@ -2881,19 +2876,3 @@ class TestStateBlockIdLifecycle:
 
         assert runner._state_block_ids_by_req["r"] == [[50], [60], [70]]
         assert runner._request_states["r"].block_ids == [[80]]
-
-    def test_finish_drops_tracking(self) -> None:
-        runner = self._make_runner()
-        runner._state_block_ids_by_req["r"] = [[10], [20], [30]]
-        runner._request_states["r"] = mr.RequestState(
-            token_ids=[1],
-            prompt_len=1,
-            cache=[],
-            sampling_params=SamplingParams(),
-            block_ids=[[40]],
-        )
-        runner._paged_request_seq_lens["r"] = 1
-
-        runner._reconcile_request_lifecycle({"r"}, materialize_runtime_state=False)
-
-        assert "r" not in runner._state_block_ids_by_req

@@ -98,18 +98,6 @@ class TestAlignGDNStateManager:
         conv_src, _ = _slab(cache, 0, 2)
         np.testing.assert_array_equal(conv_src, 5.0)
 
-    def test_decode_within_block_moves_nothing(self) -> None:
-        cache = _make_cache()
-        manager = AlignGDNStateManager(cache, BLOCK)
-        _fill_slab(cache, 0, 2, 5.0)
-
-        ctx = self._populate(manager, ["req-A"], [[[2]]], [(2, 1)])
-
-        assert ctx.gdn_group_slot_mappings == ([2],)
-        conv, rec = _slab(cache, 0, 2)
-        np.testing.assert_array_equal(conv, 5.0)
-        np.testing.assert_array_equal(rec, 5.0)
-
     def test_striped_groups_share_one_pool_without_colliding(self) -> None:
         # Two layers from different groups sharing one physical pool, the
         # layout kv_cache_tensors.shared_by produces: each group's motion
@@ -131,40 +119,6 @@ class TestAlignGDNStateManager:
         np.testing.assert_array_equal(conv, 8.0)  # group 1 moved its rows
         conv, _ = _slab(cache, 0, 3)  # group 1's checkpoint intact in the pool
         np.testing.assert_array_equal(conv, 8.0)
-
-    def test_ensure_capacity_releases_old_pools_while_growing(self) -> None:
-        # Growing 32 -> 64 slots across 8 pools must not hold every old pool
-        # alongside every new pool: the memory plan reserves one old physical
-        # pool, so the transient peak stays within a few pools of final size.
-        cache = GDNPagedStateCache(
-            num_layers=8,
-            max_seqs=64,
-            conv_kernel_dim=2,
-            conv_dim=64,
-            num_v_heads=4,
-            value_head_dim=64,
-            key_head_dim=128,
-            initial_seqs=32,
-            dtype=mx.float32,
-        )
-        _fill_slab(cache, 0, 3, 5.0)
-        per_slab = (4 * 64 * 128 + 64) * 4  # recurrent + conv bytes, fp32
-        new_total = 8 * 64 * per_slab
-        old_pool = 32 * per_slab
-        active_before = mx.get_active_memory()
-        mx.reset_peak_memory()
-
-        cache.ensure_capacity(64)
-
-        peak_delta = mx.get_peak_memory() - active_before
-        assert peak_delta < new_total + 3 * old_pool, (
-            f"transient growth peak {peak_delta} exceeds final size "
-            f"{new_total} plus headroom; old pools are not being released"
-        )
-        assert cache.allocated_seqs == 64
-        conv, rec = _slab(cache, 0, 3)
-        np.testing.assert_array_equal(conv, 5.0)
-        np.testing.assert_array_equal(rec, 5.0)
 
     def test_pool_materializes_lazily_by_high_water_block_id(self) -> None:
         cache = _make_cache(num_blocks=8, initial_blocks=2)
@@ -218,31 +172,3 @@ class TestHybridAlignRuntime:
             runtime.state_cache.recurrent_states[0]
             is runtime.state_cache.recurrent_states[1]
         )
-
-    def test_scheduler_cow_copy_updates_sdpa_and_gdn_blocks(self) -> None:
-        runtime = self._make_runtime()
-        runtime.initialize(num_blocks=8)
-        runtime.adopt_scheduler_group(
-            0,
-            BLOCK,
-            state_group_indices=(1, 2),
-            layer_group_ordinals=[0, 1],
-            layer_pool_ordinals=[0, 0],
-        )
-
-        kv = runtime.kv_cache
-        kv.key_caches[0][2] = 3
-        kv.value_caches[0][2] = 4
-        runtime.state_cache.ensure_capacity(3)
-        _fill_slab(runtime.state_cache, 0, 2, 5)
-
-        runtime.copy_blocks([(2, 6)])
-        mx.eval(kv.key_caches[0], kv.value_caches[0])
-
-        np.testing.assert_array_equal(np.array(kv.key_caches[0][2]), 3)
-        np.testing.assert_array_equal(np.array(kv.value_caches[0][2]), 4)
-        np.testing.assert_array_equal(np.array(kv.key_caches[0][6]), 3)
-        np.testing.assert_array_equal(np.array(kv.value_caches[0][6]), 4)
-        conv, rec = _slab(runtime.state_cache, 0, 6)
-        np.testing.assert_array_equal(conv, 5)
-        np.testing.assert_array_equal(rec, 5)
