@@ -74,11 +74,20 @@ def metallib_path(name: str) -> Path:
 # do NOT add ``-O3``: MLX compiles its shaders at the metal default optimization
 # (already enabled), so matching keeps the prebuilt path numerically and
 # behaviourally identical to what users get today.
-_METALLIB_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
+MIN_MACOS_VERSION = "15.0"
+NAX_MIN_MACOS_VERSION = "26.2"
+_METALLIB_BASE_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
+_METALLIB_FLAGS = (
+    *_METALLIB_BASE_FLAGS,
+    f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+)
 
 # MPP tensor ops need a 26.2 deployment floor at compile and link time.
-_NAX_MIN_SDK = (26, 2)
-_NAX_METALLIB_FLAGS = (*_METALLIB_FLAGS, "-mmacosx-version-min=26.2")
+_NAX_MIN_SDK = tuple(int(x) for x in NAX_MIN_MACOS_VERSION.split("."))
+_NAX_METALLIB_FLAGS = (
+    *_METALLIB_BASE_FLAGS,
+    f"-mmacosx-version-min={NAX_MIN_MACOS_VERSION}",
+)
 
 
 def _metallib_flags(name: str) -> tuple[str, ...]:
@@ -231,6 +240,7 @@ def _build_spec() -> _BuildSpec:
         "-shared",
         "-fPIC",
         "-O2",
+        f"-mmacosx-version-min={MIN_MACOS_VERSION}",
         "-fvisibility=default",
         f"-I{py_include}",
         f"-I{nb_path / 'include'}",

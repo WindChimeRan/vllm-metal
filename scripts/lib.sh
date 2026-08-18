@@ -122,12 +122,30 @@ ensure_metal_toolchain() {
 # nanobind are importable.
 build_native_artifacts() {
   section "Building native Metal artifacts"
+  require_nax_sdk
   python -m vllm_metal.metal.build
 }
 
+# Official CI/release wheels must contain NAX. The lower-level Python builder
+# still permits older SDKs for local source builds, where NAX remains optional.
+require_nax_sdk() {
+  local sdk_version min_version sdk_major sdk_minor min_major min_minor
+  sdk_version=$(xcrun -sdk macosx --show-sdk-version)
+  min_version=$(python -c "from vllm_metal.metal.build import NAX_MIN_MACOS_VERSION; print(NAX_MIN_MACOS_VERSION)")
+  IFS=. read -r sdk_major sdk_minor <<< "${sdk_version}"
+  IFS=. read -r min_major min_minor <<< "${min_version}"
+
+  if (( sdk_major < min_major || (sdk_major == min_major && sdk_minor < min_minor) )); then
+    error "NAX release builds require macOS SDK >= ${min_version}; selected SDK is ${sdk_version}."
+    error "Select Xcode 26.3 (for example via DEVELOPER_DIR) and retry."
+    return 1
+  fi
+  success "NAX build SDK ${sdk_version}"
+}
+
 # Fail unless the freshly built wheel actually bundles the prebuilt native
-# artifacts: the _paged_ops*.so extension and the three .metallib shader
-# libraries. maturin's `include` directive is what pulls these (gitignored)
+# artifacts: the _paged_ops*.so extension, three required metallibs, and NAX.
+# maturin's `include` directive is what pulls these (gitignored)
 # files in; if that ever regresses, the wheel would install fine but fail at
 # first run with "Prebuilt native extension not found". The expected filenames
 # are read from build.py so this guard never drifts from the runtime loader.
@@ -139,9 +157,9 @@ verify_wheel_artifacts() {
 
   local expected
   if ! expected=$(python -c "
-from vllm_metal.metal.build import METALLIB_NAMES, metallib_path, output_path
+from vllm_metal.metal.build import METALLIB_NAMES, NAX_METALLIB_NAME, metallib_path, output_path
 print(output_path().name)
-for _name in METALLIB_NAMES:
+for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
     print(metallib_path(_name).name)
 "); then
     error "Failed to resolve expected native artifact names from build.py."
@@ -160,6 +178,33 @@ for _name in METALLIB_NAMES:
       return 1
     fi
   done <<< "$expected"
+
+  local expected_minos paged_ops_name unpack_dir native_so native_name actual_minos native_count
+  expected_minos=$(python -c "from vllm_metal.metal.build import MIN_MACOS_VERSION; print(MIN_MACOS_VERSION)")
+  paged_ops_name=$(python -c "from vllm_metal.metal.build import output_path; print(output_path().name)")
+  unpack_dir=$(mktemp -d)
+  unzip -qq "${wheel}" '*.so' -d "${unpack_dir}"
+  native_count=0
+  while IFS= read -r native_so; do
+    native_name=$(basename "${native_so}")
+    case "${native_name}" in
+      "${paged_ops_name}"|_rs.*.so) ;;
+      *) continue ;;
+    esac
+    native_count=$((native_count + 1))
+    actual_minos=$(otool -l "${native_so}" | awk '$1 == "minos" { print $2; exit }')
+    if [ "${actual_minos}" != "${expected_minos}" ]; then
+      error "${native_so} targets macOS ${actual_minos:-unknown}; expected ${expected_minos}."
+      rm -rf "${unpack_dir}"
+      return 1
+    fi
+    success "${native_name}: macOS ${actual_minos}"
+  done < <(find "${unpack_dir}" -type f -name '*.so')
+  rm -rf "${unpack_dir}"
+  if [ "${native_count}" -lt 2 ]; then
+    error "Wheel ${wheel} is missing a required native extension."
+    return 1
+  fi
 
   success "Wheel bundles all native artifacts"
 }
