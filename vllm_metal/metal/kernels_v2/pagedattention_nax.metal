@@ -343,7 +343,11 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
 
     simdgroup_barrier(mem_flags::mem_none);
 
-    // O += P @ V.  P stays fp32 into the MMA (see relaxed_precision note).
+    // O += P @ V.  P is fp32 in registers, but the matmul2d descriptor is
+    // relaxed_precision (required by the register layout nax_coord() mirrors),
+    // so the tensor unit truncates it -- unlike pagedattention_tiled.metal,
+    // which keeps P fp32 through the MMA and is precision-neutral by contract.
+    // That divergence is what tools/nax_prefill_parity.py bounds.
     // V is re-read per d-pair like MLX; the bases are already resolved.
 #pragma clang loop unroll(full)
     for (short id = 0; id < TD; id += 2) {
@@ -381,7 +385,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
 #pragma clang loop unroll(full)
   for (short i = 0; i < 2; i++) {
     if (q_ok[i]) {
-      const float rcp = 1.0f / sum_score[i];
+      // Match tiled attention's zero-denominator guard for fully masked rows.
+      const float rcp = 1.0f / (sum_score[i] + 1e-6f);
       device T *out_row = out_base + (fm + i * 8) * q_stride + fn;
 #pragma clang loop unroll(full)
       for (short d = 0; d < TD; d++) {

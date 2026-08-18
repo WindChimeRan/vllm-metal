@@ -240,7 +240,7 @@ class TestSinkParity:
 class TestSinkPrefillMode:
     """Ordinary prefill with sinks stays on the tiled sink path."""
 
-    def test_prefill_matches_mlx_oracle(self) -> None:
+    def test_prefill_matches_mlx_oracle(self, force_tiled_prefill) -> None:
         got, ref = _run_prefill(
             GPT_OSS_PREFILL_CTX,
             GPT_OSS_PREFILL_LEN,

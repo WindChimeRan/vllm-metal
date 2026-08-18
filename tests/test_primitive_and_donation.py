@@ -168,6 +168,7 @@ def test_primitive_vs_reference_varlen(
     num_heads: tuple[int, int],
     num_blocks: int,
     sliding_window: int,
+    force_tiled_prefill,
 ) -> None:
     """paged_attention_primitive matches reference for mixed prefill+decode."""
     mx.random.seed(0)
@@ -217,7 +218,7 @@ def test_primitive_vs_reference_varlen(
 
 
 @pytest.mark.parametrize("head_size", [64, 96, 128])
-def test_tiled_kernel_head_size_parity(head_size: int) -> None:
+def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> None:
     """Tiled prefill kernel matches reference for every routed head size.
 
     can_use_tiled_kernel() routes head sizes {64, 96, 128} to the BQ=32

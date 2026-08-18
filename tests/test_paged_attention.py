@@ -253,8 +253,8 @@ class TestPrepare:
     def test_prepare_unified_mixed_window_and_prefill_stays_off_window_mode(self):
         # A verify window sharing the batch with a prefill chunk keeps its
         # merged segment but the batch reports verify_window_q=1, so the
-        # dispatch routes it down the tiled path exactly like the
-        # non-speculative case (window mode is pure-verification only).
+        # dispatch routes it down a prefill kernel (tiled, or NAX on M5)
+        # exactly like the non-speculative case, never window mode.
         prepare_unified(
             [([5, 6, 7], 7, 3)],
             [([10, 11], 5, 0)],

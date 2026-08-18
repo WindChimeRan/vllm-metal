@@ -274,9 +274,9 @@ def prepare_grouped(
             cu_seqlens=cu_seqlens,
             offsets=offsets,
             num_decode_requests=len(decode_requests),
-            # Window routing applies only to pure-verification batches;
-            # any prefill segment keeps the whole batch on the tiled
-            # kernel, numerically identical to the non-speculative path.
+            # Window routing applies only to pure-verification batches. Any
+            # prefill segment keeps the whole batch on a prefill kernel (tiled,
+            # or NAX on M5), never the verification-window kernel.
             verify_window_q=1 if prefill_requests else max_decode_window,
             kv_groups=kv_groups,
         )

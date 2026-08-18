@@ -23,6 +23,27 @@ def _get_test_seed() -> int:
         raise ValueError("VLLM_METAL_TEST_SEED must be an integer") from exc
 
 
+@pytest.fixture
+def force_tiled_prefill():
+    """Keep prefill batches on the tiled kernel for the duration of a test.
+
+    On an M5 the NAX kernel intercepts eligible prefill batches before
+    select_tile_config, so a test that means to exercise the tiled kernel
+    silently exercises NAX instead -- and because CI runners are not M5,
+    nothing would catch the swap. Tests that assert tiled dispatch request this
+    fixture; NAX itself is covered by tools/nax_prefill_parity.py (manual, M5).
+    """
+
+    from vllm_metal.metal import get_ops
+
+    ops = get_ops()
+    ops.set_nax_enabled(False)
+    try:
+        yield
+    finally:
+        ops.set_nax_enabled(True)
+
+
 @pytest.fixture(autouse=True)
 def _seed_random_generators() -> None:
     """Seed common RNGs to keep tests deterministic."""
