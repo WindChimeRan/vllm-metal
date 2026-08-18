@@ -89,6 +89,12 @@ def _build_mla_paged_attention_source() -> str:
     return "\n".join(parts)
 
 
+def _build_nax_source() -> str:
+    """NAX prefill attention source (self-contained; guards itself to empty
+    on compilers without Metal 4 tensor-op support)."""
+    return _read_metal_source(_KERNELS_V2_DIR / "pagedattention_nax.metal")
+
+
 def metal_mla_paged_attention(
     q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
     q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
@@ -218,10 +224,17 @@ def get_ops() -> ModuleType:
     #    precompiled .metallib files shipped in the wheel (no first-request
     #    shader compile); only compile the shaders in-process when the developer
     #    opts in via VLLM_METAL_BUILD_FROM_SOURCE (no silent fallback).
+    # NAX prefill kernels are optional at every layer: hardware-gated,
+    # env-gated, and (in prebuilt mode) present only in wheels built on a
+    # macOS >= 26.2 SDK.  Absence is never an error — the primitive's
+    # dispatch falls back to the tiled kernel.
+    init_nax = envs.VLLM_METAL_NAX_PREFILL and mod.nax_supported()
     if envs.VLLM_METAL_BUILD_FROM_SOURCE:
         mod.init_v2_library(_build_v2_paged_attention_source())
         mod.init_gdn_library(_build_gdn_source())
         mod.init_mla_library(_build_mla_paged_attention_source())
+        if init_nax:
+            mod.init_nax_library(_build_nax_source())
     else:
         from vllm_metal.metal.build import METALLIB_NAMES, metallib_path
 
@@ -234,6 +247,11 @@ def get_ops() -> ModuleType:
             )
         for name in METALLIB_NAMES:
             mod.init_library_path(name, str(metallib_path(name)))
+        nax_lib = metallib_path("paged_attention_nax_kern")
+        if init_nax and nax_lib.exists():
+            mod.init_nax_library_path(str(nax_lib))
+    if init_nax and mod.nax_ready():
+        logger.info("NAX prefill attention kernels loaded (M5 tensor units)")
 
     _ops_module = mod
     logger.info("Native paged-attention Metal kernels loaded")

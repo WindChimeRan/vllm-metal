@@ -133,6 +133,53 @@ void init_library_path(const std::string& name, const std::string& path) {
 }
 
 // ---------------------------------------------------------------------------
+// NAX (M5 tensor-unit) prefill kernel support
+// ---------------------------------------------------------------------------
+
+static std::string nax_source_;
+static bool nax_lib_ready_ = false;   // a NAX library was registered
+static bool nax_enabled_ = true;      // runtime kill-switch (tests / env)
+
+// Mirror of mlx::core::metal::is_nax_available() rather than a call to it:
+// an mlx wheel built with MLX_METAL_NO_NAX reports false on NAX hardware,
+// and that build flag gates mlx's own kernels, not ours.  The 'p'-family
+// asymmetry (gen >= 18, not 17) is deliberate upstream — keep it.
+static bool nax_hardware_supported() {
+  static const bool v = []() {
+    bool ok = false;
+    if (__builtin_available(macOS 26.2, *)) {
+      ok = true;
+    }
+    auto& d = metal::device(Device::gpu);
+    const auto& arch = d.get_architecture();
+    if (arch.empty()) return false;
+    ok &= d.get_architecture_gen() >= (arch.back() == 'p' ? 18 : 17);
+    return ok;
+  }();
+  return v;
+}
+
+void init_nax_library(const std::string& nax_src) {
+  nax_source_ = nax_src;
+  auto& d = metal::device(Device::gpu);
+  d.get_library("paged_attention_nax_kern", [&]() { return nax_source_; });
+  nax_lib_ready_ = true;
+}
+
+void init_nax_library_path(const std::string& path) {
+  init_library_path("paged_attention_nax_kern", path);
+  nax_lib_ready_ = true;
+}
+
+// Shapes the NAX kernel is instantiated for.  Head dims beyond 128 need a
+// register-pressure-aware tile shape (mlx's NAX attention also stops at 128);
+// everything else falls through to the tiled kernel.
+static bool nax_eligible(int head_size, int block_size) {
+  return nax_lib_ready_ && nax_enabled_ && nax_hardware_supported() &&
+      (head_size == 64 || head_size == 128) && (block_size % 8 == 0);
+}
+
+// ---------------------------------------------------------------------------
 // Helper: dtype → Metal type string
 // ---------------------------------------------------------------------------
 
@@ -278,6 +325,56 @@ static std::optional<TileConfig> select_tile_config(int head_size) {
   }
 }
 
+// NAX prefill: identical buffer ABI to the tiled kernel, so only the kernel
+// name, grid (BQ=64 rows per threadgroup) and the absence of threadgroup
+// memory differ.  Sink handling matches tiled's function-constant pattern.
+static void dispatch_paged_attention_nax(
+    array& out, const array& query,
+    const array& key_cache, const array& value_cache,
+    int num_kv_heads, float scale, float softcap,
+    const array& block_tables, const array& seq_lens,
+    const array& cu_seqlens_q,
+    int block_size, int sliding_window,
+    Stream s, const array* sinks) {
+  auto& d = metal::device(s.device);
+
+  constexpr int kNaxBQ = 64;
+  constexpr int kNaxThreads = 128;
+
+  int total_q_tokens = static_cast<int>(query.shape(0));
+  int head_size  = static_cast<int>(query.shape(2));
+  int num_seqs   = static_cast<int>(cu_seqlens_q.shape(0)) - 1;
+  int total_q_blocks = total_q_tokens / kNaxBQ + num_seqs;
+  bool use_sinks = sinks != nullptr;
+
+  std::string base_kname =
+      "paged_attention_nax_" + dtype_to_metal(query.dtype()) +
+      "_hs" + std::to_string(head_size) +
+      "_bs" + std::to_string(block_size);
+  std::string hash_name = base_kname + "_sk" + (use_sinks ? "1" : "0");
+
+  auto* lib = d.get_library("paged_attention_nax_kern");
+  auto* kernel = d.get_kernel(
+      base_kname, lib, hash_name,
+      {{&use_sinks, MTL::DataType::DataTypeBool, NS::UInteger(40)}});
+
+  int num_heads = static_cast<int>(query.shape(1));
+  auto& enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+
+  bind_paged_attn_buffers(enc, out, query, key_cache, value_cache,
+                          num_kv_heads, softcap, block_tables, seq_lens,
+                          cu_seqlens_q, sliding_window);
+  enc.set_bytes(scale, 9);
+  if (use_sinks) {
+    enc.set_input_array(*sinks, 18);
+  }
+
+  enc.dispatch_threadgroups(
+      MTL::Size::Make(num_heads, total_q_blocks, 1),
+      MTL::Size::Make(kNaxThreads, 1, 1));
+}
+
 static void dispatch_paged_attention_tiled(
     array& out, const array& query,
     const array& key_cache, const array& value_cache,
@@ -385,6 +482,16 @@ static void dispatch_paged_attention_v2_online(
   // pagedattention_tiled.metal folds the sink into each row's denominator-only
   // softmax state before final normalization.
   if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
+    // Prefill batches on supported M5 shapes take the tensor-unit kernel;
+    // the tiled kernel remains the fallback for every other shape/machine.
+    if (nax_eligible(head_size, block_size)) {
+      dispatch_paged_attention_nax(
+          out, query, key_cache, value_cache,
+          num_kv_heads, scale, softcap,
+          block_tables, seq_lens, cu_seqlens_q,
+          block_size, sliding_window, s, sinks);
+      return;
+    }
     if (auto cfg = select_tile_config(head_size)) {
       dispatch_paged_attention_tiled(
           out, query, key_cache, value_cache,
@@ -1414,6 +1521,24 @@ NB_MODULE(_paged_ops, m) {
   m.def("init_gdn_library", &init_gdn_library,
         nb::arg("gdn_src"),
         "JIT-compile the GDN linear attention Metal shader.");
+
+  m.def("init_nax_library", &init_nax_library,
+        nb::arg("nax_src"),
+        "JIT-compile the NAX prefill attention Metal shader.");
+
+  m.def("init_nax_library_path", &init_nax_library_path,
+        nb::arg("path"),
+        "Load the precompiled NAX prefill .metallib from disk.");
+
+  m.def("nax_supported", &nax_hardware_supported,
+        "True on hardware/OS with M5 tensor units (macOS >= 26.2, gen 17+).");
+
+  m.def("nax_ready", []() { return nax_lib_ready_ && nax_enabled_; },
+        "True when the NAX prefill kernel is loaded and enabled.");
+
+  m.def("set_nax_enabled", [](bool enabled) { nax_enabled_ = enabled; },
+        nb::arg("enabled"),
+        "Runtime kill-switch for the NAX prefill kernel (tests / A-B runs).");
 
   m.def("tq_encode",
         [](nb::handle key_h, nb::handle value_h,

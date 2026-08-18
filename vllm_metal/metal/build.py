@@ -48,6 +48,12 @@ _HASH = _stamp_path(_OUT)
 # ``get_library(name)`` returns the .metallib loaded at startup.
 METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern")
 
+# Optional libraries: built only when the local SDK can compile them, absent
+# from wheels built on older SDKs, and loaded at runtime only when present.
+# The wheel-bundling guard (scripts/lib.sh verify_wheel_artifacts) therefore
+# must NOT require them — keep them out of METALLIB_NAMES.
+OPTIONAL_METALLIB_NAMES = ("paged_attention_nax_kern",)
+
 
 def output_path() -> Path:
     """Path to the prebuilt native extension (whether or not it exists yet)."""
@@ -73,6 +79,32 @@ def metallib_path(name: str) -> Path:
 # behaviourally identical to what users get today.
 _METALLIB_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
 
+# The NAX library needs the 26.2 deployment floor at BOTH compile and link:
+# MetalPerformancePrimitives tensor ops are hidden below it, and a link step
+# without the flag pins the AIR version and silently drops the NAX object
+# (empty metallib).  The single metal invocation below applies it to both.
+_NAX_MIN_SDK = (26, 2)
+_NAX_METALLIB_FLAGS = (*_METALLIB_FLAGS, "-mmacosx-version-min=26.2")
+
+
+def _metallib_flags(name: str) -> tuple[str, ...]:
+    return _NAX_METALLIB_FLAGS if name in OPTIONAL_METALLIB_NAMES else _METALLIB_FLAGS
+
+
+def _sdk_supports_nax() -> bool:
+    """Whether the local macOS SDK can compile the NAX library at all."""
+    try:
+        out = subprocess.run(
+            ["xcrun", "-sdk", "macosx", "--show-sdk-version"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        parts = tuple(int(x) for x in out.split(".")[:2])
+        return parts >= _NAX_MIN_SDK
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        return False
+
 
 def _metallib_source(name: str) -> str:
     """Assemble the concatenated Metal source for one shader library. Source
@@ -81,6 +113,7 @@ def _metallib_source(name: str) -> str:
     from vllm_metal.metal import (
         _build_gdn_source,
         _build_mla_paged_attention_source,
+        _build_nax_source,
         _build_v2_paged_attention_source,
     )
 
@@ -88,15 +121,16 @@ def _metallib_source(name: str) -> str:
         "paged_attention_v2_kern": _build_v2_paged_attention_source,
         "gdn_kern": _build_gdn_source,
         "paged_mla_kern": _build_mla_paged_attention_source,
+        "paged_attention_nax_kern": _build_nax_source,
     }
     return builders[name]()
 
 
-def _metallib_digest(source: str) -> str:
+def _metallib_digest(name: str, source: str) -> str:
     """Content hash of a metallib: its assembled ``.metal`` source + the compile
     flags. Editing any concatenated shader changes ``source`` and so the digest."""
     h = hashlib.sha256()
-    h.update("\0".join(_METALLIB_FLAGS).encode())
+    h.update("\0".join(_metallib_flags(name)).encode())
     h.update(b"\0")
     h.update(source.encode())
     return h.hexdigest()
@@ -123,12 +157,12 @@ def _compile_metallib(name: str, source: str) -> Path:
         tmp.write(source)
         tmp.close()
         _run_or_raise(
-            [*_METALLIB_FLAGS, tmp.name, "-o", str(out)],
+            [*_metallib_flags(name), tmp.name, "-o", str(out)],
             f"compile Metal library '{name}'",
         )
     finally:
         Path(tmp.name).unlink(missing_ok=True)
-    _stamp_path(out).write_text(_metallib_digest(source))
+    _stamp_path(out).write_text(_metallib_digest(name, source))
     return out
 
 
@@ -141,7 +175,21 @@ def build_metallibs() -> list[Path]:
     the Metal toolchain never reaches this code.
     """
     logger.info("Building Metal shader libraries ...")
-    return [_compile_metallib(name, _metallib_source(name)) for name in METALLIB_NAMES]
+    built = [_compile_metallib(name, _metallib_source(name)) for name in METALLIB_NAMES]
+    if _sdk_supports_nax():
+        built += [
+            _compile_metallib(name, _metallib_source(name))
+            for name in OPTIONAL_METALLIB_NAMES
+        ]
+    else:
+        # A wheel built here simply ships without the NAX kernels; runtime
+        # dispatch falls back to the tiled kernel when the library is absent.
+        logger.warning(
+            "macOS SDK < %s: skipping NAX metallib(s) %s",
+            ".".join(map(str, _NAX_MIN_SDK)),
+            ", ".join(OPTIONAL_METALLIB_NAMES),
+        )
+    return built
 
 
 def _find_package_path(name: str) -> Path:
@@ -304,13 +352,19 @@ def stale_artifacts() -> list[Path]:
     no source builder (a ``KeyError`` from :func:`_metallib_source`) is
     deliberately left to propagate: that is a bug to fix, not a condition to
     hide behind ``[]``."""
-    artifacts = (_OUT, *(metallib_path(n) for n in METALLIB_NAMES))
+    # Optional libraries participate only when actually built (a wheel from an
+    # older SDK legitimately lacks them).
+    opt_names = [n for n in OPTIONAL_METALLIB_NAMES if metallib_path(n).exists()]
+    all_names = (*METALLIB_NAMES, *opt_names)
+    artifacts = (_OUT, *(metallib_path(n) for n in all_names))
     if not any(_stamp_path(a).exists() for a in artifacts):
         return []
     try:
         digests = {_OUT: _input_hash(_build_spec())}
-        for name in METALLIB_NAMES:
-            digests[metallib_path(name)] = _metallib_digest(_metallib_source(name))
+        for name in all_names:
+            digests[metallib_path(name)] = _metallib_digest(
+                name, _metallib_source(name)
+            )
     except (OSError, ImportError, RuntimeError) as exc:
         # The check couldn't run (not a verdict on the artifacts); don't block a
         # loadable install, but leave a breadcrumb instead of failing silently.
