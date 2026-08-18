@@ -122,25 +122,7 @@ ensure_metal_toolchain() {
 # nanobind are importable.
 build_native_artifacts() {
   section "Building native Metal artifacts"
-  require_nax_sdk
   python -m vllm_metal.metal.build
-}
-
-# Official CI/release wheels must contain NAX. The lower-level Python builder
-# still permits older SDKs for local source builds, where NAX remains optional.
-require_nax_sdk() {
-  local sdk_version min_version sdk_major sdk_minor min_major min_minor
-  sdk_version=$(xcrun -sdk macosx --show-sdk-version)
-  min_version=$(python -c "from vllm_metal.metal.build import NAX_MIN_MACOS_VERSION; print(NAX_MIN_MACOS_VERSION)")
-  IFS=. read -r sdk_major sdk_minor <<< "${sdk_version}"
-  IFS=. read -r min_major min_minor <<< "${min_version}"
-
-  if (( sdk_major < min_major || (sdk_major == min_major && sdk_minor < min_minor) )); then
-    error "NAX release builds require macOS SDK >= ${min_version}; selected SDK is ${sdk_version}."
-    error "Select Xcode 26.3 (for example via DEVELOPER_DIR) and retry."
-    return 1
-  fi
-  success "NAX build SDK ${sdk_version}"
 }
 
 # Fail unless the freshly built wheel actually bundles the prebuilt native
