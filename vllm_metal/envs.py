@@ -75,10 +75,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
-    # Emergency kill-switch for automatic NAX (M5 tensor-unit) prefill
-    # attention.  NAX is selected automatically when the OS, hardware, shader
-    # library, dtype, and workload shape support it.  Set to "1" only to force
-    # the established non-NAX fallback after a driver or correctness issue.
+    # Emergency override for automatic M5 NAX prefill attention.
     "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)

@@ -48,11 +48,8 @@ _HASH = _stamp_path(_OUT)
 # ``get_library(name)`` returns the .metallib loaded at startup.
 METALLIB_NAMES = ("paged_attention_v2_kern", "gdn_kern", "paged_mla_kern")
 
-# Optional libraries: built only when the local SDK can compile them, absent
-# from wheels built on older SDKs, and loaded at runtime only when present.
-# The wheel-bundling guard (scripts/lib.sh verify_wheel_artifacts) therefore
-# must NOT require them — keep them out of METALLIB_NAMES.
-OPTIONAL_METALLIB_NAMES = ("paged_attention_nax_kern",)
+# Kept outside METALLIB_NAMES because wheels built with older SDKs omit it.
+NAX_METALLIB_NAME = "paged_attention_nax_kern"
 
 
 def output_path() -> Path:
@@ -79,16 +76,13 @@ def metallib_path(name: str) -> Path:
 # behaviourally identical to what users get today.
 _METALLIB_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
 
-# The NAX library needs the 26.2 deployment floor at BOTH compile and link:
-# MetalPerformancePrimitives tensor ops are hidden below it, and a link step
-# without the flag pins the AIR version and silently drops the NAX object
-# (empty metallib).  The single metal invocation below applies it to both.
+# MPP tensor ops need a 26.2 deployment floor at compile and link time.
 _NAX_MIN_SDK = (26, 2)
 _NAX_METALLIB_FLAGS = (*_METALLIB_FLAGS, "-mmacosx-version-min=26.2")
 
 
 def _metallib_flags(name: str) -> tuple[str, ...]:
-    return _NAX_METALLIB_FLAGS if name in OPTIONAL_METALLIB_NAMES else _METALLIB_FLAGS
+    return _NAX_METALLIB_FLAGS if name == NAX_METALLIB_NAME else _METALLIB_FLAGS
 
 
 def _sdk_supports_nax() -> bool:
@@ -121,7 +115,7 @@ def _metallib_source(name: str) -> str:
         "paged_attention_v2_kern": _build_v2_paged_attention_source,
         "gdn_kern": _build_gdn_source,
         "paged_mla_kern": _build_mla_paged_attention_source,
-        "paged_attention_nax_kern": _build_nax_source,
+        NAX_METALLIB_NAME: _build_nax_source,
     }
     return builders[name]()
 
@@ -167,7 +161,7 @@ def _compile_metallib(name: str, source: str) -> Path:
 
 
 def build_metallibs() -> list[Path]:
-    """Precompile the three Metal shader libraries to ``.metallib`` files.
+    """Precompile the required libraries and optional NAX library.
 
     PACKAGING-only (CI + release.sh): the default runtime path loads these
     prebuilt libraries, but source mode (``VLLM_METAL_BUILD_FROM_SOURCE=1``)
@@ -177,17 +171,14 @@ def build_metallibs() -> list[Path]:
     logger.info("Building Metal shader libraries ...")
     built = [_compile_metallib(name, _metallib_source(name)) for name in METALLIB_NAMES]
     if _sdk_supports_nax():
-        built += [
-            _compile_metallib(name, _metallib_source(name))
-            for name in OPTIONAL_METALLIB_NAMES
-        ]
+        built.append(
+            _compile_metallib(NAX_METALLIB_NAME, _metallib_source(NAX_METALLIB_NAME))
+        )
     else:
-        # A wheel built here simply ships without the NAX kernels; runtime
-        # dispatch falls back to the tiled kernel when the library is absent.
         logger.warning(
-            "macOS SDK < %s: skipping NAX metallib(s) %s",
+            "macOS SDK < %s: skipping %s",
             ".".join(map(str, _NAX_MIN_SDK)),
-            ", ".join(OPTIONAL_METALLIB_NAMES),
+            NAX_METALLIB_NAME,
         )
     return built
 
@@ -352,10 +343,8 @@ def stale_artifacts() -> list[Path]:
     no source builder (a ``KeyError`` from :func:`_metallib_source`) is
     deliberately left to propagate: that is a bug to fix, not a condition to
     hide behind ``[]``."""
-    # Optional libraries participate only when actually built (a wheel from an
-    # older SDK legitimately lacks them).
-    opt_names = [n for n in OPTIONAL_METALLIB_NAMES if metallib_path(n).exists()]
-    all_names = (*METALLIB_NAMES, *opt_names)
+    optional = (NAX_METALLIB_NAME,) if metallib_path(NAX_METALLIB_NAME).exists() else ()
+    all_names = (*METALLIB_NAMES, *optional)
     artifacts = (_OUT, *(metallib_path(n) for n in all_names))
     if not any(_stamp_path(a).exists() for a in artifacts):
         return []

@@ -1,18 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Parity tests for the NAX (M5 tensor-unit) prefill attention kernel.
+"""NAX and tiled prefill parity against a gathered fp32 SDPA reference.
 
-Each case runs the same paged batch through ``paged_attention_primitive``
-twice — NAX dispatch enabled, then force-disabled via ``set_nax_enabled``
-(the tiled-kernel arm) — and compares both against a gathered fp32 SDPA
-reference.
-
-Acceptance is reference-relative, not bitwise-vs-tiled: the NAX PV matmul
-runs the fp32 P operand at relaxed (tf32-style) precision — below bf16
-output rounding for softmax probabilities, but enough to break bitwise
-agreement with the tiled kernel's fp32 accumulation order.
-
-Skipped wholesale when the NAX library is unavailable (pre-M5 hardware,
-macOS < 26.2, or a wheel built on an older SDK).
+The relaxed-precision PV matmul is not bitwise identical to tiled attention.
+Tests skip when the optional NAX library is unavailable.
 """
 
 from __future__ import annotations
@@ -24,8 +14,7 @@ from vllm_metal.metal import get_ops
 
 
 def _nax_ready() -> bool:
-    ops = get_ops()
-    return bool(ops.nax_supported() and ops.nax_ready())
+    return bool(get_ops().nax_ready())
 
 
 pytestmark = pytest.mark.skipif(
@@ -44,9 +33,11 @@ def _build_case(seqs, qh, kvh, d, bs, dtype, seed):
     vc = mx.random.normal((num_blocks, bs, kvh, d)).astype(dtype)
     total_q = sum(q for q, _ in seqs)
     q = (mx.random.normal((total_q, qh, d)) * 0.5).astype(dtype)
-    bt_rows, nxt = [], 1
+    # Interleave physical page IDs so every case exercises block-table gathers.
+    block_ids = [*range(1, num_blocks, 2), *range(2, num_blocks, 2)]
+    bt_rows, nxt = [], 0
     for nb in blocks_per:
-        bt_rows.append(list(range(nxt, nxt + nb)))
+        bt_rows.append(block_ids[nxt : nxt + nb])
         nxt += nb
     max_nb = max(blocks_per)
     bt = mx.array([r + [0] * (max_nb - len(r)) for r in bt_rows], dtype=mx.int32)
@@ -65,7 +56,7 @@ def _reference(q, kc, vc, seqs, bt_rows, qh, kvh, d, bs, scale, softcap, window,
     flat_v = vc.reshape(-1, kvh, d).astype(mx.float32)
     group = qh // kvh
     outs, q_off = [], 0
-    for (ql, ctx), row in zip(seqs, bt_rows, strict=False):
+    for (ql, ctx), row in zip(seqs, bt_rows, strict=True):
         total = ql + ctx
         slots = mx.array([row[p // bs] * bs + p % bs for p in range(total)])
         kh = mx.repeat(flat_k[slots].transpose(1, 0, 2), group, axis=0)
@@ -188,9 +179,7 @@ def test_nax_prefill_matches_reference(name):
 
     nax_err = mx.abs(nax_f - ref).max().item()
     tiled_err = mx.abs(tiled_f - ref).max().item()
-    # NAX must track the reference as well as the tiled kernel does (with
-    # headroom for relaxed-precision PV), and never be wildly off in
-    # absolute terms.
+    # Allow relaxed-precision PV headroom relative to the tiled error.
     assert nax_err <= max(2.5 * tiled_err, 2e-2), (
         f"{name}: nax_err={nax_err:.3e} tiled_err={tiled_err:.3e}"
     )

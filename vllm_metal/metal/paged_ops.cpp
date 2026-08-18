@@ -138,12 +138,10 @@ void init_library_path(const std::string& name, const std::string& path) {
 
 static std::string nax_source_;
 static bool nax_lib_ready_ = false;   // a NAX library was registered
-static bool nax_enabled_ = true;      // runtime kill-switch (tests / env)
+static bool nax_enabled_ = true;      // test / A-B switch
 
-// Mirror of mlx::core::metal::is_nax_available() rather than a call to it:
-// an mlx wheel built with MLX_METAL_NO_NAX reports false on NAX hardware,
-// and that build flag gates mlx's own kernels, not ours.  The 'p'-family
-// asymmetry (gen >= 18, not 17) is deliberate upstream — keep it.
+// Match MLX's hardware gate, but ignore MLX_METAL_NO_NAX because this library
+// is compiled separately. The 'p' family requires generation 18 rather than 17.
 static bool nax_hardware_supported() {
   static const bool v = []() {
     bool ok = false;
@@ -171,12 +169,12 @@ void init_nax_library_path(const std::string& path) {
   nax_lib_ready_ = true;
 }
 
-// Shapes the NAX kernel is instantiated for.  Head dims beyond 128 need a
-// register-pressure-aware tile shape (mlx's NAX attention also stops at 128);
-// everything else falls through to the tiled kernel.
-static bool nax_eligible(int head_size, int block_size) {
+// Match the instantiated NAX shapes; other shapes retain the tiled path.
+static bool nax_eligible(Dtype dtype, int head_size, int block_size) {
   return nax_lib_ready_ && nax_enabled_ && nax_hardware_supported() &&
-      (head_size == 64 || head_size == 128) && (block_size % 8 == 0);
+      (dtype == float16 || dtype == bfloat16) &&
+      (head_size == 64 || head_size == 128) &&
+      (block_size == 8 || block_size == 16 || block_size == 32);
 }
 
 // ---------------------------------------------------------------------------
@@ -325,9 +323,7 @@ static std::optional<TileConfig> select_tile_config(int head_size) {
   }
 }
 
-// NAX prefill: identical buffer ABI to the tiled kernel, so only the kernel
-// name, grid (BQ=64 rows per threadgroup) and the absence of threadgroup
-// memory differ.  Sink handling matches tiled's function-constant pattern.
+// Same buffer ABI as the tiled kernel, with BQ=64 and no threadgroup memory.
 static void dispatch_paged_attention_nax(
     array& out, const array& query,
     const array& key_cache, const array& value_cache,
@@ -482,9 +478,7 @@ static void dispatch_paged_attention_v2_online(
   // pagedattention_tiled.metal folds the sink into each row's denominator-only
   // softmax state before final normalization.
   if (has_prefill && !window_batch && !use_turboquant && dtype_ok) {
-    // Prefill batches on supported M5 shapes take the tensor-unit kernel;
-    // the tiled kernel remains the fallback for every other shape/machine.
-    if (nax_eligible(head_size, block_size)) {
+    if (nax_eligible(query.dtype(), head_size, block_size)) {
       dispatch_paged_attention_nax(
           out, query, key_cache, value_cache,
           num_kv_heads, scale, softcap,
@@ -1531,7 +1525,7 @@ NB_MODULE(_paged_ops, m) {
         "Load the precompiled NAX prefill .metallib from disk.");
 
   m.def("nax_supported", &nax_hardware_supported,
-        "True on hardware/OS with M5 tensor units (macOS >= 26.2, gen 17+).");
+        "True when the OS and GPU expose NAX tensor units.");
 
   m.def("nax_ready", []() { return nax_lib_ready_ && nax_enabled_; },
         "True when the NAX prefill kernel is loaded and enabled.");

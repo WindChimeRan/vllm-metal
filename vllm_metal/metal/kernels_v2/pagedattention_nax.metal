@@ -1,35 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// NAX (M5 tensor-unit) paged prefill attention.
+// NAX (M5 tensor-unit) paged prefill attention. Portions adapted from MLX
+// steel_attention_nax (MIT, Copyright © 2025 Apple Inc.).
 //
-// Same paging / varlen / causal semantics as pagedattention_tiled.metal, but
-// the QK^T and PV matmuls run on the neural accelerators through Metal 4's
-// MetalPerformancePrimitives matmul2d: 16x32x16 per simdgroup instead of
-// 8x8x8.  Ported from MLX steel_attention_nax (BQ=64, BK=32, 4 simdgroups),
-// which established the two structural choices this kernel inherits:
+// QK^T and PV use MPP 16x32x16 matmul2d operations. Q/K/V move directly from
+// device memory to register fragments without threadgroup staging.
+// relaxed_precision=true is required by the cooperative-tensor register layout
+// mirrored in nax_coord(); it also truncates the fp32 P operand of PV.
 //
-//   - No threadgroup memory and no data barriers: Q/K/V go device -> register
-//     fragments, re-read per KV tile.  L1 absorbs the redundancy; the freed
-//     registers and barriers buy more than smem staging does at this tile
-//     size (measured 3.4x over the tiled kernel at L=4096, hd=128).
-//   - relaxed_precision=true on the MMA descriptor.  Load-bearing twice:
-//     it truncates the fp32 P operand of PV tf32-style (below bf16 output
-//     rounding for softmax probabilities), AND the cooperative-tensor
-//     register layout that nax_coord() mirrors is only valid for relaxed
-//     descriptors — flipping the flag scrambles operand placement.
-//
-// The paged twist: a 16-row K/V fragment splits into two 8-token halves, and
-// an 8-token run starting at a multiple of 8 never crosses a physical-block
-// boundary for any supported BLOCK_SIZE (8/16/32).  The block-table gather
-// therefore collapses to four base offsets per 32-token KV tile, and every
-// fragment access is a plain strided vec<T,4> read off those bases.
-//
-// Buffer ABI is identical to paged_attention_tiled (bind_paged_attn_buffers
-// in paged_ops.cpp), so the C++ dispatch differs only in kernel name and
-// grid.  Compiled into its own metallib with -mmacosx-version-min=26.2; the
-// guard below compiles the file to nothing on SDKs that cannot build it.
-
-#if __has_include(<MetalPerformancePrimitives/MetalPerformancePrimitives.h>) && \
-    defined(__HAVE_TENSOR__)
+// Each 16-row K/V fragment is two 8-token page-local loads. Block sizes
+// 8/16/32 therefore need four block-table lookups per 32-token KV tile.
+// This optional metallib requires macOS 26.2.
 
 #include <metal_stdlib>
 #include <metal_tensor>
@@ -37,9 +17,7 @@
 
 using namespace metal;
 
-#ifndef VLLM_NAX_BFLOAT_DEFINED
 typedef bfloat bfloat16_t;
-#endif
 
 constant bool nax_use_sinks [[function_constant(40)]];
 
@@ -183,11 +161,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   const short fm = sc.y;
   const short fn = sc.x;
 
-  // Every fragment access below moves 4 consecutive elements (a lane owns
-  // cols fn..fn+3) through an aligned vec<T,4>: all bases are multiples of 4
-  // elements and fn is 0/4/8/12.  Guarding per row-half instead of per
-  // element keeps the wide accesses intact — per-element guarded scalar
-  // loads with 64-bit address math cost 4x on this kernel.
+  // All bases and lane offsets keep vec4 fragment loads aligned. Row-half
+  // guards preserve those wide loads at partial-tile boundaries.
   using T4 = metal::vec<T, 4>;
 
   const device T *q_base = q
@@ -202,9 +177,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   }
   const long bt_row = long(seq_idx) * max_num_blocks_per_seq;
 
-  // Online-softmax state for this lane's 2 rows.  With sinks the learned
-  // logit is folded at init (denominator-only); order-invariant, so this
-  // matches the tiled kernel's exit-time fold.
+  // Sinks enter the initial denominator-only softmax state.
   float max_score[2];
   float sum_score[2] = {0.0f, 0.0f};
   if (nax_use_sinks) {
@@ -257,9 +230,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
       kv_ok[h] = fm < rows;
     }
 
-    // S = Q @ K^T.  Q is re-read from device each tile rather than pinned in
-    // registers (MLX's choice: L1-hot, and the freed registers keep
-    // occupancy).  Partial unroll lets K loads interleave with the mma chain.
+    // Q is re-read per KV tile to reduce register pressure.
     nax_frag8<float> S0 = nax_frag8<float>(0.0f);
     nax_frag8<float> S1 = nax_frag8<float>(0.0f);
 #pragma clang loop unroll_count(4)
@@ -327,7 +298,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
 
     // Online softmax, finite-sentinel form: masked logits are NAX_FINITE_MIN
     // and exp gets a zero select.  The select is what keeps rows whose
-    // sliding window has not opened yet exact — their running max is still
+    // sliding window has not opened yet exact; their running max is still
     // the sentinel, and exp2(s - max) would otherwise be exp2(0) = 1.
     float new_max[2] = {max_score[0], max_score[1]};
     nax_row_reduce<NaxMaxOp>(S0, new_max);
@@ -402,8 +373,7 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
     }
   }
 
-  // Normalize and store (valid rows only; padding rows belong to the next
-  // sequence's blocks and are written by their own threadgroup).
+  // Normalize and store valid rows only.
   threadgroup_barrier(mem_flags::mem_none);
   device T *out_base = out
       + long(q_seq_start + q_pos_start + sg * 16) * q_stride
@@ -462,5 +432,3 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
 
 instantiate_paged_attention_nax_all(half);
 instantiate_paged_attention_nax_all(bfloat16_t);
-
-#endif  // __has_include(MetalPerformancePrimitives) && __HAVE_TENSOR__
