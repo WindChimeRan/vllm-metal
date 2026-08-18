@@ -95,6 +95,51 @@ def _build_nax_source() -> str:
     return _read_metal_source(_KERNELS_V2_DIR / "pagedattention_nax.metal")
 
 
+def _try_init_nax_library(
+    mod: ModuleType,
+    *,
+    disabled: bool,
+    build_from_source: bool,
+    prebuilt_path: Path | None = None,
+) -> bool:
+    """Best-effort initialization of the optional NAX shader library.
+
+    NAX is an optimization, never a serving prerequisite.  Unsupported
+    hardware, a wheel built without the optional metallib, or a library
+    load/compile failure all leave the established tiled/per-token dispatch
+    available.  Programming errors such as a mismatched extension API still
+    propagate instead of being hidden behind the fallback.
+    """
+    if disabled:
+        logger.info("NAX prefill attention disabled by VLLM_METAL_DISABLE_NAX")
+        return False
+
+    try:
+        if not mod.nax_supported():
+            return False
+        if build_from_source:
+            mod.init_nax_library(_build_nax_source())
+        else:
+            if prebuilt_path is None or not prebuilt_path.exists():
+                return False
+            mod.init_nax_library_path(str(prebuilt_path))
+        ready = bool(mod.nax_ready())
+    except (OSError, RuntimeError) as exc:
+        logger.warning(
+            "NAX prefill attention initialization failed; using the "
+            "non-NAX fallback: %s",
+            exc,
+        )
+        return False
+
+    if not ready:
+        logger.warning(
+            "NAX prefill attention library initialized but is not ready; "
+            "using the non-NAX fallback"
+        )
+    return ready
+
+
 def metal_mla_paged_attention(
     q_nope,  # [total_q_tokens, num_heads, kv_lora_rank]
     q_pe,  # [total_q_tokens, num_heads, qk_rope_head_dim]
@@ -186,7 +231,8 @@ def get_ops() -> ModuleType:
     from vllm_metal import envs
     from vllm_metal.metal.build import build, output_path, stale_artifacts
 
-    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+    build_from_source = envs.VLLM_METAL_BUILD_FROM_SOURCE
+    if build_from_source:
         so_path = build()
     else:
         so_path = output_path()
@@ -224,17 +270,15 @@ def get_ops() -> ModuleType:
     #    precompiled .metallib files shipped in the wheel (no first-request
     #    shader compile); only compile the shaders in-process when the developer
     #    opts in via VLLM_METAL_BUILD_FROM_SOURCE (no silent fallback).
-    # NAX prefill kernels are optional at every layer: hardware-gated,
-    # env-gated, and (in prebuilt mode) present only in wheels built on a
-    # macOS >= 26.2 SDK.  Absence is never an error — the primitive's
-    # dispatch falls back to the tiled kernel.
-    init_nax = envs.VLLM_METAL_NAX_PREFILL and mod.nax_supported()
-    if envs.VLLM_METAL_BUILD_FROM_SOURCE:
+    # NAX prefill kernels are optional at every layer: hardware/OS-gated,
+    # shape-gated by the primitive, and (in prebuilt mode) present only in
+    # wheels built on a macOS >= 26.2 SDK.  Missing or unloadable NAX support
+    # is never a serving error — dispatch keeps the established fallback.
+    nax_prebuilt_path: Path | None = None
+    if build_from_source:
         mod.init_v2_library(_build_v2_paged_attention_source())
         mod.init_gdn_library(_build_gdn_source())
         mod.init_mla_library(_build_mla_paged_attention_source())
-        if init_nax:
-            mod.init_nax_library(_build_nax_source())
     else:
         from vllm_metal.metal.build import METALLIB_NAMES, metallib_path
 
@@ -247,10 +291,15 @@ def get_ops() -> ModuleType:
             )
         for name in METALLIB_NAMES:
             mod.init_library_path(name, str(metallib_path(name)))
-        nax_lib = metallib_path("paged_attention_nax_kern")
-        if init_nax and nax_lib.exists():
-            mod.init_nax_library_path(str(nax_lib))
-    if init_nax and mod.nax_ready():
+        nax_prebuilt_path = metallib_path("paged_attention_nax_kern")
+
+    nax_ready = _try_init_nax_library(
+        mod,
+        disabled=envs.VLLM_METAL_DISABLE_NAX,
+        build_from_source=build_from_source,
+        prebuilt_path=nax_prebuilt_path,
+    )
+    if nax_ready:
         logger.info("NAX prefill attention kernels loaded (M5 tensor units)")
 
     _ops_module = mod

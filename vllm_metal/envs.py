@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     VLLM_METAL_GDN_LAZY_KERNELS: bool = True
     VLLM_METAL_DECODE_PIPELINE: bool = True
     VLLM_METAL_MLA_KERNEL: bool = False
-    VLLM_METAL_NAX_PREFILL: bool = True
+    VLLM_METAL_DISABLE_NAX: bool = False
     VLLM_METAL_SPEC_VERIFY_WINDOW: bool = False
     VLLM_METAL_BUILD_FROM_SOURCE: bool = False
     VLLM_METAL_VISIBLE_DEVICES: str | None = None
@@ -75,15 +75,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # qk_rope_head_dim=64, block_size ∈ {16, 32}, fp16/bf16,
     # decode-only).
     "VLLM_METAL_MLA_KERNEL": lambda: os.getenv("VLLM_METAL_MLA_KERNEL", "0") == "1",
-    # NAX (M5 tensor-unit) prefill attention kernels (default on).  Consulted
-    # once at get_ops(): the NAX shader library is only loaded when this is
-    # set AND the hardware supports it AND (prebuilt mode) the wheel shipped
-    # the library.  Prefill batches on supported shapes (head_dim 64/128,
-    # fp16/bf16 cache) then dispatch to the tensor units inside
-    # paged_attention_primitive; everything else keeps the 8x8 tiled kernel.
-    # Set to "0" to force the tiled kernel everywhere (A/B benchmarking, or
-    # as an escape hatch).
-    "VLLM_METAL_NAX_PREFILL": lambda: os.getenv("VLLM_METAL_NAX_PREFILL", "1") == "1",
+    # Emergency kill-switch for automatic NAX (M5 tensor-unit) prefill
+    # attention.  NAX is selected automatically when the OS, hardware, shader
+    # library, dtype, and workload shape support it.  Set to "1" only to force
+    # the established non-NAX fallback after a driver or correctness issue.
+    "VLLM_METAL_DISABLE_NAX": lambda: os.getenv("VLLM_METAL_DISABLE_NAX", "0") == "1",
     # Spec-decode verification window mode (issue #465). Off by default —
     # verify windows keep the expanded per-token layout (main behavior)
     # unless this opt-in is set. Set to "1" to merge K+1 verify windows
