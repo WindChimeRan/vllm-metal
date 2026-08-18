@@ -6,11 +6,14 @@ All sources live in `kernels_v2/`. The legacy `kernels_v1/` path has been
 removed (PR #378); v2 supersedes it on every axis (online-softmax `exp2`
 trick, variable-length support, MLA, GDN, TurboQuant).
 
-**License / provenance:** project-authored portions are Apache-2.0.
-`utils.metal`, `pagedattention.metal`, and `pagedattention_nax.metal` adapt
-parts of Apple's [MLX](https://github.com/ml-explore/mlx) framework (MIT,
-© 2023-2025 Apple Inc.). `pagedattention.metal` also adapts Apache-2.0 vLLM
-code. See each file header for attribution.
+**License / provenance** (per the file headers themselves): Apache-2.0.
+Portions of `utils.metal` and `pagedattention.metal` are adapted from
+Apple's [MLX](https://github.com/ml-explore/mlx) framework (Apache-2.0,
+© 2023 Apple Inc.); `pagedattention.metal` also adapts portions of the
+[vLLM project](https://github.com/vllm-project/vllm) (Apache-2.0).
+`turboquant.metal`, `pagedattention_tiled.metal`, and `mla.metal` are
+vLLM-project Apache-2.0 sources. `pagedattention_nax.metal` adapts MLX's
+`steel_attention_nax` (MIT, © 2025 Apple Inc.).
 
 ## How the shaders are compiled
 
