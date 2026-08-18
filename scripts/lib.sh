@@ -88,6 +88,8 @@ get_version() {
 # present (no slow download), otherwise download MetalToolchain and re-check.
 ensure_metal_toolchain() {
   section "Ensuring Metal toolchain"
+  # Keep Maturin/Rust aligned with the native extension's macOS 15 floor.
+  export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
   local tmpdir metal_src metal_lib
   tmpdir=$(mktemp -d)

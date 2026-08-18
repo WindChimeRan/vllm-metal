@@ -2,7 +2,9 @@
 
 ## Requirements
 
-- macOS on Apple Silicon
+- macOS 15 (Sequoia) or later, on Apple Silicon. The prebuilt wheel's
+  native extension and Metal kernels target macOS 15, so the wheel is
+  tagged `macosx_15_0_arm64` and will not install on earlier releases.
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
 
 > **No compiler required.** The install script below fetches vLLM core and the
