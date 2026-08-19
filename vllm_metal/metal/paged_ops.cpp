@@ -173,7 +173,7 @@ void init_nax_library_path(const std::string& path) {
 static bool nax_eligible(Dtype dtype, int head_size, int block_size) {
   return nax_lib_ready_ && nax_enabled_ &&
       (dtype == float16 || dtype == bfloat16) &&
-      (head_size == 64 || head_size == 128) &&
+      (head_size == 64 || head_size == 128 || head_size == 256) &&
       (block_size == 8 || block_size == 16 || block_size == 32);
 }
 

@@ -351,8 +351,9 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
     // V is re-read per d-pair like MLX; the bases are already resolved.
 #pragma clang loop unroll(full)
     for (short id = 0; id < TD; id += 2) {
-      if (TD == 8 && id == 4) {
-        // Scheduling hint from mlx steel_attention_nax (hd=128 only).
+      if (TD >= 8 && id == TD / 2) {
+        // Scheduling hint from mlx steel_attention_nax. At TD == 8 this is the
+        // hd=128 barrier verbatim; TD == 16 (hd=256) gets the same split.
         threadgroup_barrier(mem_flags::mem_none);
       }
 #pragma clang loop unroll(full)
@@ -433,7 +434,10 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   instantiate_paged_attention_nax(type, 64, 32);                             \
   instantiate_paged_attention_nax(type, 128, 8);                             \
   instantiate_paged_attention_nax(type, 128, 16);                            \
-  instantiate_paged_attention_nax(type, 128, 32);
+  instantiate_paged_attention_nax(type, 128, 32);                            \
+  instantiate_paged_attention_nax(type, 256, 8);                             \
+  instantiate_paged_attention_nax(type, 256, 16);                            \
+  instantiate_paged_attention_nax(type, 256, 32);
 
 instantiate_paged_attention_nax_all(half);
 instantiate_paged_attention_nax_all(bfloat16_t);

@@ -9,7 +9,7 @@ silently skips itself is worse than no check. Run it on an M5 before touching
     python tools/nax_prefill_parity.py
 
 Covers every compiled specialization -- {float16, bfloat16} x head_size
-{64, 128} x block_size {8, 16, 32} -- in both masking regimes:
+{64, 128, 256} x block_size {8, 16, 32} -- in both masking regimes:
 
 ``fast``
     Softcap off, no sliding window, sinks off. Reaches the ``tile_no_mask``
@@ -22,7 +22,8 @@ Covers every compiled specialization -- {float16, bfloat16} x head_size
 
 Block size matters beyond the kernel name: at 8 the four half-row bases of a
 32-token KV tile land on four different pages, at 32 they collapse onto one.
-Head size 64 (TD=4) skips the ``TD == 8`` scheduling barrier that 128 takes.
+Head size 64 (TD=4) skips the mid-loop scheduling barrier that 128 (TD=8) and
+256 (TD=16) take; 256 also holds 128 fp32 accumulator registers per thread.
 
 Every case is checked for *engagement*, not just agreement. NAX accumulates
 through the tensor unit with ``relaxed_precision``, so a bitwise-identical
@@ -93,12 +94,12 @@ class Case:
 
 def _cases() -> list[Case]:
     """The full instantiated matrix: instantiate_paged_attention_nax_all emits
-    {half, bfloat16_t} x hs{64, 128} x bs{8, 16, 32}, and the dispatcher picks
+    {half, bfloat16_t} x hs{64, 128, 256} x bs{8, 16, 32}, and the dispatcher picks
     a separate pipeline per sinks constant."""
     return [
         Case(dtype, head_size, block_size, regime)
         for dtype in (mx.float16, mx.bfloat16)
-        for head_size in (64, 128)
+        for head_size in (64, 128, 256)
         for block_size in (8, 16, 32)
         for regime in ("fast", "masked")
     ]
