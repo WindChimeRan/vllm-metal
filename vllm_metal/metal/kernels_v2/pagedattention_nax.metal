@@ -352,8 +352,8 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
 #pragma clang loop unroll(full)
     for (short id = 0; id < TD; id += 2) {
       if (TD >= 8 && id == TD / 2) {
-        // Scheduling hint from mlx steel_attention_nax. At TD == 8 this is the
-        // hd=128 barrier verbatim; TD == 16 (hd=256) gets the same split.
+        // At TD=8 this is the MLX hd=128 scheduling barrier verbatim. The
+        // vLLM hd=256/512 extensions use the same midpoint split at TD=16/32.
         threadgroup_barrier(mem_flags::mem_none);
       }
 #pragma clang loop unroll(full)
