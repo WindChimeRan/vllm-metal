@@ -19,8 +19,8 @@ Pending state handoff:
     layer.
   - A recurrent update may consume that compact state directly only when its
     caller permits compact input and the active slot order exactly matches.
-  - Slot-order mismatches, fallback execution, new prefill work, or slot release
-    must scatter the pending update into the stable state pool first.
+  - Slot-order mismatches, fallback execution, or slot release must scatter the
+    pending update into the stable state pool first.
 """
 
 from __future__ import annotations
@@ -373,7 +373,7 @@ class GDNPagedStateCache:
     def set_pending_recurrent_state(
         self, layer_idx: int, slot_ids: list[int], state_updates: mx.array
     ) -> None:
-        """Store compact recurrent updates to be consumed by the next decode."""
+        """Store compact recurrent updates for the next eligible state consumer."""
         self.require_allocated_slots(slot_ids)
         if self.has_pending_recurrent_state(layer_idx):
             self.apply_pending_recurrent_state(layer_idx)

@@ -168,7 +168,10 @@ class TestGDNPagedStateCache:
             np.array(pending_state), np.full((2, 1, 4, 32), 9)
         )
 
-    def test_recurrent_decode_view_drains_mismatched_pending_state(self) -> None:
+    @pytest.mark.parametrize("slot_ids", [[0, 2], [1, 3]])
+    def test_recurrent_state_view_drains_mismatched_pending_state(
+        self, slot_ids: list[int]
+    ) -> None:
         # Arrange
         cache = _make_state_cache(max_seqs=4)
         initial_state = mx.arange(4 * 1 * 4 * 32, dtype=mx.float32).reshape(4, 1, 4, 32)
@@ -178,7 +181,7 @@ class TestGDNPagedStateCache:
         )
 
         # Act
-        view = cache.recurrent_state_for_update(0, [0, 2], allow_compact=True)
+        view = cache.recurrent_state_for_update(0, slot_ids, allow_compact=True)
 
         # Assert
         assert not view.uses_compact_state
@@ -187,7 +190,29 @@ class TestGDNPagedStateCache:
         expected_state = np.array(initial_state)
         expected_state[[3, 1]] = 7
         np.testing.assert_array_equal(np.array(view.state), expected_state)
-        np.testing.assert_array_equal(np.array(view.state_slot_ids), [0, 2])
+        np.testing.assert_array_equal(np.array(view.state_slot_ids), slot_ids)
+
+    def test_recurrent_state_view_drains_matching_pending_when_disallowed(
+        self,
+    ) -> None:
+        # Arrange
+        cache = _make_state_cache(max_seqs=4)
+        slot_ids = [3, 1]
+        cache.set_pending_recurrent_state(
+            0, slot_ids, mx.full((2, 1, 4, 32), 7, dtype=mx.float32)
+        )
+
+        # Act
+        view = cache.recurrent_state_for_update(0, slot_ids, allow_compact=False)
+
+        # Assert
+        assert not view.uses_compact_state
+        assert not cache.has_pending_recurrent_state(0)
+        mx.eval(view.state, view.state_slot_ids)
+        expected_state = np.zeros((4, 1, 4, 32), dtype=np.float32)
+        expected_state[slot_ids] = 7
+        np.testing.assert_array_equal(np.array(view.state), expected_state)
+        np.testing.assert_array_equal(np.array(view.state_slot_ids), slot_ids)
 
     def test_state_view_owns_compact_slot_mapping(self) -> None:
         # Arrange
@@ -1161,6 +1186,58 @@ class TestLazyRecurrentPrefill:
         expected_state[slot_ids] = 7
         np.testing.assert_array_equal(
             np.array(cache.recurrent_states[0]), expected_state
+        )
+
+    def test_deferred_prefill_state_is_consumed_by_next_prefill(self) -> None:
+        # Arrange
+        state_updates = mx.full((2, 2, 3, 32), 9, dtype=mx.float32)
+        prefill_kernel = _RecordingStateKernel(
+            mx.ones((5, 2, 3), dtype=mx.float32),
+            state_updates,
+            state_input_index=5,
+            slot_mapping_index=7,
+        )
+        cache = _make_state_cache(
+            max_seqs=4,
+            num_v_heads=2,
+            value_head_dim=3,
+            key_head_dim=32,
+        )
+        initial_state = mx.arange(4 * 2 * 3 * 32, dtype=mx.float32).reshape(4, 2, 3, 32)
+        cache.recurrent_states[0] = mx.array(initial_state)
+        slot_ids = [3, 1]
+        request = _recurrent_prefill_request(
+            q=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            k=mx.zeros((1, 5, 1, 32), dtype=mx.float32),
+            v=mx.zeros((1, 5, 2, 3), dtype=mx.float32),
+            g=mx.zeros((1, 5, 2), dtype=mx.float32),
+            beta=mx.zeros((1, 5, 2), dtype=mx.float32),
+            cache=cache,
+            slot_ids=slot_ids,
+            cu_seqlens=[0, 2, 5],
+            defer_state_scatter=True,
+        )
+        kernels = GDNLazyKernels(
+            enabled=True,
+            conv_kernel=_RaisingKernel(),
+            recurrent_decode_kernel=_RaisingKernel(),
+            recurrent_prefill_kernel=prefill_kernel,
+        )
+
+        # Act
+        assert kernels.try_recurrent_prefill(request) is not None
+        assert kernels.try_recurrent_prefill(request) is not None
+
+        # Assert
+        assert prefill_kernel.state_input is state_updates
+        assert prefill_kernel.slot_mapping is not None
+        assert cache.pending_recurrent_state(0, slot_ids) is state_updates
+        mx.eval(cache.recurrent_states[0], prefill_kernel.slot_mapping)
+        np.testing.assert_array_equal(
+            np.array(prefill_kernel.slot_mapping), np.array([0, 1])
+        )
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]), np.array(initial_state)
         )
 
     def test_materialized_deferred_prefill_evals_compact_state(

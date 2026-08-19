@@ -463,7 +463,9 @@ class GDNLazyKernels:
 
         state_cache = request.state_cache
         state_view = state_cache.recurrent_state_for_update(
-            request.cache_idx, request.slot_ids, allow_compact=False
+            request.cache_idx,
+            request.slot_ids,
+            allow_compact=request.defer_state_scatter,
         )
         state_in = state_view.state
         slot_ids_arr = state_view.state_slot_ids
