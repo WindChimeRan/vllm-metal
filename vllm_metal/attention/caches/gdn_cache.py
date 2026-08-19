@@ -346,13 +346,6 @@ class GDNPagedStateCache:
         """Return whether a layer has deferred conv updates."""
         return self.pending_conv_states[layer_idx] is not None
 
-    def updated_conv_state_array(self, layer_idx: int) -> mx.array:
-        """Return the authoritative conv state array for submission."""
-        pending_state = self.pending_conv_states[layer_idx]
-        return (
-            pending_state if pending_state is not None else self.conv_states[layer_idx]
-        )
-
     def conv_state_for_decode(
         self, layer_idx: int, slot_ids: list[int]
     ) -> GDNStateView:
@@ -418,23 +411,19 @@ class GDNPagedStateCache:
         state_updates: mx.array,
         *,
         defer: bool,
-        make_contiguous: bool = False,
-    ) -> mx.array:
-        """Publish or defer a recurrent update and return authoritative state."""
+    ) -> None:
+        """Publish or defer a recurrent state update."""
         if defer:
             if state_view.uses_compact_state:
                 self.clear_pending_recurrent_state(layer_idx)
             self.set_pending_recurrent_state(layer_idx, slot_ids, state_updates)
-            return state_updates
+            return
 
         if state_view.uses_compact_state:
             raise RuntimeError("cannot scatter through a compact recurrent state view")
         recurrent_state = state_view.state
         recurrent_state[state_view.state_slot_ids] = state_updates
-        if make_contiguous:
-            recurrent_state = mx.contiguous(recurrent_state)
         self.store_recurrent_state(layer_idx, recurrent_state)
-        return recurrent_state
 
     def _state_view(
         self,

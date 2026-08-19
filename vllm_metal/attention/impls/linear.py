@@ -57,7 +57,7 @@ class _GDNLazyPolicy:
 
     - combined QKVZ projection: Qwen3-Next style, cheapest handoff path
     - separate projection with expanded value state: Qwen3.6 style, use the
-      conservative fp32/materialized handoff policy
+      conservative fp32/stable-pool handoff policy
     - separate projection with compact value state: Qwen3.5 style, avoid the
       extra conv-prefill launch but keep lazy recurrent prefill
     """
@@ -79,9 +79,6 @@ class _GDNLazyPolicy:
         if self.uses_conservative_recurrent_prefill_policy():
             return _EXPANDED_RECURRENT_DECODE_THREADGROUP_DV
         return _DEFAULT_RECURRENT_DECODE_THREADGROUP_DV
-
-    def should_materialize_prefill_state(self, num_requests: int) -> bool:
-        return num_requests > 1 and not self.combined_qkvz_projection
 
     def recurrent_prefill_compute_dtype(self) -> mx.Dtype | None:
         if self.uses_conservative_recurrent_prefill_policy():
@@ -228,8 +225,6 @@ class GDNPagedAttentionWrapper(nn.Module):
                 mixed_qkv, inner, state_cache, cache_idx, slot_ids, state.cu_seqlens
             )
             if conv_packed is not None:
-                if self._should_materialize_prefill_state(state):
-                    mx.eval(state_cache.updated_conv_state_array(cache_idx))
                 return conv_packed
 
         state_cache.apply_pending_conv_state(cache_idx)
@@ -264,10 +259,6 @@ class GDNPagedAttentionWrapper(nn.Module):
             state_cache.set_pending_conv_state(
                 cache_idx, slot_ids, mx.concatenate(conv_updates, axis=0)
             )
-            if self._should_materialize_prefill_state(state):
-                mx.eval(state_cache.updated_conv_state_array(cache_idx))
-        elif self._should_materialize_prefill_state(state):
-            mx.eval(state_cache.conv_states[cache_idx])
 
         return mx.concatenate(conv_outputs, axis=1)
 
@@ -341,7 +332,6 @@ class GDNPagedAttentionWrapper(nn.Module):
                 slot_ids=state.slot_ids,
                 output_dtype=state.x.dtype,
                 cu_seqlens=state.cu_seqlens,
-                materialize_outputs=self._should_materialize_prefill_state(state),
                 compute_dtype=self._recurrent_prefill_compute_dtype(),
                 defer_state_scatter=self._should_defer_recurrent_prefill_state(state),
             )
@@ -390,15 +380,6 @@ class GDNPagedAttentionWrapper(nn.Module):
         # Compact separate-projection and combined-QKVZ variants stay on the
         # original launch shape, which benchmarks better for those layouts.
         return self._gdn_lazy_policy.recurrent_decode_threadgroup_dv()
-
-    def _should_materialize_prefill_state(self, state: _GDNForwardState) -> bool:
-        # Separate-projection GDN variants keep more independent state-producing
-        # arrays alive across the lazy prefill graph.  Materializing conv and
-        # recurrent state at each layer bounds the prefill→decode handoff
-        # without penalizing Qwen3-Next's combined QKVZ projection path.
-        return self._gdn_lazy_policy.should_materialize_prefill_state(
-            state.num_requests
-        )
 
     def _recurrent_prefill_compute_dtype(self) -> mx.Dtype | None:
         return self._gdn_lazy_policy.recurrent_prefill_compute_dtype()
