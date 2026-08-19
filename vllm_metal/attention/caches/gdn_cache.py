@@ -17,8 +17,8 @@ on request admission and never exceeds that cap.
 Pending state handoff:
   - At most one compact pending conv or recurrent update may exist per linear
     layer.
-  - Lazy decode may consume that compact update directly only when the active
-    slot order exactly matches the pending slot order.
+  - A recurrent update may consume that compact state directly only when its
+    caller permits compact input and the active slot order exactly matches.
   - Slot-order mismatches, fallback execution, new prefill work, or slot release
     must scatter the pending update into the stable state pool first.
 """
@@ -32,8 +32,8 @@ import mlx.core as mx
 
 
 @dataclass(frozen=True)
-class GDNDecodeStateView:
-    """State array and slot mappings for one lazy decode kernel launch."""
+class GDNStateView:
+    """State array and slot mappings for one lazy stateful kernel launch."""
 
     state: mx.array
     state_slot_ids: mx.array
@@ -355,20 +355,18 @@ class GDNPagedStateCache:
 
     def conv_state_for_decode(
         self, layer_idx: int, slot_ids: list[int]
-    ) -> GDNDecodeStateView:
+    ) -> GDNStateView:
         """Return authoritative conv state and slot ids for a decode kernel."""
         self.require_allocated_slots(slot_ids)
         if not self.has_pending_conv_state(layer_idx):
-            return self._decode_state_view(
+            return self._state_view(
                 self.conv_states[layer_idx], slot_ids, uses_compact_state=False
             )
         pending_state = self.pending_conv_state(layer_idx, slot_ids)
         if pending_state is not None:
-            return self._decode_state_view(
-                pending_state, slot_ids, uses_compact_state=True
-            )
+            return self._state_view(pending_state, slot_ids, uses_compact_state=True)
         self.apply_pending_conv_state(layer_idx)
-        return self._decode_state_view(
+        return self._state_view(
             self.conv_states[layer_idx], slot_ids, uses_compact_state=False
         )
 
@@ -391,32 +389,60 @@ class GDNPagedStateCache:
             return None
         return self.pending_recurrent_states[layer_idx]
 
-    def recurrent_state_for_decode(
-        self, layer_idx: int, slot_ids: list[int]
-    ) -> GDNDecodeStateView:
-        """Return authoritative recurrent state and slot ids for a decode kernel."""
+    def recurrent_state_for_update(
+        self,
+        layer_idx: int,
+        slot_ids: list[int],
+        *,
+        allow_compact: bool,
+    ) -> GDNStateView:
+        """Return authoritative recurrent state for one lazy kernel update."""
         self.require_allocated_slots(slot_ids)
         if not self.has_pending_recurrent_state(layer_idx):
-            return self._decode_state_view(
+            return self._state_view(
                 self.recurrent_states[layer_idx], slot_ids, uses_compact_state=False
             )
         pending_state = self.pending_recurrent_state(layer_idx, slot_ids)
-        if pending_state is not None:
-            return self._decode_state_view(
-                pending_state, slot_ids, uses_compact_state=True
-            )
+        if allow_compact and pending_state is not None:
+            return self._state_view(pending_state, slot_ids, uses_compact_state=True)
         self.apply_pending_recurrent_state(layer_idx)
-        return self._decode_state_view(
+        return self._state_view(
             self.recurrent_states[layer_idx], slot_ids, uses_compact_state=False
         )
 
-    def _decode_state_view(
+    def finish_recurrent_state_update(
+        self,
+        layer_idx: int,
+        slot_ids: list[int],
+        state_view: GDNStateView,
+        state_updates: mx.array,
+        *,
+        defer: bool,
+        make_contiguous: bool = False,
+    ) -> mx.array:
+        """Publish or defer a recurrent update and return authoritative state."""
+        if defer:
+            if state_view.uses_compact_state:
+                self.clear_pending_recurrent_state(layer_idx)
+            self.set_pending_recurrent_state(layer_idx, slot_ids, state_updates)
+            return state_updates
+
+        if state_view.uses_compact_state:
+            raise RuntimeError("cannot scatter through a compact recurrent state view")
+        recurrent_state = state_view.state
+        recurrent_state[state_view.state_slot_ids] = state_updates
+        if make_contiguous:
+            recurrent_state = mx.contiguous(recurrent_state)
+        self.store_recurrent_state(layer_idx, recurrent_state)
+        return recurrent_state
+
+    def _state_view(
         self,
         state: mx.array,
         slot_ids: list[int],
         *,
         uses_compact_state: bool,
-    ) -> GDNDecodeStateView:
+    ) -> GDNStateView:
         cache_slot_ids = mx.array(slot_ids, dtype=mx.int32)
         compact_order = list(range(len(slot_ids)))
         state_slot_ids = (
@@ -424,7 +450,7 @@ class GDNPagedStateCache:
             if uses_compact_state and slot_ids != compact_order
             else cache_slot_ids
         )
-        return GDNDecodeStateView(
+        return GDNStateView(
             state=state,
             state_slot_ids=state_slot_ids,
             cache_slot_ids=cache_slot_ids,

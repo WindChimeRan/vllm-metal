@@ -178,7 +178,7 @@ class TestGDNPagedStateCache:
         )
 
         # Act
-        view = cache.recurrent_state_for_decode(0, [0, 2])
+        view = cache.recurrent_state_for_update(0, [0, 2], allow_compact=True)
 
         # Assert
         assert not view.uses_compact_state
@@ -189,7 +189,7 @@ class TestGDNPagedStateCache:
         np.testing.assert_array_equal(np.array(view.state), expected_state)
         np.testing.assert_array_equal(np.array(view.state_slot_ids), [0, 2])
 
-    def test_decode_state_view_owns_compact_slot_mapping(self) -> None:
+    def test_state_view_owns_compact_slot_mapping(self) -> None:
         # Arrange
         cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
         pending = mx.full((2, 2, 4), 9, dtype=mx.float32)

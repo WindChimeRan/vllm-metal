@@ -378,8 +378,8 @@ class GDNLazyKernels:
             return None
 
         state_cache = request.state_cache
-        state_view = state_cache.recurrent_state_for_decode(
-            request.cache_idx, request.slot_ids
+        state_view = state_cache.recurrent_state_for_update(
+            request.cache_idx, request.slot_ids, allow_compact=True
         )
         state_in = state_view.state
         state_slot_ids_arr = state_view.state_slot_ids
@@ -415,14 +415,17 @@ class GDNLazyKernels:
         # ``num_requests`` slabs per step; without this each step also copies
         # the update into the pool, doubling recurrent state traffic.
         #
-        # ``recurrent_state_for_decode`` above already drained any pending
+        # ``recurrent_state_for_update`` above already drained any pending
         # update whose slot order did not match, so the only pending state
         # that can still be live here is this layer's own previous step —
         # which ``state_updates`` supersedes.  Clear it rather than letting
         # ``set_pending_recurrent_state`` scatter that stale slab first.
-        state_cache.clear_pending_recurrent_state(request.cache_idx)
-        state_cache.set_pending_recurrent_state(
-            request.cache_idx, request.slot_ids, state_updates
+        state_cache.finish_recurrent_state_update(
+            request.cache_idx,
+            request.slot_ids,
+            state_view,
+            state_updates,
+            defer=True,
         )
         return y_out
 
@@ -459,10 +462,11 @@ class GDNLazyKernels:
             return None
 
         state_cache = request.state_cache
-        if state_cache.has_pending_recurrent_state(request.cache_idx):
-            state_cache.apply_pending_recurrent_state(request.cache_idx)
-        state_in = state_cache.recurrent_states[request.cache_idx]
-        slot_ids_arr = mx.array(request.slot_ids, dtype=mx.int32)
+        state_view = state_cache.recurrent_state_for_update(
+            request.cache_idx, request.slot_ids, allow_compact=False
+        )
+        state_in = state_view.state
+        slot_ids_arr = state_view.state_slot_ids
         cu_seqlens_arr = mx.array(request.cu_seqlens, dtype=mx.int32)
         kernel_dtype = request.compute_dtype or request.output_dtype
         state_dtype = state_in.dtype
@@ -498,17 +502,14 @@ class GDNLazyKernels:
             output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
             output_dtypes=[kernel_dtype, state_dtype],
         )
-        if request.defer_state_scatter:
-            request.state_cache.set_pending_recurrent_state(
-                request.cache_idx, request.slot_ids, state_updates
-            )
-            state_to_materialize = state_updates
-        else:
-            state_in[slot_ids_arr] = state_updates
-            if request.materialize_outputs:
-                state_in = mx.contiguous(state_in)
-            request.state_cache.store_recurrent_state(request.cache_idx, state_in)
-            state_to_materialize = state_in
+        state_to_materialize = state_cache.finish_recurrent_state_update(
+            request.cache_idx,
+            request.slot_ids,
+            state_view,
+            state_updates,
+            defer=request.defer_state_scatter,
+            make_contiguous=request.materialize_outputs,
+        )
         y_out = _astype_if_needed(y_out, request.output_dtype)
         if request.materialize_outputs:
             mx.eval(y_out, state_to_materialize)
