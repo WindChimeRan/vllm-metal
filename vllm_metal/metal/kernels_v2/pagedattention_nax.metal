@@ -437,7 +437,13 @@ template <typename T, int HEAD_SIZE, int BLOCK_SIZE>
   instantiate_paged_attention_nax(type, 128, 32);                            \
   instantiate_paged_attention_nax(type, 256, 8);                             \
   instantiate_paged_attention_nax(type, 256, 16);                            \
-  instantiate_paged_attention_nax(type, 256, 32);
+  instantiate_paged_attention_nax(type, 256, 32);                            \
+  instantiate_paged_attention_nax(type, 96, 8);                              \
+  instantiate_paged_attention_nax(type, 96, 16);                             \
+  instantiate_paged_attention_nax(type, 96, 32);                             \
+  instantiate_paged_attention_nax(type, 512, 8);                             \
+  instantiate_paged_attention_nax(type, 512, 16);                            \
+  instantiate_paged_attention_nax(type, 512, 32);
 
 instantiate_paged_attention_nax_all(half);
 instantiate_paged_attention_nax_all(bfloat16_t);

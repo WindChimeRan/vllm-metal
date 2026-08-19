@@ -99,7 +99,7 @@ def _cases() -> list[Case]:
     return [
         Case(dtype, head_size, block_size, regime)
         for dtype in (mx.float16, mx.bfloat16)
-        for head_size in (64, 128, 256)
+        for head_size in (64, 96, 128, 256, 512)
         for block_size in (8, 16, 32)
         for regime in ("fast", "masked")
     ]
