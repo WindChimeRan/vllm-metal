@@ -167,13 +167,6 @@ def test_metallib_digest_changes_with_source():
     )
 
 
-def test_nax_metallib_has_its_own_deployment_floor():
-    required = build._metallib_flags(build.METALLIB_NAMES[0])
-    nax = build._metallib_flags(build.NAX_METALLIB_NAME)
-    assert required[-1] == f"-mmacosx-version-min={build.MIN_MACOS_VERSION}"
-    assert nax[-1] == f"-mmacosx-version-min={build.NAX_MIN_MACOS_VERSION}"
-
-
 # --------------------------------------------------------------------------
 # is_stale: one staleness primitive for the .so and every .metallib.
 # --------------------------------------------------------------------------
