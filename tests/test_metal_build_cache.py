@@ -174,6 +174,15 @@ def test_nax_metallib_has_its_own_deployment_floor():
     assert nax[-1] == f"-mmacosx-version-min={build.NAX_MIN_MACOS_VERSION}"
 
 
+def test_official_build_requires_nax_sdk(monkeypatch):
+    monkeypatch.setattr(build, "_sdk_supports_nax", lambda: False)
+    with pytest.raises(
+        RuntimeError,
+        match=r"Official wheel builds require macOS SDK >= 26\.2",
+    ):
+        build.require_nax_sdk()
+
+
 # --------------------------------------------------------------------------
 # is_stale: one staleness primitive for the .so and every .metallib.
 # --------------------------------------------------------------------------

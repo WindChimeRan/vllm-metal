@@ -109,6 +109,15 @@ def _sdk_supports_nax() -> bool:
         return False
 
 
+def require_nax_sdk() -> None:
+    """Fail unless the selected SDK can build the official NAX artifact."""
+    if not _sdk_supports_nax():
+        raise RuntimeError(
+            f"Official wheel builds require macOS SDK >= {NAX_MIN_MACOS_VERSION} "
+            f"to compile {NAX_METALLIB_NAME}."
+        )
+
+
 def _metallib_source(name: str) -> str:
     """Assemble the concatenated Metal source for one shader library. Source
     builders are imported at call time (function-level) to avoid import-order

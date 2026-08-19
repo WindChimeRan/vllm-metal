@@ -34,7 +34,6 @@ def test_disable_nax_env_is_a_negative_override(monkeypatch) -> None:
     [
         (True, True, True, False),
         (False, False, True, False),
-        (False, True, False, False),
         (False, True, True, True),
     ],
 )
@@ -59,6 +58,20 @@ def test_prebuilt_nax_policy(
     assert loaded is expected
     assert ops.nax_supported.called is (not disabled)
     assert ops.init_nax_library_path.called is expected
+
+
+def test_missing_prebuilt_nax_warns_and_keeps_fallback(tmp_path: Path, caplog) -> None:
+    ops = _ops(supported=True)
+    missing = tmp_path / "paged_attention_nax_kern.metallib"
+
+    assert not _try_init_nax_library(
+        ops,  # type: ignore[arg-type]
+        disabled=False,
+        build_from_source=False,
+        prebuilt_path=missing,
+    )
+    assert f"prebuilt library is missing at {missing}" in caplog.text
+    assert "using the non-NAX fallback" in caplog.text
 
 
 @pytest.mark.parametrize("build_from_source", [False, True])

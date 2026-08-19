@@ -116,14 +116,19 @@ ensure_metal_toolchain() {
   rm -rf "${tmpdir}"
 }
 
-# Build the in-package native artifacts (the _paged_ops*.so and the three
-# precompiled .metallib shader libraries) into vllm_metal/metal/ so that
-# `uv build` can bundle them into the wheel via the maturin `include` directive.
+# Build the in-package native artifacts (the _paged_ops*.so and the required
+# precompiled .metallib shader libraries, including NAX) into vllm_metal/metal/
+# so `uv build` can bundle them via the maturin `include` directive.
 #
 # `python` here is the venv interpreter activated by setup_dev_env, so mlx and
 # nanobind are importable.
 build_native_artifacts() {
   section "Building native Metal artifacts"
+  # Official wheels require NAX, so reject an older SDK before compiling.
+  if ! python -c \
+    "from vllm_metal.metal.build import require_nax_sdk; require_nax_sdk()"; then
+    return 1
+  fi
   python -m vllm_metal.metal.build
 }
 

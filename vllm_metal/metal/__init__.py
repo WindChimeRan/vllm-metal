@@ -113,6 +113,12 @@ def _try_init_nax_library(
             mod.init_nax_library(_build_nax_source())
         else:
             if prebuilt_path is None or not prebuilt_path.exists():
+                logger.warning(
+                    "NAX prefill attention is supported on this machine, but "
+                    "the prebuilt library is missing at %s; using the non-NAX "
+                    "fallback",
+                    prebuilt_path or "<unknown path>",
+                )
                 return False
             mod.init_nax_library_path(str(prebuilt_path))
         return True
