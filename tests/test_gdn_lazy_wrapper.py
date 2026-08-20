@@ -443,7 +443,6 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         assert result is lazy_out
         assert fake_lazy.prefill_called
         assert fake_lazy.prefill_request is not None
-        assert fake_lazy.prefill_request.materialize_outputs
         assert fake_lazy.prefill_request.compute_dtype is None
         assert fake_lazy.prefill_request.defer_state_scatter
 
@@ -510,7 +509,6 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         assert result is lazy_out
         assert fake_lazy.prefill_called
         assert fake_lazy.prefill_request is not None
-        assert fake_lazy.prefill_request.materialize_outputs
         assert fake_lazy.prefill_request.compute_dtype == mx.float32
         assert not fake_lazy.prefill_request.defer_state_scatter
 
@@ -618,12 +616,11 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         # Assert
         assert result is lazy_out
         assert fake_lazy.prefill_request is not None
-        assert not fake_lazy.prefill_request.materialize_outputs
         assert fake_lazy.prefill_request.compute_dtype is None
         assert not fake_lazy.prefill_request.defer_state_scatter
         assert fake_lazy.prefill_request.slot_ids == [2]
 
-    def test_multi_request_prefill_separate_projection_materializes_compact_conv_state(
+    def test_multi_request_prefill_separate_projection_keeps_conv_state_lazy(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Arrange
@@ -659,9 +656,7 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         # Assert
         pending_state = cache.pending_conv_state(0, [0, 1])
         assert pending_state is not None
-        assert len(eval_args) == 1
-        assert len(eval_args[0]) == 1
-        assert eval_args[0][0] is pending_state
+        assert not eval_args
 
     def test_eager_conv_prefill_fallback_defers_compact_state(self) -> None:
         # Arrange
@@ -901,7 +896,6 @@ class TestGDNPagedAttentionWrapperLazyKernels:
         assert result is lazy_out
         assert fake_lazy.prefill_called
         assert fake_lazy.prefill_request is not None
-        assert not fake_lazy.prefill_request.materialize_outputs
         assert fake_lazy.prefill_request.compute_dtype is None
         assert fake_lazy.prefill_request.defer_state_scatter
 

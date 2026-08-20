@@ -287,7 +287,6 @@ def _recurrent_prefill_request(
     output_dtype: mx.Dtype = mx.float32,
     compute_dtype: mx.Dtype | None = None,
     defer_state_scatter: bool = False,
-    materialize_outputs: bool = False,
 ) -> GDNRecurrentPrefillRequest:
     return GDNRecurrentPrefillRequest(
         q=q,
@@ -302,7 +301,6 @@ def _recurrent_prefill_request(
         cu_seqlens=cu_seqlens,
         compute_dtype=compute_dtype,
         defer_state_scatter=defer_state_scatter,
-        materialize_outputs=materialize_outputs,
     )
 
 
@@ -1163,7 +1161,7 @@ class TestLazyRecurrentPrefill:
             np.array(cache.recurrent_states[0]), expected_state
         )
 
-    def test_materialized_deferred_prefill_evals_compact_state(
+    def test_deferred_prefill_does_not_materialize_outputs(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Arrange
@@ -1193,7 +1191,6 @@ class TestLazyRecurrentPrefill:
             slot_ids=slot_ids,
             cu_seqlens=[0, 2, 5],
             defer_state_scatter=True,
-            materialize_outputs=True,
         )
 
         # Act
@@ -1206,15 +1203,13 @@ class TestLazyRecurrentPrefill:
 
         # Assert
         assert result is not None
-        assert len(eval_args) == 1
-        assert len(eval_args[0]) == 2
-        assert eval_args[0][1].shape == (2, 2, 3, 32)
-        assert cache.pending_recurrent_state(0, slot_ids) is eval_args[0][1]
+        assert not eval_args
+        assert cache.pending_recurrent_state(0, slot_ids) is not None
         np.testing.assert_array_equal(
             np.array(cache.recurrent_states[0]), np.array(initial_state)
         )
 
-    def test_materialized_scattered_prefill_contiguates_state_pool(
+    def test_scattered_prefill_does_not_force_materialization(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Arrange
@@ -1249,7 +1244,6 @@ class TestLazyRecurrentPrefill:
             slot_ids=slot_ids,
             cu_seqlens=[0, 2, 5],
             defer_state_scatter=False,
-            materialize_outputs=True,
         )
 
         # Act
@@ -1262,10 +1256,8 @@ class TestLazyRecurrentPrefill:
 
         # Assert
         assert result is not None
-        assert len(contiguous_args) == 1
-        assert contiguous_args[0].shape == (4, 2, 3, 32)
-        assert len(eval_args) == 1
-        assert eval_args[0][1] is cache.recurrent_states[0]
+        assert not contiguous_args
+        assert not eval_args
         assert cache.pending_recurrent_state(0, slot_ids) is None
 
     @pytest.mark.parametrize(

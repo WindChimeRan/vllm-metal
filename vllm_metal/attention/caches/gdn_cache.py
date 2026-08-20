@@ -346,13 +346,6 @@ class GDNPagedStateCache:
         """Return whether a layer has deferred conv updates."""
         return self.pending_conv_states[layer_idx] is not None
 
-    def updated_conv_state_array(self, layer_idx: int) -> mx.array:
-        """Return the authoritative conv state array for submission."""
-        pending_state = self.pending_conv_states[layer_idx]
-        return (
-            pending_state if pending_state is not None else self.conv_states[layer_idx]
-        )
-
     def conv_state_for_decode(
         self, layer_idx: int, slot_ids: list[int]
     ) -> GDNDecodeStateView:

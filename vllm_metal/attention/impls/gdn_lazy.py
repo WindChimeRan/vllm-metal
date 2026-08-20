@@ -75,7 +75,6 @@ class GDNRecurrentPrefillRequest(GDNRecurrentRequest):
     """Inputs for one lazy GDN recurrent prefill-containing attempt."""
 
     cu_seqlens: list[int]
-    materialize_outputs: bool = False
     compute_dtype: mx.Dtype | None = None
     defer_state_scatter: bool = False
 
@@ -502,14 +501,8 @@ class GDNLazyKernels:
             request.state_cache.set_pending_recurrent_state(
                 request.cache_idx, request.slot_ids, state_updates
             )
-            state_to_materialize = state_updates
         else:
             state_in[slot_ids_arr] = state_updates
-            if request.materialize_outputs:
-                state_in = mx.contiguous(state_in)
             request.state_cache.store_recurrent_state(request.cache_idx, state_in)
-            state_to_materialize = state_in
         y_out = _astype_if_needed(y_out, request.output_dtype)
-        if request.materialize_outputs:
-            mx.eval(y_out, state_to_materialize)
         return y_out
