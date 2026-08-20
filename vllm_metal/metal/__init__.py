@@ -76,6 +76,7 @@ def _build_gdn_source() -> str:
     parts = [
         _read_metal_source(_KERNELS_V2_DIR / "utils.metal"),
         _read_metal_source(_KERNELS_V2_DIR / "gdn_linear_attention.metal"),
+        _read_metal_source(_KERNELS_V2_DIR / "gdn_state_scatter.metal"),
     ]
     return "\n".join(parts)
 

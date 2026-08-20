@@ -678,6 +678,16 @@ class ModelCachePolicy:
                     f"the memory plan budgeted {budgeted}; refusing to "
                     "exceed the paged memory budget"
                 )
+            # Record the derived layout next to the budget it was checked
+            # against.
+            logger.info(
+                "Align-mode GDN state: %d linear layers over %d physical "
+                "state pools (budgeted %d), %d mamba cache groups",
+                len(cache_idx_by_name),
+                pools_used,
+                budgeted,
+                len(mamba_group_ids),
+            )
         runtime.adopt_scheduler_group(
             group_index,
             block_size,

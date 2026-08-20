@@ -204,6 +204,48 @@ class TestGDNPagedStateCache:
         np.testing.assert_array_equal(np.array(view.cache_slot_ids), [3, 1])
         np.testing.assert_array_equal(np.array(view.state_slot_ids), [0, 1])
 
+    def test_pending_states_batch_matches_per_layer_drain(self) -> None:
+        # The batched drain must land exactly what draining each layer in turn
+        # would have landed.
+        def build() -> GDNPagedStateCache:
+            cache = _make_state_cache(num_layers=2, max_seqs=4)
+            cache.set_layer_layout([0, 1], [0, 0])
+            cache.set_pending_conv_state(
+                0, [1], mx.full((1, 2, 4), 4, dtype=mx.float32)
+            )
+            cache.set_pending_conv_state(
+                1, [3], mx.full((1, 2, 4), 6, dtype=mx.float32)
+            )
+            return cache
+
+        batched = build()
+        batched.apply_pending_conv_states()
+
+        per_layer = build()
+        per_layer.apply_pending_conv_state(0)
+        per_layer.apply_pending_conv_state(1)
+
+        np.testing.assert_array_equal(
+            np.array(batched.conv_states[0]), np.array(per_layer.conv_states[0])
+        )
+
+    def test_identity_layout_still_drains_every_layer(self) -> None:
+        # mamba_cache_mode="none" never calls set_layer_layout: every layer is
+        # its own pool and must still be drained.
+        cache = _make_state_cache(num_layers=3, max_seqs=4)
+        for layer_idx in range(3):
+            cache.set_pending_recurrent_state(
+                layer_idx, [layer_idx], mx.full((1, 1, 4, 32), 2, dtype=mx.float32)
+            )
+
+        cache.apply_pending_recurrent_states()
+
+        for layer_idx in range(3):
+            assert not cache.has_pending_recurrent_state(layer_idx)
+            np.testing.assert_array_equal(
+                np.array(cache.recurrent_states[layer_idx][layer_idx]), 2.0
+            )
+
 
 def _require_metal() -> None:
     try:
@@ -229,6 +271,7 @@ def _get_native_ops_or_skip() -> Any:
 
 def _make_state_cache(
     *,
+    num_layers: int = 1,
     max_seqs: int = 3,
     conv_kernel_dim: int = 3,
     conv_dim: int = 4,
@@ -237,7 +280,7 @@ def _make_state_cache(
     key_head_dim: int = 32,
 ) -> GDNPagedStateCache:
     return GDNPagedStateCache(
-        num_layers=1,
+        num_layers=num_layers,
         max_seqs=max_seqs,
         conv_kernel_dim=conv_kernel_dim,
         conv_dim=conv_dim,
@@ -1730,3 +1773,154 @@ class TestGDNLazySharedOwner:
             "gdn_recurrent_decode_v2",
             "gdn_recurrent_prefill_v2",
         ]
+
+
+class TestNativeGDNStateScatter:
+    """The in-place row scatter that replaces MLX's whole-pool copy."""
+
+    @staticmethod
+    def _scatter_fn() -> Any:
+        ops = _get_native_ops_or_skip()
+        fn = getattr(ops, "gdn_state_scatter", None)
+        if fn is None:
+            pytest.skip("native extension predates gdn_state_scatter")
+        return fn
+
+    @pytest.mark.parametrize(
+        ("shape", "dtype", "slots"),
+        [
+            ((8, 3, 4), mx.float32, [0, 5, 2]),
+            ((8, 1, 4, 32), mx.float32, [7, 1]),
+            ((8, 3, 4), mx.float16, [3]),
+            ((8, 3, 4), mx.bfloat16, [6, 0]),
+            ((16, 2, 6144), mx.float32, [15, 4, 9]),
+        ],
+    )
+    def test_matches_mlx_indexed_assignment(
+        self, shape: tuple[int, ...], dtype: mx.Dtype, slots: list[int]
+    ) -> None:
+        scatter = self._scatter_fn()
+        rng = np.random.default_rng(0)
+        pool_np = rng.standard_normal(shape).astype(np.float32)
+        rows_np = rng.standard_normal((len(slots), *shape[1:])).astype(np.float32)
+        ids = mx.array(slots, dtype=mx.int32)
+
+        reference = mx.array(pool_np).astype(dtype)
+        reference[ids] = mx.array(rows_np).astype(dtype)
+        mx.eval(reference)
+
+        pool = mx.array(pool_np).astype(dtype)
+        mx.eval(pool)
+        out = scatter(pool, mx.array(rows_np).astype(dtype), ids)
+        mx.eval(out)
+
+        np.testing.assert_array_equal(
+            np.array(out.astype(mx.float32)), np.array(reference.astype(mx.float32))
+        )
+
+    def test_writes_through_the_original_buffer(self) -> None:
+        # The output aliases the pool buffer -- that is what avoids the copy,
+        # and what makes the caller's rebind mandatory.
+        scatter = self._scatter_fn()
+        pool = mx.zeros((4, 2, 2), dtype=mx.float32)
+        mx.eval(pool)
+        out = scatter(
+            pool, mx.ones((1, 2, 2), dtype=mx.float32), mx.array([2], mx.int32)
+        )
+        mx.eval(out)
+        np.testing.assert_array_equal(np.array(pool[2]), 1.0)
+
+    def test_empty_update_leaves_the_pool_alone(self) -> None:
+        scatter = self._scatter_fn()
+        pool = mx.ones((4, 2, 2), dtype=mx.float32)
+        mx.eval(pool)
+        out = scatter(
+            pool,
+            mx.zeros((0, 2, 2), dtype=mx.float32),
+            mx.array([], dtype=mx.int32),
+        )
+        mx.eval(out)
+        np.testing.assert_array_equal(np.array(out), 1.0)
+
+    def test_rejects_mismatched_inputs(self) -> None:
+        scatter = self._scatter_fn()
+        pool = mx.zeros((4, 2, 2), dtype=mx.float32)
+        mx.eval(pool)
+        with pytest.raises(RuntimeError, match="dtypes differ"):
+            scatter(
+                pool,
+                mx.ones((1, 2, 2), dtype=mx.float16),
+                mx.array([0], dtype=mx.int32),
+            )
+        with pytest.raises(RuntimeError, match="dst_ids must be int32"):
+            scatter(
+                pool,
+                mx.ones((1, 2, 2), dtype=mx.float32),
+                mx.array([0], dtype=mx.int64),
+            )
+        with pytest.raises(RuntimeError, match="one dst id per src row"):
+            scatter(
+                pool,
+                mx.ones((2, 2, 2), dtype=mx.float32),
+                mx.array([0], dtype=mx.int32),
+            )
+        with pytest.raises(RuntimeError, match="must be mlx.core.array"):
+            # inst_ptr on a non-array is undefined behaviour; this used to
+            # segfault rather than raise.
+            scatter(pool, mx.ones((1, 2, 2), dtype=mx.float32), [0])
+        with pytest.raises(RuntimeError, match="row shape does not match"):
+            scatter(
+                pool,
+                mx.ones((1, 3, 2), dtype=mx.float32),
+                mx.array([0], dtype=mx.int32),
+            )
+
+    def test_converts_source_dtype_like_mlx_does(self) -> None:
+        # MLX's indexed assignment converts the source implicitly, so callers
+        # pass int literals into fp32 pools; the primitive demands an exact
+        # match, so the cache helper must convert before dispatching.
+        self._scatter_fn()  # skip when the primitive is unavailable
+        cache = _make_state_cache(max_seqs=4, conv_kernel_dim=3, conv_dim=4)
+        pool = cache.conv_states[0]
+        rows = mx.full((1, 2, 4), 5)  # int32, unlike the fp32 pool
+        assert rows.dtype != pool.dtype
+
+        updated = cache._scatter_rows(pool, rows, mx.array([2], dtype=mx.int32))
+        mx.eval(updated)
+
+        np.testing.assert_array_equal(np.array(updated[2]), 5.0)
+
+    def test_cache_drain_agrees_with_the_mlx_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The whole point of the primitive is to be a drop-in for the MLX
+        # path, so the two must land identical pools.
+        from vllm_metal.attention.caches import gdn_cache as gdn_cache_mod
+
+        scatter = self._scatter_fn()
+
+        def build() -> GDNPagedStateCache:
+            cache = _make_state_cache(num_layers=2, max_seqs=4)
+            cache.set_layer_layout([0, 1], [0, 0])
+            cache.set_pending_recurrent_state(
+                0, [0], mx.full((1, 1, 4, 32), 3, dtype=mx.float32)
+            )
+            cache.set_pending_recurrent_state(
+                1, [2], mx.full((1, 1, 4, 32), 7, dtype=mx.float32)
+            )
+            return cache
+
+        monkeypatch.setattr(gdn_cache_mod, "_native_row_scatter", lambda: None)
+        fallback = build()
+        fallback.apply_pending_recurrent_states()
+        mx.eval(fallback.recurrent_states[0])
+
+        monkeypatch.setattr(gdn_cache_mod, "_native_row_scatter", lambda: scatter)
+        native = build()
+        native.apply_pending_recurrent_states()
+        mx.eval(native.recurrent_states[0])
+
+        np.testing.assert_array_equal(
+            np.array(native.recurrent_states[0]),
+            np.array(fallback.recurrent_states[0]),
+        )

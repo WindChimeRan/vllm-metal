@@ -25,10 +25,45 @@ Pending state handoff:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import functools
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import mlx.core as mx
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
+
+@functools.cache
+def _native_row_scatter() -> Callable[..., mx.array] | None:
+    """Return the in-place row-scatter primitive, or ``None`` for the MLX path.
+
+    Resolved once per process.  The fallback exists for an extension that
+    predates the primitive -- a prebuilt wheel artifact in a source checkout --
+    and warns, because silently taking the slow path loses the whole point of
+    the primitive with no signal.
+    """
+    try:
+        from vllm_metal.metal import get_ops
+
+        scatter = getattr(get_ops(), "gdn_state_scatter", None)
+    except (ImportError, RuntimeError) as exc:
+        logger.warning(
+            "Native gdn_state_scatter is unavailable (%s); GDN state writes "
+            "fall back to MLX's indexed assignment, which rewrites the whole "
+            "state pool per write.",
+            exc,
+        )
+        return None
+    if scatter is None:
+        logger.warning(
+            "The native extension predates gdn_state_scatter; GDN state "
+            "writes fall back to MLX's indexed assignment, which rewrites "
+            "the whole state pool per write. Rebuild with "
+            "`python -m vllm_metal.metal.build` to restore the fast path."
+        )
+    return scatter
 
 
 @dataclass(frozen=True)
@@ -269,12 +304,15 @@ class GDNPagedStateCache:
         src = mx.array(src_ids, dtype=mx.int32)
         dst = mx.array(dst_ids, dtype=mx.int32)
         for layer_idx in layer_indices:
+            # Gather first (its output is O(rows)), then write the rows back.
+            # Reading the sources into their own array keeps the copy atomic
+            # when one pair's destination is another pair's source.
             conv = self.conv_states[layer_idx]
-            conv[dst] = conv[src]
+            conv = self._scatter_rows(conv, conv[src], dst)
             self.store_conv_state(layer_idx, conv)
 
             recurrent = self.recurrent_states[layer_idx]
-            recurrent[dst] = recurrent[src]
+            recurrent = self._scatter_rows(recurrent, recurrent[src], dst)
             self.store_recurrent_state(layer_idx, recurrent)
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
@@ -310,12 +348,12 @@ class GDNPagedStateCache:
             dtype=self.recurrent_states[0].dtype,
         )
         for layer_idx in layer_indices:
-            conv = self.conv_states[layer_idx]
-            conv[ids] = conv_zeros
+            conv = self._scatter_rows(self.conv_states[layer_idx], conv_zeros, ids)
             self.store_conv_state(layer_idx, conv)
 
-            recurrent = self.recurrent_states[layer_idx]
-            recurrent[ids] = recurrent_zeros
+            recurrent = self._scatter_rows(
+                self.recurrent_states[layer_idx], recurrent_zeros, ids
+            )
             self.store_recurrent_state(layer_idx, recurrent)
 
     def set_pending_conv_state(
@@ -446,6 +484,32 @@ class GDNPagedStateCache:
         arrays.extend(p for p in self.pending_recurrent_states if p is not None)
         return arrays
 
+    def _scatter_rows(self, pool: mx.array, rows: mx.array, ids: mx.array) -> mx.array:
+        """Write ``rows`` into ``pool`` at row ids ``ids``; return the new pool.
+
+        MLX's indexed assignment routes through ``copy_gpu``, which donates
+        the source buffer only when it holds the sole reference to it
+        (``is_donatable`` in ``mlx/backend/common/utils.h``).  A state pool is
+        aliased into every one of its sibling layers by
+        :meth:`store_conv_state`, so that never holds and each write rewrites
+        the whole pool -- which, under align-mode prefix caching, grows with
+        cache occupancy.  The native primitive writes only the named rows in
+        place and returns an array aliasing the same buffer, so callers must
+        rebind through :meth:`store_conv_state` /
+        :meth:`store_recurrent_state`.
+
+        Destination slots must be distinct; duplicates race in the kernel
+        where the MLX path would be last-writer-wins.
+        """
+        native = _native_row_scatter()
+        if native is None:
+            pool[ids] = rows
+            return pool
+        # MLX's indexed assignment converts the source implicitly and callers
+        # rely on it; the primitive requires an exact match.  ``astype`` is a
+        # no-op when the dtypes already agree, and O(rows) otherwise.
+        return native(pool, rows.astype(pool.dtype), ids)
+
     def apply_pending_conv_state(self, layer_idx: int) -> None:
         """Scatter deferred conv updates into the stable state pool."""
         pending_state = self.pending_conv_states[layer_idx]
@@ -454,9 +518,11 @@ class GDNPagedStateCache:
             return
         self.require_allocated_slots(pending_slots)
 
-        slot_ids_arr = mx.array(pending_slots, dtype=mx.int32)
-        conv_state = self.conv_states[layer_idx]
-        conv_state[slot_ids_arr] = pending_state
+        conv_state = self._scatter_rows(
+            self.conv_states[layer_idx],
+            pending_state,
+            mx.array(pending_slots, dtype=mx.int32),
+        )
         self.store_conv_state(layer_idx, conv_state)
         self.clear_pending_conv_state(layer_idx)
 
@@ -473,9 +539,11 @@ class GDNPagedStateCache:
             return
         self.require_allocated_slots(pending_slots)
 
-        slot_ids_arr = mx.array(pending_slots, dtype=mx.int32)
-        recurrent_state = self.recurrent_states[layer_idx]
-        recurrent_state[slot_ids_arr] = pending_state
+        recurrent_state = self._scatter_rows(
+            self.recurrent_states[layer_idx],
+            pending_state,
+            mx.array(pending_slots, dtype=mx.int32),
+        )
         self.store_recurrent_state(layer_idx, recurrent_state)
         self.clear_pending_recurrent_state(layer_idx)
 
