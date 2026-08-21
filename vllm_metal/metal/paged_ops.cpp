@@ -1215,9 +1215,11 @@ void init_gdn_library(const std::string& src) {
   d.get_library("gdn_kern", [&]() { return gdn_source_; });
 }
 
-// gdn_state_scatter writes selected rows in place and returns a distinct graph
-// handle for the resulting pool buffer. Callers must rebind that handle so
-// later operations depend on the write. Destination slots must be distinct.
+// MLX Scatter/SliceUpdate copy their destination unless it is donatable; GDN
+// pools are aliased across sibling layers, so pool[ids] = rows copies the full
+// pool. mx.fast.metal_kernel allocates fresh outputs, so this Primitive aliases
+// the pool with copy_shared_buffer; callers rebind the output so downstream
+// readers depend on the write. Destination slots must be distinct.
 
 class GDNStateScatterPrimitive : public Primitive {
  public:
