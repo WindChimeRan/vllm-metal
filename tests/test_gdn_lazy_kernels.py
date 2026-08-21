@@ -1881,6 +1881,49 @@ class TestNativeGDNStateScatter:
                 mx.ones((1, 3, 2), dtype=mx.float32),
                 mx.array([0], dtype=mx.int32),
             )
+        with pytest.raises(RuntimeError, match="row shape does not match"):
+            scatter(
+                pool,
+                mx.array(1, dtype=mx.float32),
+                mx.array([0], dtype=mx.int32),
+            )
+
+    def test_rejects_unsupported_pool_dtype(self) -> None:
+        scatter = self._scatter_fn()
+        with pytest.raises(RuntimeError, match="pool dtype must be"):
+            scatter(
+                mx.zeros((4, 2), dtype=mx.int32),
+                mx.ones((1, 2), dtype=mx.int32),
+                mx.array([0], dtype=mx.int32),
+            )
+
+    def test_materializes_noncontiguous_source_and_ids(self) -> None:
+        scatter = self._scatter_fn()
+        pool = mx.zeros((4, 2), dtype=mx.float32)
+        rows = mx.arange(8, dtype=mx.float32).reshape(2, 4)[:, ::2]
+        ids = mx.array([0, 3, 1, 3], dtype=mx.int32)[::2]
+
+        updated = scatter(pool, rows, ids)
+        mx.eval(updated)
+
+        np.testing.assert_array_equal(np.array(updated[:2]), [[0.0, 2.0], [4.0, 6.0]])
+
+    def test_materializes_noncontiguous_pool(self) -> None:
+        scatter = self._scatter_fn()
+        base = mx.arange(8, dtype=mx.float32).reshape(2, 4)
+        mx.eval(base)
+        pool = base.T
+        updated = scatter(
+            pool,
+            mx.array([[9.0, 10.0]], dtype=mx.float32),
+            mx.array([1], dtype=mx.int32),
+        )
+        mx.eval(updated)
+
+        np.testing.assert_array_equal(
+            np.array(updated),
+            [[0.0, 4.0], [9.0, 10.0], [2.0, 6.0], [3.0, 7.0]],
+        )
 
     def test_converts_source_dtype_like_mlx_does(self) -> None:
         # MLX's indexed assignment converts the source implicitly, so callers
