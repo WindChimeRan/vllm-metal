@@ -1938,37 +1938,21 @@ class TestNativeGDNStateScatter:
 
         np.testing.assert_array_equal(np.array(updated[2]), 5.0)
 
-    def test_cache_drain_agrees_with_the_mlx_fallback(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # The whole point of the primitive is to be a drop-in for the MLX
-        # path, so the two must land identical pools.
-        from vllm_metal.attention.caches import gdn_cache as gdn_cache_mod
-
-        scatter = self._scatter_fn()
-
-        def build() -> GDNPagedStateCache:
-            cache = _make_state_cache(num_layers=2, max_seqs=4)
-            cache.set_layer_layout([0, 1], [0, 0])
-            cache.set_pending_recurrent_state(
-                0, [0], mx.full((1, 1, 4, 32), 3, dtype=mx.float32)
-            )
-            cache.set_pending_recurrent_state(
-                1, [2], mx.full((1, 1, 4, 32), 7, dtype=mx.float32)
-            )
-            return cache
-
-        monkeypatch.setattr(gdn_cache_mod, "_native_row_scatter", lambda: None)
-        fallback = build()
-        fallback.apply_pending_recurrent_states()
-        mx.eval(fallback.recurrent_states[0])
-
-        monkeypatch.setattr(gdn_cache_mod, "_native_row_scatter", lambda: scatter)
-        native = build()
-        native.apply_pending_recurrent_states()
-        mx.eval(native.recurrent_states[0])
-
-        np.testing.assert_array_equal(
-            np.array(native.recurrent_states[0]),
-            np.array(fallback.recurrent_states[0]),
+    def test_shared_cache_drain_chains_native_scatters(self) -> None:
+        self._scatter_fn()  # skip when the primitive is unavailable
+        cache = _make_state_cache(num_layers=2, max_seqs=4)
+        cache.set_layer_layout([0, 1], [0, 0])
+        cache.set_pending_recurrent_state(
+            0, [0], mx.full((1, 1, 4, 32), 3, dtype=mx.float32)
         )
+        cache.set_pending_recurrent_state(
+            1, [2], mx.full((1, 1, 4, 32), 7, dtype=mx.float32)
+        )
+
+        cache.apply_pending_recurrent_states()
+        mx.eval(cache.recurrent_states[0])
+
+        expected = np.zeros(cache.recurrent_states[0].shape, dtype=np.float32)
+        expected[0] = 3
+        expected[2] = 7
+        np.testing.assert_array_equal(np.array(cache.recurrent_states[0]), expected)

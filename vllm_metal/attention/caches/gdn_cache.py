@@ -30,40 +30,14 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import mlx.core as mx
-from vllm.logger import init_logger
-
-logger = init_logger(__name__)
 
 
 @functools.cache
-def _native_row_scatter() -> Callable[..., mx.array] | None:
-    """Return the in-place row-scatter primitive, or ``None`` for the MLX path.
+def _native_row_scatter() -> Callable[..., mx.array]:
+    """Return the required in-place row-scatter primitive."""
+    from vllm_metal.metal import get_ops
 
-    Resolved once per process.  The fallback exists for an extension that
-    predates the primitive -- a prebuilt wheel artifact in a source checkout --
-    and warns, because silently taking the slow path loses the whole point of
-    the primitive with no signal.
-    """
-    try:
-        from vllm_metal.metal import get_ops
-
-        scatter = getattr(get_ops(), "gdn_state_scatter", None)
-    except (ImportError, RuntimeError) as exc:
-        logger.warning(
-            "Native gdn_state_scatter is unavailable (%s); GDN state writes "
-            "fall back to MLX's indexed assignment, which rewrites the whole "
-            "state pool per write.",
-            exc,
-        )
-        return None
-    if scatter is None:
-        logger.warning(
-            "The native extension predates gdn_state_scatter; GDN state "
-            "writes fall back to MLX's indexed assignment, which rewrites "
-            "the whole state pool per write. Rebuild with "
-            "`python -m vllm_metal.metal.build` to restore the fast path."
-        )
-    return scatter
+    return get_ops().gdn_state_scatter
 
 
 @dataclass(frozen=True)
@@ -486,14 +460,10 @@ class GDNPagedStateCache:
         Destination slots must be distinct; duplicates race in the kernel
         where the MLX path would be last-writer-wins.
         """
-        native = _native_row_scatter()
-        if native is None:
-            pool[ids] = rows
-            return pool
         # MLX's indexed assignment converts the source implicitly and callers
         # rely on it; the primitive requires an exact match.  ``astype`` is a
         # no-op when the dtypes already agree, and O(rows) otherwise.
-        return native(pool, rows.astype(pool.dtype), ids)
+        return _native_row_scatter()(pool, rows.astype(pool.dtype), ids)
 
     def write_conv_rows(self, layer_idx: int, rows: mx.array, ids: mx.array) -> None:
         """Write conv rows into a layer's pool and rebind its sibling aliases.
