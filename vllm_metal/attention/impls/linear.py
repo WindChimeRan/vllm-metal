@@ -247,9 +247,9 @@ class GDNPagedAttentionWrapper(nn.Module):
             if defer_conv_state:
                 conv_updates.append(new_conv)
             else:
-                cs = state_cache.conv_states[cache_idx]
-                cs[slot : slot + 1] = new_conv
-                state_cache.store_conv_state(cache_idx, cs)
+                state_cache.write_conv_rows(
+                    cache_idx, new_conv, mx.array([slot], dtype=mx.int32)
+                )
 
             conv_out = nn.silu(inner.conv1d(conv_input))
             # Take only the output tokens (not the conv state prefix)

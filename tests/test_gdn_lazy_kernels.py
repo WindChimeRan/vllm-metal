@@ -710,7 +710,10 @@ class TestLazyConvPrefill:
         # Assert
         assert result is not None
         assert cache.pending_conv_state(0, [3, 1]) is None
-        assert decode_kernel.state_input is cache.conv_states[0]
+        # The kernel must read the stable pool, not the compact pending rows.
+        # Object identity no longer distinguishes them: the in-place scatter
+        # mints a fresh handle onto the same buffer, so compare shape.
+        assert decode_kernel.state_input.shape == cache.conv_states[0].shape
         mx.eval(cache.conv_states[0], decode_kernel.slot_mapping)
         np.testing.assert_array_equal(np.array(decode_kernel.slot_mapping), [1, 3])
         expected_state = np.array(initial_state)

@@ -224,14 +224,7 @@ class GDNPagedStateCache:
         """Clear state for one allocated slot before it is reused."""
         self.require_allocated_slots([slot])
         self.apply_pending_states()
-        for layer_idx in self._canonical_layers:
-            conv = self.conv_states[layer_idx]
-            conv[slot] = mx.zeros_like(conv[slot])
-            self.store_conv_state(layer_idx, conv)
-
-            recurrent = self.recurrent_states[layer_idx]
-            recurrent[slot] = mx.zeros_like(recurrent[slot])
-            self.store_recurrent_state(layer_idx, recurrent)
+        self.zero_slots([slot], self._canonical_layers)
 
     def set_layer_layout(
         self, group_ordinals: list[int], pool_ordinals: list[int]
@@ -307,13 +300,10 @@ class GDNPagedStateCache:
             # Gather first (its output is O(rows)), then write the rows back.
             # Reading the sources into their own array keeps the copy atomic
             # when one pair's destination is another pair's source.
-            conv = self.conv_states[layer_idx]
-            conv = self._scatter_rows(conv, conv[src], dst)
-            self.store_conv_state(layer_idx, conv)
-
-            recurrent = self.recurrent_states[layer_idx]
-            recurrent = self._scatter_rows(recurrent, recurrent[src], dst)
-            self.store_recurrent_state(layer_idx, recurrent)
+            self.write_conv_rows(layer_idx, self.conv_states[layer_idx][src], dst)
+            self.write_recurrent_rows(
+                layer_idx, self.recurrent_states[layer_idx][src], dst
+            )
 
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
         """Apply scheduler copy-on-write operations to every physical pool."""
@@ -348,13 +338,8 @@ class GDNPagedStateCache:
             dtype=self.recurrent_states[0].dtype,
         )
         for layer_idx in layer_indices:
-            conv = self._scatter_rows(self.conv_states[layer_idx], conv_zeros, ids)
-            self.store_conv_state(layer_idx, conv)
-
-            recurrent = self._scatter_rows(
-                self.recurrent_states[layer_idx], recurrent_zeros, ids
-            )
-            self.store_recurrent_state(layer_idx, recurrent)
+            self.write_conv_rows(layer_idx, conv_zeros, ids)
+            self.write_recurrent_rows(layer_idx, recurrent_zeros, ids)
 
     def set_pending_conv_state(
         self, layer_idx: int, slot_ids: list[int], state_updates: mx.array
@@ -510,6 +495,28 @@ class GDNPagedStateCache:
         # no-op when the dtypes already agree, and O(rows) otherwise.
         return native(pool, rows.astype(pool.dtype), ids)
 
+    def write_conv_rows(self, layer_idx: int, rows: mx.array, ids: mx.array) -> None:
+        """Write conv rows into a layer's pool and rebind its sibling aliases.
+
+        The single write path for a conv pool.  Writing the pool directly with
+        MLX's indexed assignment rewrites all of it (see :meth:`_scatter_rows`),
+        and the aliasing that makes that unavoidable is also what makes the
+        rebind mandatory -- doing both here keeps the two from drifting apart.
+        This is graph construction only; nothing is evaluated.
+        """
+        self.store_conv_state(
+            layer_idx, self._scatter_rows(self.conv_states[layer_idx], rows, ids)
+        )
+
+    def write_recurrent_rows(
+        self, layer_idx: int, rows: mx.array, ids: mx.array
+    ) -> None:
+        """Write recurrent rows into a layer's pool and rebind its aliases."""
+        self.store_recurrent_state(
+            layer_idx,
+            self._scatter_rows(self.recurrent_states[layer_idx], rows, ids),
+        )
+
     def apply_pending_conv_state(self, layer_idx: int) -> None:
         """Scatter deferred conv updates into the stable state pool."""
         pending_state = self.pending_conv_states[layer_idx]
@@ -518,12 +525,9 @@ class GDNPagedStateCache:
             return
         self.require_allocated_slots(pending_slots)
 
-        conv_state = self._scatter_rows(
-            self.conv_states[layer_idx],
-            pending_state,
-            mx.array(pending_slots, dtype=mx.int32),
+        self.write_conv_rows(
+            layer_idx, pending_state, mx.array(pending_slots, dtype=mx.int32)
         )
-        self.store_conv_state(layer_idx, conv_state)
         self.clear_pending_conv_state(layer_idx)
 
     def apply_pending_conv_states(self) -> None:
@@ -539,12 +543,9 @@ class GDNPagedStateCache:
             return
         self.require_allocated_slots(pending_slots)
 
-        recurrent_state = self._scatter_rows(
-            self.recurrent_states[layer_idx],
-            pending_state,
-            mx.array(pending_slots, dtype=mx.int32),
+        self.write_recurrent_rows(
+            layer_idx, pending_state, mx.array(pending_slots, dtype=mx.int32)
         )
-        self.store_recurrent_state(layer_idx, recurrent_state)
         self.clear_pending_recurrent_state(layer_idx)
 
     def apply_pending_recurrent_states(self) -> None:
