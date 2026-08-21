@@ -1262,10 +1262,16 @@ class GDNStateScatterPrimitive : public Primitive {
     }
     int row_elems = static_cast<int>(pool.size() / pool.shape(0));
 
+    // Four elements per thread when the row divides evenly, which every GDN
+    // state layout does; the scalar kernel is the general fallback.
+    bool vec4 = (row_elems % 4) == 0;
+    int lanes = vec4 ? row_elems / 4 : row_elems;
+
     auto s = stream();
     auto& d = metal::device(s.device);
     auto dt = dtype_to_metal(pool.dtype());
-    std::string kname = "gdn_state_scatter_rows_" + dt;
+    std::string kname =
+        std::string("gdn_state_scatter_rows_") + (vec4 ? "vec4_" : "") + dt;
     auto* lib = d.get_library("gdn_kern");
     auto* kernel = d.get_kernel(kname, lib, kname, {});
 
@@ -1274,12 +1280,15 @@ class GDNStateScatterPrimitive : public Primitive {
     enc.set_output_array(outputs[0], 0);
     enc.set_input_array(src,         1);
     enc.set_input_array(dst_ids,     2);
-    enc.set_bytes(row_elems,         3);
+    enc.set_bytes(lanes,             3);
 
-    int tg = std::min(row_elems, 256);
-    enc.dispatch_threadgroups(
-        MTL::Size::Make(n, 1, 1),
-        MTL::Size::Make(tg, 1, 1));
+    // 2D thread grid: x walks the row, y selects the update row. One
+    // threadgroup per row leaves most of the GPU idle on a 1 MiB slab.
+    int tg_x = std::min<int>(
+        lanes, static_cast<int>(kernel->maxTotalThreadsPerThreadgroup()));
+    enc.dispatch_threads(
+        MTL::Size::Make(lanes, n, 1),
+        MTL::Size::Make(tg_x, 1, 1));
   }
 
   const char* name() const override { return "GDNStateScatter"; }

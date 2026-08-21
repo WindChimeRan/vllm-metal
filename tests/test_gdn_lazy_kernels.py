@@ -1797,6 +1797,10 @@ class TestNativeGDNStateScatter:
             ((8, 3, 4), mx.float16, [3]),
             ((8, 3, 4), mx.bfloat16, [6, 0]),
             ((16, 2, 6144), mx.float32, [15, 4, 9]),
+            # row lengths not divisible by 4 take the scalar kernel
+            ((8, 3), mx.float32, [0, 5]),
+            ((8, 7), mx.float16, [2]),
+            ((8, 5, 3), mx.bfloat16, [6, 1]),
         ],
     )
     def test_matches_mlx_indexed_assignment(
