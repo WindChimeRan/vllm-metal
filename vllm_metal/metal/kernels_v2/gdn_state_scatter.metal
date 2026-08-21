@@ -18,9 +18,6 @@ template <typename T>
     device const int &row_elems [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int i = int(gid.x);
-  if (i >= row_elems) {
-    return;
-  }
   const int64_t row = int64_t(gid.y);
   const int64_t dst = int64_t(dst_ids[gid.y]) * row_elems;
   pool[dst + i] = src[row * row_elems + i];
@@ -36,9 +33,6 @@ template <typename T>
     device const int &row_vec4s [[buffer(3)]],
     uint2 gid [[thread_position_in_grid]]) {
   const int i = int(gid.x);
-  if (i >= row_vec4s) {
-    return;
-  }
   const int64_t row = int64_t(gid.y);
   const int64_t dst = int64_t(dst_ids[gid.y]) * row_vec4s;
   reinterpret_cast<device vec<T, 4> *>(pool)[dst + i] =
