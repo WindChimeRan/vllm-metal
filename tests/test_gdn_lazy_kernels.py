@@ -204,29 +204,27 @@ class TestGDNPagedStateCache:
         np.testing.assert_array_equal(np.array(view.cache_slot_ids), [3, 1])
         np.testing.assert_array_equal(np.array(view.state_slot_ids), [0, 1])
 
-    def test_pending_states_batch_matches_per_layer_drain(self) -> None:
-        # The batched drain must land exactly what draining each layer in turn
-        # would have landed.
-        def build() -> GDNPagedStateCache:
-            cache = _make_state_cache(num_layers=2, max_seqs=4)
-            cache.set_layer_layout([0, 1], [0, 0])
-            cache.set_pending_conv_state(
-                0, [1], mx.full((1, 2, 4), 4, dtype=mx.float32)
-            )
-            cache.set_pending_conv_state(
-                1, [3], mx.full((1, 2, 4), 6, dtype=mx.float32)
-            )
-            return cache
+    def test_copy_slots_gathers_overlapping_sources_before_writing(self) -> None:
+        cache = _make_state_cache(
+            max_seqs=4,
+            conv_kernel_dim=2,
+            conv_dim=1,
+            value_head_dim=1,
+            key_head_dim=1,
+        )
+        cache.conv_states[0] = mx.arange(4, dtype=mx.float32).reshape(4, 1, 1)
+        cache.recurrent_states[0] = mx.arange(4, dtype=mx.float32).reshape(4, 1, 1, 1)
 
-        batched = build()
-        batched.apply_pending_conv_states()
-
-        per_layer = build()
-        per_layer.apply_pending_conv_state(0)
-        per_layer.apply_pending_conv_state(1)
+        # Destination 2 is also the second source. Both source rows must be
+        # gathered before the in-place writes begin.
+        cache.copy_slots([1, 2], [2, 3], [0])
+        mx.eval(cache.conv_states[0], cache.recurrent_states[0])
 
         np.testing.assert_array_equal(
-            np.array(batched.conv_states[0]), np.array(per_layer.conv_states[0])
+            np.array(cache.conv_states[0]).reshape(-1), [0.0, 1.0, 1.0, 2.0]
+        )
+        np.testing.assert_array_equal(
+            np.array(cache.recurrent_states[0]).reshape(-1), [0.0, 1.0, 1.0, 2.0]
         )
 
     def test_identity_layout_still_drains_every_layer(self) -> None:
