@@ -1781,11 +1781,7 @@ class TestNativeGDNStateScatter:
 
     @staticmethod
     def _scatter_fn() -> Any:
-        ops = _get_native_ops_or_skip()
-        fn = getattr(ops, "gdn_state_scatter", None)
-        if fn is None:
-            pytest.skip("native extension predates gdn_state_scatter")
-        return fn
+        return _get_native_ops_or_skip().gdn_state_scatter
 
     @pytest.mark.parametrize(
         ("shape", "dtype", "slots"),
