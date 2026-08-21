@@ -11,6 +11,13 @@ using namespace metal;
 //
 // A 2D grid walks elements on x and update rows on y. Destination slots must
 // be distinct because duplicate rows would race between threadgroups.
+//
+// Both kernels assume an exact-size grid and therefore carry no bounds check:
+// the host dispatches through MLX's dispatch_threads, which maps to Metal's
+// non-uniform dispatchThreads and launches exactly grid_dims threads. Moving
+// to dispatch_threadgroups -- the style the rest of paged_ops.cpp uses --
+// would round the grid up to whole threadgroups and write past the end of a
+// row. Add the bounds checks back first if you ever change the dispatch.
 template <typename T>
 [[kernel]] void gdn_state_scatter_rows(
     device T *pool [[buffer(0)]], const device T *src [[buffer(1)]],

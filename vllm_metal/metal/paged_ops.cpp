@@ -1267,6 +1267,11 @@ class GDNStateScatterPrimitive : public Primitive {
 
     // 2D thread grid: x walks the row, y selects the update row. One
     // threadgroup per row leaves most of the GPU idle on a 1 MiB slab.
+    //
+    // dispatch_threads maps to Metal's non-uniform dispatchThreads, so exactly
+    // `lanes` threads run along x and the kernels need no bounds check. This is
+    // the only dispatch_threads call in this file; the others round up through
+    // dispatch_threadgroups, which here would write past the end of a row.
     int tg_x = std::min<int>(
         lanes, static_cast<int>(kernel->maxTotalThreadsPerThreadgroup()));
     enc.dispatch_threads(
