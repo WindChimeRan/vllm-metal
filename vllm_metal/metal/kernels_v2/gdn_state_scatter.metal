@@ -9,19 +9,8 @@ using namespace metal;
 //   src:     [n, row_elems]           compact update rows
 //   dst_ids: [n]                      destination slot for each update row
 //
-// A 2D thread grid: x walks the row, y selects the update. One threadgroup
-// per row would leave the GPU idle -- a recurrent row is 16x128x128 floats,
-// so a single 256-wide threadgroup would run 1024 scalar iterations while
-// most of the machine sits unused.
-//
-// MLX's own indexed assignment cannot be used on this path because it donates
-// the destination buffer only when it holds the sole reference to it, and a
-// state pool is aliased into every sibling layer that shares it -- so each
-// write rewrites the whole pool, which under align-mode prefix caching grows
-// with cache occupancy.
-//
-// Destination slots must be distinct: two update rows naming the same slot
-// would race.  Callers enforce that (pool siblings own disjoint block ids).
+// A 2D grid walks elements on x and update rows on y. Destination slots must
+// be distinct because duplicate rows would race between threadgroups.
 template <typename T>
 [[kernel]] void gdn_state_scatter_rows(
     device T *pool [[buffer(0)]], const device T *src [[buffer(1)]],

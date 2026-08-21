@@ -1215,27 +1215,9 @@ void init_gdn_library(const std::string& src) {
   d.get_library("gdn_kern", [&]() { return gdn_source_; });
 }
 
-// ---------------------------------------------------------------------------
-// gdn_state_scatter — in-place row scatter into a GDN state pool
-//
-// Replaces `pool[mx.array(slot_ids)] = rows` on the state-drain path.  MLX's
-// Scatter::eval_gpu (mlx/backend/metal/indexing.cpp) routes through copy_gpu,
-// which donates the source buffer only when it holds the sole reference to it
-// (is_donatable, mlx/backend/common/utils.h).  A GDN state pool is aliased
-// into every one of its sibling layers, so that never holds and each write
-// rewrites the whole pool.  Under align-mode prefix caching the pool is
-// indexed by scheduler block id and grows with cache occupancy, so that
-// rewrite — not the update itself — dominates the step.
-//
-// This primitive writes the rows in place: the output aliases the pool buffer
-// via copy_shared_buffer, giving the write a distinct graph identity (the same
-// provenance pattern as TQEncodePrimitive / ReshapeAndCachePrimitive) while
-// touching only the rows named by dst_ids.  The caller MUST rebind its pool
-// reference to the returned array so later ops depend on this primitive.
-//
-// Destination slots must be distinct; duplicates would race between
-// threadgroups.  Callers enforce that invariant.
-// ---------------------------------------------------------------------------
+// gdn_state_scatter writes selected rows in place and returns a distinct graph
+// handle for the resulting pool buffer. Callers must rebind that handle so
+// later operations depend on the write. Destination slots must be distinct.
 
 class GDNStateScatterPrimitive : public Primitive {
  public:

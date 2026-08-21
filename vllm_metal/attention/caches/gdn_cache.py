@@ -444,36 +444,14 @@ class GDNPagedStateCache:
         return arrays
 
     def _scatter_rows(self, pool: mx.array, rows: mx.array, ids: mx.array) -> mx.array:
-        """Write ``rows`` into ``pool`` at row ids ``ids``; return the new pool.
-
-        MLX's indexed assignment routes through ``copy_gpu``, which donates
-        the source buffer only when it holds the sole reference to it
-        (``is_donatable`` in ``mlx/backend/common/utils.h``).  A state pool is
-        aliased into every one of its sibling layers by
-        :meth:`store_conv_state`, so that never holds and each write rewrites
-        the whole pool -- which, under align-mode prefix caching, grows with
-        cache occupancy.  The native primitive writes only the named rows in
-        place and returns an array aliasing the same buffer, so callers must
-        rebind through :meth:`store_conv_state` /
-        :meth:`store_recurrent_state`.
-
-        Destination slots must be distinct; duplicates race in the kernel
-        where the MLX path would be last-writer-wins.
-        """
+        """Write distinct rows in place and return the rebound pool handle."""
         # MLX's indexed assignment converts the source implicitly and callers
         # rely on it; the primitive requires an exact match.  ``astype`` is a
         # no-op when the dtypes already agree, and O(rows) otherwise.
         return _native_row_scatter()(pool, rows.astype(pool.dtype), ids)
 
     def write_conv_rows(self, layer_idx: int, rows: mx.array, ids: mx.array) -> None:
-        """Write conv rows into a layer's pool and rebind its sibling aliases.
-
-        The single write path for a conv pool.  Writing the pool directly with
-        MLX's indexed assignment rewrites all of it (see :meth:`_scatter_rows`),
-        and the aliasing that makes that unavoidable is also what makes the
-        rebind mandatory -- doing both here keeps the two from drifting apart.
-        This is graph construction only; nothing is evaluated.
-        """
+        """Write conv rows and rebind every sibling to the returned handle."""
         self.store_conv_state(
             layer_idx, self._scatter_rows(self.conv_states[layer_idx], rows, ids)
         )
@@ -481,7 +459,7 @@ class GDNPagedStateCache:
     def write_recurrent_rows(
         self, layer_idx: int, rows: mx.array, ids: mx.array
     ) -> None:
-        """Write recurrent rows into a layer's pool and rebind its aliases."""
+        """Write recurrent rows and rebind siblings to the returned handle."""
         self.store_recurrent_state(
             layer_idx,
             self._scatter_rows(self.recurrent_states[layer_idx], rows, ids),
