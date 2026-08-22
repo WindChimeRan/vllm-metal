@@ -162,6 +162,37 @@ class TestShortConvPagedWrapper:
                 ref_caches[req][0],
             )
 
+    def test_mixed_decode_and_prefill_step_matches_reference(self) -> None:
+        """One packed step mixing a decode with prefills exercises the
+        per-segment loop boundary of the pure-decode fast path — including a
+        1-token prefill chunk, which is length-indistinguishable from decode.
+        """
+        mx.random.seed(1)
+        module = _make_module()
+        wrapper, _ = _make_wrapper(module)
+
+        slot_ids = [1, 4, 6]
+        # Request 0 decodes (1 token after a 4-token prefill); request 1
+        # prefills 5 tokens; request 2 advances by a 1-token prefill chunk.
+        request_chunks = [
+            [mx.random.normal((1, t, HIDDEN)) for t in (4, 1)],
+            [mx.random.normal((1, t, HIDDEN)) for t in (2, 5)],
+            [mx.random.normal((1, t, HIDDEN)) for t in (3, 1)],
+        ]
+
+        ref_outputs = []
+        for chunks in request_chunks:
+            cache = ArraysCache(size=1)
+            ref_outputs.append(
+                [module(chunk, mask=None, cache=cache) for chunk in chunks]
+            )
+
+        for step in range(2):
+            chunks = [request_chunks[req][step] for req in range(3)]
+            outputs = _run_wrapper_step(wrapper, chunks, slot_ids)
+            for req in range(3):
+                _assert_close(outputs[req], ref_outputs[req][step])
+
     def test_no_context_delegates_to_inner(self) -> None:
         """Without a paged context the wrapper is the original module."""
         mx.random.seed(3)
@@ -171,3 +202,60 @@ class TestShortConvPagedWrapper:
 
         x = mx.random.normal((1, 5, HIDDEN))
         _assert_close(wrapper(x), module(x))
+
+
+class TestShortConvStateLifecycle:
+    """None-mode slot lifecycle (HybridGDNStateManager over ShortConv)."""
+
+    def test_grow_release_and_reuse_zeroes_the_slot(self) -> None:
+        from vllm_metal.attention.context import PagedAttentionContext
+        from vllm_metal.attention.state import HybridGDNStateManager
+
+        cache = ShortConvStateCache(
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=L_CACHE,
+            conv_dim=HIDDEN,
+            initial_seqs=0,
+            dtype=mx.float32,
+        )
+        manager = HybridGDNStateManager(cache)
+
+        def assign(req_ids):
+            ctx = PagedAttentionContext(slot_mapping=[])
+            manager.populate_step_context(req_ids=req_ids, ctx=ctx)
+            return ctx.gdn_slot_mapping
+
+        slots = assign(["a", "b"])
+        assert cache.allocated_seqs >= 2
+
+        # Dirty request a's slot, grow past it, and check the state survives.
+        rows = mx.full((1, L_CACHE - 1, HIDDEN), 3.0, mx.float32)
+        cache.write_conv_rows(0, rows, mx.array([slots[0]], dtype=mx.int32))
+        assign(["a", "b", "c", "d"])
+        assert cache.allocated_seqs == 4
+        mx.eval(cache.conv_states[0])
+        assert float(cache.conv_states[0][slots[0]].max()) == 3.0
+
+        # Release a; its slot must come back zeroed for the next request.
+        manager.release_requests({"a"})
+        manager.materialize_pending_state()
+        new_slots = assign(["b", "c", "d", "e"])
+        reused = new_slots[-1]
+        assert reused == slots[0]
+        mx.eval(cache.conv_states[0])
+        assert float(cache.conv_states[0][reused].max()) == 0.0
+
+    def test_out_of_range_and_unallocated_slots_raise(self) -> None:
+        cache = ShortConvStateCache(
+            num_layers=1,
+            max_seqs=4,
+            conv_kernel_dim=L_CACHE,
+            conv_dim=HIDDEN,
+            initial_seqs=2,
+            dtype=mx.float32,
+        )
+        with pytest.raises(RuntimeError, match="out-of-range"):
+            cache.require_allocated_slots([4])
+        with pytest.raises(RuntimeError, match="beyond allocated"):
+            cache.require_allocated_slots([2])

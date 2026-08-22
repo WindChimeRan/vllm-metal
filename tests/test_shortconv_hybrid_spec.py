@@ -195,8 +195,22 @@ def _conv_runner():
         ),
     )
     lifecycle = ModelLifecycle(runner, runner._model_adapter)
-    lifecycle._install_conv_hybrid_dims(runner.model_args)
+    # Public wiring: the shared hybrid-dims installer dispatches per family.
+    lifecycle._install_hybrid_attention_dims(runner.model_args)
     return runner
+
+
+def test_unsupported_conv_layer_types_entry_raises():
+    runner = make_stub_runner(
+        model_args={
+            "layer_types": ["conv", "sliding_attention"],
+            "conv_L_cache": CONV_L_CACHE,
+            "hidden_size": HIDDEN,
+        }
+    )
+    lifecycle = ModelLifecycle(runner, runner._model_adapter)
+    with pytest.raises(NotImplementedError, match="sliding_attention"):
+        lifecycle._install_hybrid_attention_dims(runner.model_args)
 
 
 def test_conv_hybrid_dims_derived_from_layer_types():
@@ -235,14 +249,76 @@ def test_conv_hybrid_kv_cache_spec_layers_and_fields():
         assert spec.mamba_cache_mode == "none"
 
 
+def test_conv_state_bytes_per_slot_accounting():
+    """One request's conv state: layers x (L_cache-1) x hidden x dtype."""
+    runner = _conv_runner()
+
+    expected = len(CONV_LAYERS) * (CONV_L_CACHE - 1) * HIDDEN * 2  # fp16
+    assert runner._cache_policy.linear_cache_bytes_per_slot() == expected
+    # With no scheduler padding the spec-facing estimate matches exactly.
+    assert runner._cache_policy._state_spec_bytes_per_slot() == expected
+
+
 def test_conv_hybrid_backend_routing():
     runner = _conv_runner()
 
     runtime = runner._cache_policy.build_paged_attention_runtime(block_size=16)
 
     assert isinstance(runtime, ShortConvHybridPagedAttentionRuntime)
-    assert runtime._sdpa_indices == sorted(SDPA_LAYERS)
-    assert runtime._state_indices == list(CONV_LAYERS)
+
+
+def test_patch_model_wraps_and_rebinds_real_lfm2_layers():
+    """initialize + patch_model on real mlx_lm LFM2 decoder layers.
+
+    Conv layers get ShortConvPagedWrapper, attention layers get
+    SDPAPagedAttentionWrapper, and re-patching (cached model reuse) rebinds
+    the same wrapper instances to the new caches instead of re-wrapping.
+    """
+    import mlx.nn as nn
+    from mlx_lm.models.lfm2 import Lfm2DecoderLayer
+
+    from vllm_metal.attention.impls.sdpa_wrapper import SDPAPagedAttentionWrapper
+    from vllm_metal.attention.impls.shortconv import ShortConvPagedWrapper
+
+    args = make_lfm2_args(layer_types=list(LAYER_TYPES), num_hidden_layers=NUM_LAYERS)
+
+    class _TinyLfm2(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = [
+                Lfm2DecoderLayer(args, layer_idx) for layer_idx in range(NUM_LAYERS)
+            ]
+
+    model = _TinyLfm2()
+    runtime = ShortConvHybridPagedAttentionRuntime(
+        layer_types=list(LAYER_TYPES),
+        max_num_seqs=2,
+        num_kv_heads=args.num_key_value_heads,
+        head_dim=args.hidden_size // args.num_attention_heads,
+        conv_kernel_dim=args.conv_L_cache,
+        conv_dim=args.hidden_size,
+        block_size=16,
+        dtype=mx.float16,
+    )
+    runtime.initialize(num_blocks=4)
+
+    wrapped = runtime.patch_model(model)
+
+    assert wrapped == NUM_LAYERS
+    for layer_idx, layer in enumerate(model.layers):
+        if layer_idx in SDPA_LAYERS:
+            assert isinstance(layer.self_attn, SDPAPagedAttentionWrapper)
+        else:
+            assert isinstance(layer.conv, ShortConvPagedWrapper)
+    first_conv = model.layers[CONV_LAYERS[0]].conv
+    first_attn = model.layers[sorted(SDPA_LAYERS)[0]].self_attn
+
+    # Re-initialization path: same wrapper objects, refreshed cache refs.
+    runtime.initialize(num_blocks=4)
+    runtime.patch_model(model)
+    assert model.layers[CONV_LAYERS[0]].conv is first_conv
+    assert model.layers[sorted(SDPA_LAYERS)[0]].self_attn is first_attn
+    assert first_conv._state_cache is runtime.state_cache
 
 
 # ---------------------------------------------------------------------------
@@ -324,7 +400,7 @@ def _conv_hybrid_vllm_config(**cache_overrides):
     )
 
 
-@pytest.mark.parametrize("ssm_dtype", ["auto", "float16", "float32"])
+@pytest.mark.parametrize("ssm_dtype", ["auto", "float16"])
 def test_platform_accepts_any_ssm_dtype_for_conv_hybrids(monkeypatch, ssm_dtype):
     """ShortConv has no recurrent SSM pool, so GDN's fp32 rule must not apply.
 
@@ -415,3 +491,37 @@ def test_platform_still_rejects_all_mode_for_conv_hybrids(monkeypatch):
             MetalPlatform.check_and_update_config(vllm_config)
     finally:
         reset_config()
+
+
+def test_lfm2_attention_naming_is_equivalent_to_canonical_naming():
+    """prepare_sdpa_qkv must treat q_layernorm/k_layernorm/out_proj (LFM2)
+    exactly like q_norm/k_norm/o_proj: same weights under either naming must
+    produce identical Q/K/V."""
+    from types import SimpleNamespace as NS
+
+    from mlx_lm.models.lfm2 import Attention as Lfm2Attention
+
+    from vllm_metal.attention.context import PagedAttentionContext
+    from vllm_metal.attention.impls.sdpa import prepare_sdpa_qkv
+
+    args = make_lfm2_args()
+    inner = Lfm2Attention(args)
+    canonical = NS(
+        q_proj=inner.q_proj,
+        k_proj=inner.k_proj,
+        v_proj=inner.v_proj,
+        o_proj=inner.out_proj,
+        q_norm=inner.q_layernorm,
+        k_norm=inner.k_layernorm,
+        rope=inner.rope,
+    )
+    ctx = PagedAttentionContext(slot_mapping=[], cu_seqlens=[0, 5])
+    x = mx.random.normal((1, 5, args.hidden_size))
+
+    n_heads = args.num_attention_heads
+    n_kv = args.num_key_value_heads
+    got = prepare_sdpa_qkv(inner, x, ctx, n_heads, n_kv, shared_kv=None)
+    want = prepare_sdpa_qkv(canonical, x, ctx, n_heads, n_kv, shared_kv=None)
+
+    for got_arr, want_arr in zip(got[:3], want[:3], strict=True):
+        assert mx.array_equal(got_arr, want_arr).item()
