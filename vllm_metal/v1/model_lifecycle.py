@@ -121,6 +121,32 @@ class LoadedGenerationModel:
     model_args: dict[str, Any]
 
 
+def _normalize_model_args(model_args: dict[str, Any]) -> dict[str, Any]:
+    """Fill config fields older checkpoints omit, mirroring HF's own
+    normalization, so every downstream consumer reads one canonical dict.
+
+    Original-release LFM2 checkpoints (e.g. ``LiquidAI/LFM2-1.2B``) predate
+    ``layer_types`` and carry only ``full_attn_idxs``; HF's
+    ``Lfm2Config.__post_init__`` synthesizes ``layer_types`` from it, and
+    mlx_lm builds layers from ``full_attn_idxs`` directly.  Without this,
+    those checkpoints silently classify as dense models and their conv
+    layers run unwrapped.  ``conv_L_cache`` gates the synthesis to the LFM2
+    family.
+    """
+    if (
+        model_args.get("layer_types") is None
+        and model_args.get("full_attn_idxs") is not None
+        and "conv_L_cache" in model_args
+    ):
+        full = set(model_args["full_attn_idxs"])
+        model_args = dict(model_args)
+        model_args["layer_types"] = [
+            "full_attention" if i in full else "conv"
+            for i in range(int(model_args["num_hidden_layers"]))
+        ]
+    return model_args
+
+
 class ModelLifecycle:
     def __init__(
         self,
@@ -568,13 +594,13 @@ class ModelLifecycle:
 
         text_config = model_values.get("text_config")
         if text_config is None:
-            return model_values
+            return _normalize_model_args(model_values)
 
         merged_values = dict(model_values)
         text_values = self._config_to_mapping(text_config)
         for key, value in text_values.items():
             merged_values.setdefault(key, value)
-        return merged_values
+        return _normalize_model_args(merged_values)
 
     def _config_to_mapping(self, config: Any) -> dict[str, Any]:
         if isinstance(config, Mapping):

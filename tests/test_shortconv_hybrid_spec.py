@@ -117,6 +117,53 @@ def test_gdn_hybrid_does_not_classify_as_conv_hybrid():
     assert not runner.is_conv_hybrid
 
 
+def test_original_lfm2_config_without_layer_types_classifies_as_conv_hybrid():
+    """Original-release LFM2 checkpoints carry only full_attn_idxs.
+
+    ``LiquidAI/LFM2-1.2B``'s config has ``layer_types: null`` and
+    ``full_attn_idxs: [2, 5, 8, 10, 12, 14]``; HF synthesizes layer_types
+    from it and mlx_lm builds layers from it directly, so vllm-metal must
+    not silently classify these checkpoints as dense.  The synthesis runs
+    once, where model_args are extracted from the loaded model.
+    """
+    runner = make_stub_runner(model_args={})
+    lifecycle = ModelLifecycle(runner, runner._model_adapter)
+    old_style_model = SimpleNamespace(
+        args={
+            "layer_types": None,
+            "full_attn_idxs": [2, 4],
+            "conv_L_cache": CONV_L_CACHE,
+            "hidden_size": HIDDEN,
+            "num_hidden_layers": NUM_LAYERS,
+        }
+    )
+
+    runner.model_args = lifecycle._extract_model_args(old_style_model, is_vlm=False)
+
+    assert runner.model_args["layer_types"] == [
+        "conv",
+        "conv",
+        "full_attention",
+        "conv",
+        "full_attention",
+    ]
+    assert runner.is_conv_hybrid
+    lifecycle._install_hybrid_attention_dims(runner.model_args)
+    assert runner.conv_layer_indices == (0, 1, 3)
+
+
+def test_full_attn_idxs_without_conv_l_cache_is_not_conv_hybrid():
+    """The synthesis is gated to the LFM2 family by conv_L_cache."""
+    runner = make_stub_runner(model_args={})
+    lifecycle = ModelLifecycle(runner, runner._model_adapter)
+    dense_model = SimpleNamespace(args={"layer_types": None, "full_attn_idxs": [0, 1]})
+
+    runner.model_args = lifecycle._extract_model_args(dense_model, is_vlm=False)
+
+    assert runner.model_args["layer_types"] is None
+    assert not runner.is_conv_hybrid
+
+
 # ---------------------------------------------------------------------------
 # Dims derivation + KV cache spec
 # ---------------------------------------------------------------------------
