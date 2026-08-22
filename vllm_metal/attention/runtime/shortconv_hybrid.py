@@ -8,11 +8,9 @@ Handles models like LFM2/LFM2.5 where ``config.layer_types`` mixes
 SDPA layers use the native Metal SDPA kernel (same as
 ``HybridPagedAttentionRuntime``).  Conv layers use MLX-native state
 management via ``ShortConvPagedWrapper`` against a ``ShortConvStateCache``,
-driven by the same per-request slot lifecycle GDN hybrids use in
-``mamba_cache_mode="none"`` (``HybridGDNStateManager``).
-
-Conv hybrids run none mode only; prefix caching for them is rejected at
-config time until the align-mode conv state work lands.
+driven by the same state-manager pair GDN hybrids use: per-request slots in
+``mamba_cache_mode="none"`` (``HybridGDNStateManager``), block-id-keyed
+slabs in ``"align"`` (``AlignGDNStateManager``, prefix caching).
 """
 
 from __future__ import annotations
@@ -38,13 +36,9 @@ class ShortConvHybridPagedAttentionRuntime(StateHybridRuntimeBase):
 
     SDPA layers: paged Metal kernel (via SDPAPagedAttentionWrapper)
     Conv layers: MLX-native state management (via ShortConvPagedWrapper)
-
-    Conv state is not block-keyed yet, so only ``none`` mode is supported;
-    align-mode conv caching would add the pooling layout and ``copy_blocks``
-    the GDN state cache already carries.
     """
 
-    SUPPORTED_MAMBA_CACHE_MODES = ("none",)
+    SUPPORTED_MAMBA_CACHE_MODES = ("none", "align")
     STATE_WRAPPER = ShortConvPagedWrapper
     STATE_LAYER_DETECTOR = staticmethod(is_shortconv)
     STATE_LAYER_LABEL = "ShortConv"
@@ -63,7 +57,7 @@ class ShortConvHybridPagedAttentionRuntime(StateHybridRuntimeBase):
         # Common
         block_size: int,
         dtype: mx.Dtype,
-        # Scheduler-side mamba caching strategy; conv hybrids are none-only.
+        # Scheduler-side mamba caching strategy ("none" or "align").
         mamba_cache_mode: str = "none",
         # TurboQuant (SDPA layers only)
         turboquant: bool = False,

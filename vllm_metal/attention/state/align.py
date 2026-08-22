@@ -34,15 +34,24 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 
 from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
 
 
 class AlignGDNStateManager:
-    """Drive block-indexed GDN state for align-mode prefix caching."""
+    """Drive block-indexed state (GDN or ShortConv) for align-mode prefix
+    caching.  The cache is addressed purely through the shared slot-pool
+    surface (ensure_capacity / zero_slots / copy_slots /
+    layers_for_group_ordinal / apply_pending_states / updated_state_arrays),
+    so both state families run through this one manager."""
 
-    def __init__(self, state_cache: GDNPagedStateCache, block_size: int) -> None:
+    def __init__(
+        self,
+        state_cache: GDNPagedStateCache | ShortConvStateCache,
+        block_size: int,
+    ) -> None:
         self._state_cache = state_cache
         self._block_size = block_size
         self._needs_materialize = False

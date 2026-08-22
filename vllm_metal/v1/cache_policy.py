@@ -364,6 +364,11 @@ class ModelCachePolicy:
             MambaAttentionBackendEnum.GDN_ATTN,
         )
 
+    def _state_layer_suffix(self) -> str:
+        """Canonical attribute suffix upstream vLLM's models use for this
+        family's state layers (``layers.{i}.{suffix}`` in KV cache specs)."""
+        return "conv" if self._runner.is_conv_hybrid else "linear_attn"
+
     def _state_layer_spec(self) -> MambaSpec:
         """Build the scheduler-visible spec for one per-request state layer."""
         shapes, dtypes, mamba_type = self._state_layer_geometry()
@@ -412,9 +417,7 @@ class ModelCachePolicy:
                 self._runner.has_state_layers
                 and layer_idx not in self._runner.sdpa_layer_indices
             ):
-                # Same canonical suffixes upstream vLLM's models use for their
-                # state layers' KV cache specs.
-                suffix = "conv" if self._runner.is_conv_hybrid else "linear_attn"
+                suffix = self._state_layer_suffix()
                 specs[f"layers.{layer_idx}.{suffix}"] = self._state_layer_spec()
             elif use_turboquant:
                 layer_name = f"layers.{layer_idx}.self_attn"
@@ -650,21 +653,19 @@ class ModelCachePolicy:
         block_size = kv_cache_config.kv_cache_groups[
             group_index
         ].kv_cache_spec.block_size
-        # Align mode keys GDN state slabs by scheduler block id.  The engine
-        # stripes same-spec linear layers across several mamba cache groups
-        # (each group hands every request one block-table row), so the runtime
-        # needs all those groups plus each linear layer's group ordinal.  None
-        # mode keeps a private per-request slot pool and ignores the
-        # scheduler's mamba groups.
+        # Align mode keys state slabs (GDN or ShortConv) by scheduler block
+        # id.  The engine stripes same-spec state layers across several mamba
+        # cache groups (each group hands every request one block-table row),
+        # so the runtime needs all those groups plus each state layer's group
+        # ordinal.  None mode keeps a private per-request slot pool and
+        # ignores the scheduler's mamba groups.
         state_group_indices: tuple[int, ...] = ()
         layer_group_ordinals: list[int] | None = None
         layer_pool_ordinals: list[int] | None = None
-        if (
-            self._runner.cache_config.mamba_cache_mode == "align"
-            and self._runner.is_gdn_hybrid
-        ):
+        if self._runner.cache_config.mamba_cache_mode == "align":
+            state_suffix = self._state_layer_suffix()
             cache_idx_by_name = {
-                f"layers.{layer_idx}.linear_attn": cache_idx
+                f"layers.{layer_idx}.{state_suffix}": cache_idx
                 for cache_idx, layer_idx in enumerate(
                     layer_idx
                     for layer_idx in range(self._runner.num_layers)
@@ -686,13 +687,13 @@ class ModelCachePolicy:
                         raise RuntimeError(
                             f"mamba cache group {mamba_group_id} holds "
                             f"{layer_name!r}, which is not one of the "
-                            "runner's linear-attention layers"
+                            "runner's state layers"
                         )
                     layer_group_ordinals[cache_idx] = ordinal
             if -1 in layer_group_ordinals:
                 raise RuntimeError(
                     "scheduler mamba cache groups do not cover every "
-                    "linear-attention layer"
+                    "state layer"
                 )
             # Physical pools follow the engine's tensor sharing: each
             # kv_cache_tensor is shared by one layer from each cache group, so
@@ -1337,9 +1338,9 @@ class WorkerCachePlanner:
             )
 
     def _hybrid_align_state_bytes_per_block(self) -> int:
-        """Per-pool-block linear-state bytes under align-mode prefix caching."""
+        """Per-pool-block state bytes under align-mode prefix caching."""
         runner = self._worker.model_runner
-        if not runner.is_gdn_hybrid:
+        if not runner.has_state_layers:
             return 0
         if runner.cache_config.mamba_cache_mode != "align":
             return 0
@@ -1350,7 +1351,7 @@ class WorkerCachePlanner:
     def _hybrid_align_growth_bytes_per_block(self) -> int:
         """One old physical state pool retained during align-cache growth."""
         runner = self._worker.model_runner
-        if not runner.is_gdn_hybrid:
+        if not runner.has_state_layers:
             return 0
         if runner.cache_config.mamba_cache_mode != "align":
             return 0

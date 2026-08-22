@@ -217,10 +217,9 @@ def test_runtime_rejects_unknown_layer_types():
         )
 
 
-@pytest.mark.parametrize("mode", ["align", "all"])
-def test_runtime_rejects_state_caching_modes(mode: str):
-    """Conv hybrids run none mode; block-keyed conv state is not implemented."""
-    with pytest.raises(NotImplementedError, match="only 'none'"):
+def test_runtime_rejects_all_caching_mode():
+    """Conv hybrids run none or align mode; 'all' is not implemented."""
+    with pytest.raises(NotImplementedError, match="'none' and 'align'"):
         ShortConvHybridPagedAttentionRuntime(
             layer_types=list(LAYER_TYPES),
             max_num_seqs=2,
@@ -230,7 +229,7 @@ def test_runtime_rejects_state_caching_modes(mode: str):
             conv_dim=HIDDEN,
             block_size=16,
             dtype=mx.float16,
-            mamba_cache_mode=mode,
+            mamba_cache_mode="all",
         )
 
 
@@ -299,16 +298,39 @@ def test_platform_accepts_any_ssm_dtype_for_conv_hybrids(monkeypatch, ssm_dtype)
         reset_config()
 
 
-def test_platform_rejects_prefix_caching_for_conv_hybrids(monkeypatch):
-    """Conv state is not block-keyed yet, so APC would reuse stale state."""
+def test_platform_accepts_align_prefix_caching_for_conv_hybrids(monkeypatch):
+    """Conv state is block-keyed now: align-mode APC must pass config checks.
+
+    This is the default configuration — upstream vLLM enables prefix caching
+    for hybrid generative models and resolves mamba_cache_mode to "align" —
+    so a plain ``vllm serve`` of an LFM2 model exercises exactly this path.
+    """
     from vllm_metal.config import reset_config
     from vllm_metal.platform import MetalPlatform
 
     monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
     reset_config()
     try:
-        vllm_config = _conv_hybrid_vllm_config(enable_prefix_caching=True)
-        with pytest.raises(NotImplementedError, match="conv hybrid"):
+        vllm_config = _conv_hybrid_vllm_config(
+            enable_prefix_caching=True, mamba_cache_mode="align"
+        )
+        MetalPlatform.check_and_update_config(vllm_config)
+    finally:
+        reset_config()
+
+
+def test_platform_still_rejects_all_mode_for_conv_hybrids(monkeypatch):
+    """mamba_cache_mode='all' stays rejected for every hybrid state family."""
+    from vllm_metal.config import reset_config
+    from vllm_metal.platform import MetalPlatform
+
+    monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+    reset_config()
+    try:
+        vllm_config = _conv_hybrid_vllm_config(
+            enable_prefix_caching=True, mamba_cache_mode="all"
+        )
+        with pytest.raises(NotImplementedError, match="all"):
             MetalPlatform.check_and_update_config(vllm_config)
     finally:
         reset_config()

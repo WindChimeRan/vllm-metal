@@ -102,12 +102,15 @@ class ShortConvPagedWrapper(nn.Module):
             raise RuntimeError("ShortConv wrapper requires cu_seqlens in context")
 
         num_requests = len(cu_seqlens) - 1
-        # Conv hybrids run mamba_cache_mode="none", whose contract is the flat
-        # per-request slot mapping (align mode's per-group mappings arrive with
-        # conv prefix caching).
-        slot_ids = ctx.gdn_slot_mapping
-        if slot_ids is None:
-            raise RuntimeError("ShortConv wrapper requires gdn_slot_mapping in context")
+        # Align mode (prefix caching) hands each mamba cache group its own
+        # block-id mapping; none mode hands one flat per-request slot mapping.
+        if ctx.gdn_group_slot_mappings is not None:
+            ordinal = self._state_cache.layer_group_ordinal(self._state_cache_idx)
+            slot_ids = ctx.gdn_group_slot_mappings[ordinal]
+        elif ctx.gdn_slot_mapping is not None:
+            slot_ids = ctx.gdn_slot_mapping
+        else:
+            raise RuntimeError("ShortConv wrapper requires a slot mapping in context")
         if len(slot_ids) != num_requests:
             raise RuntimeError("ShortConv wrapper requires one slot per request")
         if len(set(slot_ids)) != len(slot_ids):
@@ -126,8 +129,13 @@ class ShortConvPagedWrapper(nn.Module):
         # the forward, with no pending-state staging.  This is only sound while
         # every forward's tokens are committed — conv hybrids reject
         # speculative decoding (whose rejected drafts would need state
-        # rollback) and none-mode never replays a step.  Revisit if either
-        # constraint is lifted.
+        # rollback), and neither none mode nor align mode ever replays a step
+        # (an align preemption restarts from zero-init or a checkpoint, not
+        # from partial state).  Revisit if the SD constraint is lifted.
+        #
+        # All writes go through write_conv_rows (the native in-place scatter):
+        # under align-mode striping several layers alias one physical pool,
+        # and MLX indexed assignment would silently copy the whole pool.
         inner = self._inner
         state_cache = self._state_cache
         cache_idx = self._state_cache_idx
@@ -139,20 +147,18 @@ class ShortConvPagedWrapper(nn.Module):
         # Pure-decode fast path: every segment is a single token, so one
         # batched gather / conv / scatter replaces the per-request Python
         # loop (O(B) kernel launches per layer per step otherwise).
-        if state.num_decode_requests == num_requests and state.cu_seqlens == list(
-            range(num_requests + 1)
-        ):
+        if state.num_decode_requests == num_requests:
             slots_arr = mx.array(state.slot_ids, dtype=mx.int32)
             states = pool[slots_arr]  # [B, K-1, D]
             conv_input = mx.concatenate(
                 [states, bx.reshape(num_requests, 1, -1)], axis=1
             )
-            pool[slots_arr] = conv_input[:, 1:, :]
-            state_cache.conv_states[cache_idx] = pool
+            state_cache.write_conv_rows(cache_idx, conv_input[:, 1:, :], slots_arr)
             conv_out = inner.conv(conv_input)[:, -1:, :]
             return conv_out.reshape(1, num_requests, -1)
 
         conv_outputs: list[mx.array] = []
+        new_states: list[mx.array] = []
         for req_idx in range(num_requests):
             slot = state.slot_ids[req_idx]
             start = state.cu_seqlens[req_idx]
@@ -163,12 +169,19 @@ class ShortConvPagedWrapper(nn.Module):
             conv_state = pool[slot : slot + 1]
             conv_input = mx.concatenate([conv_state, seg_bx], axis=1)
 
-            # Keep the last L_cache - 1 rows of Bx as the new state.
-            pool[slot : slot + 1] = conv_input[:, -n_keep:, :]
+            # Keep the last L_cache - 1 rows of Bx as the new state.  Each
+            # request reads only its own slot, so batching every write into
+            # one scatter after the loop cannot change what another segment
+            # reads.
+            new_states.append(conv_input[:, -n_keep:, :])
 
             conv_out = inner.conv(conv_input)
             # Take only the output tokens (not the conv state prefix).
             conv_outputs.append(conv_out[:, -(end - start) :, :])
 
-        state_cache.conv_states[cache_idx] = pool
+        state_cache.write_conv_rows(
+            cache_idx,
+            mx.concatenate(new_states, axis=0),
+            mx.array(state.slot_ids, dtype=mx.int32),
+        )
         return mx.concatenate(conv_outputs, axis=1)

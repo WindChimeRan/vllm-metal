@@ -476,25 +476,16 @@ class MetalPlatform(Platform):
                         "--mamba-ssm-cache-dtype float32 because recurrent "
                         "state is stored in fp32."
                     )
-            # Conv hybrids (LFM2 ShortConv) keep their state in a private
-            # per-request pool; align-mode block-keyed conv state is not
-            # implemented, so prefix caching would silently reuse stale state.
-            if "conv" in hf_layer_types and cache_config.enable_prefix_caching:
-                raise NotImplementedError(
-                    "Prefix caching for conv hybrid models (LFM2 ShortConv) is "
-                    "not supported on Metal yet; align-mode conv state caching "
-                    "is not implemented. Re-run with --no-enable-prefix-caching."
-                )
             if cache_config.enable_prefix_caching and not config.use_paged_attention:
                 raise NotImplementedError(
-                    "Prefix caching for hybrid GDN models requires paged "
+                    "Prefix caching for hybrid state models requires paged "
                     "attention on Metal (VLLM_METAL_USE_PAGED_ATTENTION=1); "
                     "the non-paged MLX path has no block-indexed state to "
                     "restore from."
                 )
             if cache_config.mamba_cache_mode == "all":
                 raise NotImplementedError(
-                    "mamba_cache_mode='all' is not supported for hybrid GDN "
+                    "mamba_cache_mode='all' is not supported for hybrid state "
                     "models on Metal (nor upstream, which falls back to "
                     "'align' for models without SupportsMambaPrefixCaching). "
                     "Use align mode: --enable-prefix-caching resolves to it."
@@ -504,7 +495,7 @@ class MetalPlatform(Platform):
                 and vllm_config.speculative_config is not None
             ):
                 raise NotImplementedError(
-                    "Prefix caching for hybrid GDN models on Metal does not "
+                    "Prefix caching for hybrid state models on Metal does not "
                     "support speculative decoding yet: draft-state rollback "
                     "across mamba state blocks (num_speculative_blocks) is "
                     "not implemented. Disable one of the two."
