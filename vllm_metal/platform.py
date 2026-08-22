@@ -476,6 +476,23 @@ class MetalPlatform(Platform):
                         "--mamba-ssm-cache-dtype float32 because recurrent "
                         "state is stored in fp32."
                     )
+            # The Metal state pools allocate conv state at the model/KV
+            # dtype and never read --mamba-cache-dtype; accepting a non-auto
+            # value would silently produce a different dtype than requested.
+            if cache_config.mamba_cache_dtype != "auto":
+                raise NotImplementedError(
+                    "vllm-metal ignores --mamba-cache-dtype (state pools "
+                    "allocate conv state at the model dtype); only 'auto' is "
+                    "supported."
+                )
+            # TurboQuant sizing, spec building, and block-size interplay are
+            # validated for GDN hybrids only (test_turboquant_hybrid_sizing);
+            # reject the conv-hybrid combination until it is.
+            if "conv" in hf_layer_types and config.turboquant:
+                raise NotImplementedError(
+                    "TurboQuant is not validated for conv hybrid models "
+                    "(LFM2 ShortConv) on Metal."
+                )
             if cache_config.enable_prefix_caching and not config.use_paged_attention:
                 raise NotImplementedError(
                     "Prefix caching for hybrid state models requires paged "

@@ -287,6 +287,7 @@ def _conv_hybrid_vllm_config(**cache_overrides):
         "kv_cache_dtype_skip_layers": [],
         "enable_prefix_caching": True,
         "mamba_cache_mode": "none",
+        "mamba_cache_dtype": "auto",
         "mamba_ssm_cache_dtype": "float32",
     }
     cache_config.update(cache_overrides)
@@ -362,6 +363,39 @@ def test_platform_accepts_align_prefix_caching_for_conv_hybrids(monkeypatch):
             enable_prefix_caching=True, mamba_cache_mode="align"
         )
         MetalPlatform.check_and_update_config(vllm_config)
+    finally:
+        reset_config()
+
+
+def test_platform_rejects_non_auto_mamba_cache_dtype(monkeypatch):
+    """The state pools ignore --mamba-cache-dtype; non-auto must fail loudly."""
+    from vllm_metal.config import reset_config
+    from vllm_metal.platform import MetalPlatform
+
+    monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+    reset_config()
+    try:
+        vllm_config = _conv_hybrid_vllm_config(mamba_cache_dtype="float32")
+        with pytest.raises(NotImplementedError, match="mamba-cache-dtype"):
+            MetalPlatform.check_and_update_config(vllm_config)
+    finally:
+        reset_config()
+
+
+def test_platform_rejects_turboquant_for_conv_hybrids(monkeypatch):
+    """TurboQuant x conv hybrid is unvalidated; reject rather than silently run."""
+    from vllm_metal.config import reset_config
+    from vllm_metal.platform import MetalPlatform
+
+    monkeypatch.setenv("VLLM_METAL_USE_PAGED_ATTENTION", "1")
+    reset_config()
+    try:
+        vllm_config = _conv_hybrid_vllm_config()
+        # TurboQuant arrives via --additional-config, which the platform
+        # hook applies onto the Metal config before the hybrid checks.
+        vllm_config.additional_config = {"turboquant": True}
+        with pytest.raises(NotImplementedError, match="TurboQuant"):
+            MetalPlatform.check_and_update_config(vllm_config)
     finally:
         reset_config()
 

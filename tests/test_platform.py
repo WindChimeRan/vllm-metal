@@ -1152,6 +1152,7 @@ class TestMetalPlatform:
                 SimpleNamespace(
                     block_size=None,
                     kv_cache_dtype_skip_layers=[],
+                    mamba_cache_dtype="auto",
                     enable_prefix_caching=True,
                     mamba_cache_mode="none",
                     mamba_ssm_cache_dtype="float32",
@@ -1164,6 +1165,7 @@ class TestMetalPlatform:
                 SimpleNamespace(
                     block_size=None,
                     kv_cache_dtype_skip_layers=[],
+                    mamba_cache_dtype="auto",
                     enable_prefix_caching=False,
                     mamba_cache_mode="all",
                     mamba_ssm_cache_dtype="float32",
@@ -1176,6 +1178,7 @@ class TestMetalPlatform:
                 SimpleNamespace(
                     block_size=None,
                     kv_cache_dtype_skip_layers=[],
+                    mamba_cache_dtype="auto",
                     enable_prefix_caching=True,
                     mamba_cache_mode="align",
                     mamba_ssm_cache_dtype="float32",
@@ -1221,6 +1224,7 @@ class TestMetalPlatform:
                 SimpleNamespace(
                     block_size=None,
                     kv_cache_dtype_skip_layers=[],
+                    mamba_cache_dtype="auto",
                     enable_prefix_caching=True,
                     mamba_cache_mode="align",
                     mamba_ssm_cache_dtype="float32",
