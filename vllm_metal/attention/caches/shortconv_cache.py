@@ -54,8 +54,8 @@ class ShortConvStateCache:
         max_seqs: int,
         conv_kernel_dim: int,
         conv_dim: int,
-        initial_seqs: int | None = None,
-        dtype: mx.Dtype = mx.float16,
+        initial_seqs: int,
+        dtype: mx.Dtype,
     ) -> None:
         if dtype not in (mx.float16, mx.bfloat16, mx.float32):
             raise ValueError(f"Unsupported dtype for ShortConv state cache: {dtype}")
@@ -63,8 +63,6 @@ class ShortConvStateCache:
             raise ValueError("max_seqs must be non-negative")
         if conv_kernel_dim < 2:
             raise ValueError("conv_kernel_dim must be at least 2 to carry state")
-        if initial_seqs is None:
-            initial_seqs = max_seqs
         if initial_seqs < 0 or initial_seqs > max_seqs:
             raise ValueError(
                 "initial_seqs must be between 0 and max_seqs "

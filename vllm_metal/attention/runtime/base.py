@@ -172,24 +172,28 @@ class StateHybridRuntimeBase(PagedAttentionRuntimeBase):
         }
 
         def wrap_layer(layer_idx: int, attn: Any) -> Any:
+            # Direct indexing, not .get(k, k): a layer whose module-shape
+            # detection disagrees with the config-derived index sets must
+            # KeyError at patch time, not silently mis-index a cache.
+
             if isinstance(attn, SDPAPagedAttentionWrapper):
                 # Already patched (cached model reuse) — refresh cache refs.
-                cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
+                cache_idx = sdpa_cache_map[layer_idx]
                 attn.rebind_cache(kv_cache, self._block_size, cache_idx=cache_idx)
                 return attn
             if isinstance(attn, self.STATE_WRAPPER):
                 # Already patched — refresh state cache ref.
-                cache_idx = state_cache_map.get(layer_idx, layer_idx)
+                cache_idx = state_cache_map[layer_idx]
                 object.__setattr__(attn, "_state_cache_idx", cache_idx)
                 object.__setattr__(attn, "_state_cache", state_cache)
                 return attn
             if is_sdpa(attn):
-                cache_idx = sdpa_cache_map.get(layer_idx, layer_idx)
+                cache_idx = sdpa_cache_map[layer_idx]
                 return SDPAPagedAttentionWrapper(
                     attn, layer_idx, kv_cache, self._block_size, cache_idx=cache_idx
                 )
             if type(self).STATE_LAYER_DETECTOR(attn):
-                cache_idx = state_cache_map.get(layer_idx, layer_idx)
+                cache_idx = state_cache_map[layer_idx]
                 return self.STATE_WRAPPER(attn, cache_idx, state_cache)
             raise RuntimeError(
                 f"{type(self).__name__} patch_model: layer {layer_idx} attention "
