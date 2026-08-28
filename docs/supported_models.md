@@ -52,11 +52,10 @@ Native multimodal support currently targets image-only vision-language requests 
 `Automatic Prefix Cache` is the default behavior when you do not pass
 `--enable-prefix-caching`. Since
 [#283](https://github.com/vllm-project/vllm-metal/pull/283), unified paged-KV
-models reuse shared prefixes by default. Upstream vLLM keeps it off for
-hybrid/Mamba models; hybrid GDN models opt in with `--enable-prefix-caching`
-since [#584](https://github.com/vllm-project/vllm-metal/pull/584), so those rows
-are `🔵`. These values describe default engine behavior, not exhaustive
-per-model benchmarking on Metal.
+models reuse shared prefixes by default. As of vLLM 0.28.0, hybrid/Mamba
+models do too; hybrid GDN support remains experimental (`🔵`). These values
+describe default engine behavior, not exhaustive per-model benchmarking on
+Metal.
 
 HF AWQ checkpoints load through mlx-lm's `_transform_awq_weights` repack, with an
 entry-point preflight that normalizes AutoAWQ aliases (`w_bit`, `q_group_size`,
