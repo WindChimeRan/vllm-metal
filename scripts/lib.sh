@@ -16,6 +16,29 @@ section() {
   echo "=== $* ==="
 }
 
+validate_vllm_release_tag() {
+  local release_tag="$1"
+  if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+    error "Invalid vLLM release tag: ${release_tag}"
+    return 1
+  fi
+}
+
+# Read the upstream vLLM release paired with this source revision.
+read_vllm_release_tag() {
+  local path="${1:-.github/vllm-release-tag.commit}"
+  local release_tag
+
+  if [ ! -r "$path" ]; then
+    error "Missing vLLM release tag file: ${path}"
+    return 1
+  fi
+
+  release_tag=$(tr -d '[:space:]' < "$path")
+  validate_vllm_release_tag "$release_tag" || return 1
+  printf '%s\n' "$release_tag"
+}
+
 # Check if running on Apple Silicon
 is_apple_silicon() {
   [ "$(uname -m)" = "arm64" ]

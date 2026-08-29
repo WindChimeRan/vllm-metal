@@ -3,6 +3,12 @@ name: Build and Release
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 0.4.0 or 0.4.0rc1 (rc publishes a prerelease)'
+        required: true
+        type: string
 
 jobs:
   build-and-release:
@@ -19,7 +25,31 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Validate stable release
+      if: github.event_name == 'workflow_dispatch'
+      run: |
+        if [[ ! "$RELEASE_REF" =~ ^releases/v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+          echo "::error::Stable releases must run from releases/vX.Y.Z, got ${RELEASE_REF}."
+          exit 1
+        fi
+        branch_version="${BASH_REMATCH[1]}"
+        branch_pattern="${branch_version//./\\.}"
+        if [[ ! "$RELEASE_VERSION" =~ ^${branch_pattern}(rc[0-9]+|\.post[0-9]+)?$ ]]; then
+          echo "::error::Version ${RELEASE_VERSION} does not belong to ${RELEASE_REF}."
+          exit 1
+        fi
+      env:
+        RELEASE_REF: ${{ github.ref_name }}
+        RELEASE_VERSION: ${{ inputs.version }}
+
     - name: Build and Release
-      run: ./scripts/release.sh
+      run: |
+        if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+          ./scripts/release.sh --channel stable --version "$RELEASE_VERSION"
+        else
+          ./scripts/release.sh --channel dev
+        fi
       env:
         GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        EVENT_NAME: ${{ github.event_name }}
+        RELEASE_VERSION: ${{ inputs.version }}

@@ -34,9 +34,19 @@ If you run `source ~/.venv-vllm-metal/bin/activate`, the `vllm` CLI becomes avai
 
 For how to use the `vllm` CLI, please refer to the [official vLLM guide](https://docs.vllm.ai/en/latest/cli/).
 
+Development channel (default):
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
+
+Stable channel:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash -s -- --stable
+```
+
+`pip install vllm-metal` is not supported. Use one of the commands above.
 
 ## Reinstallation and Update
 
