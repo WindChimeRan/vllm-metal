@@ -413,7 +413,7 @@ class Gemma4MTPAssistantLoader:
         # Keep MLX model imports lazy so config detection and spec-decode
         # metadata tests do not construct Metal-backed modules just by
         # importing this owner.
-        from vllm_metal.v1.gemma4_mtp_model import (
+        from vllm_metal.spec_decode.gemma4.model import (
             Gemma4MTPAssistantModel,
             Gemma4MTPAssistantModelArgs,
         )

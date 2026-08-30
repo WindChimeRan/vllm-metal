@@ -761,7 +761,7 @@ def test_loader_passes_revision_and_keeps_cache_keys_separate() -> None:
 
 
 def test_model_args_preserve_text_config_vocab_size() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import Gemma4MTPAssistantModelArgs
+    from vllm_metal.spec_decode.gemma4.model import Gemma4MTPAssistantModelArgs
 
     args = Gemma4MTPAssistantModelArgs(
         vocab_size=262144,
@@ -774,7 +774,7 @@ def test_model_args_preserve_text_config_vocab_size() -> None:
 
 
 def test_model_args_do_not_mutate_source_text_config() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import Gemma4MTPAssistantModelArgs
+    from vllm_metal.spec_decode.gemma4.model import Gemma4MTPAssistantModelArgs
 
     text_config: dict[str, object] = {"hidden_size": 256}
 
@@ -790,7 +790,7 @@ def test_model_args_do_not_mutate_source_text_config() -> None:
 
 
 def test_model_rejects_missing_num_hidden_layers() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -805,7 +805,7 @@ def test_model_rejects_missing_num_hidden_layers() -> None:
 
 
 def test_model_rejects_conflicting_num_kv_shared_layers() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -823,7 +823,7 @@ def test_model_rejects_conflicting_num_kv_shared_layers() -> None:
 
 
 def test_model_normalizes_missing_per_layer_input_fields() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -853,7 +853,7 @@ def test_model_rejects_nonzero_per_layer_input_fields(
     field: str,
     value: int,
 ) -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -873,7 +873,7 @@ def test_model_rejects_nonzero_per_layer_input_fields(
 def test_masked_embedding_returns_sparse_top_tokens() -> None:
     import mlx.core as mx
 
-    from vllm_metal.v1.gemma4_mtp_model import Gemma4MTPMaskedEmbedding
+    from vllm_metal.spec_decode.gemma4.model import Gemma4MTPMaskedEmbedding
 
     masked = Gemma4MTPMaskedEmbedding(
         hidden_size=2,
@@ -903,7 +903,7 @@ def test_masked_embedding_returns_sparse_top_tokens() -> None:
 def test_masked_embedding_uses_untied_lm_head_weight() -> None:
     import mlx.core as mx
 
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )

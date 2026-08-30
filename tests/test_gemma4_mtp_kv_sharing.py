@@ -157,7 +157,7 @@ def test_kv_sharing_binding_rejects_missing_target_cache_slot() -> None:
 
 
 def test_runtime_keeps_cached_assistant_model_unpatched() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
@@ -438,7 +438,7 @@ def test_runtime_drafts_k_tokens_by_recurrence() -> None:
 
 
 def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
-    from vllm_metal.v1.gemma4_mtp_model import (
+    from vllm_metal.spec_decode.gemma4.model import (
         Gemma4MTPAssistantModel,
         Gemma4MTPAssistantModelArgs,
     )
