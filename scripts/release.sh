@@ -133,6 +133,9 @@ main() {
     --generate-notes
     --target "$(git rev-parse HEAD)"
   )
+  if [ "$channel" = "stable" ]; then
+    release_args+=(--draft)
+  fi
   if [ "$prerelease" -eq 1 ]; then
     release_args+=(--prerelease)
   fi
