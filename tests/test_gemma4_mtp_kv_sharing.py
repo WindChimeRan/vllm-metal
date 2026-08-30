@@ -266,9 +266,8 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
     captured: dict[str, object] = {}
 
     class AssistantModel:
-        def draft_token_ids(
+        def draft_step(
             self,
-            input_ids,
             *,
             target_hidden_states,
             target_input_embeddings,
@@ -277,7 +276,6 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
         ):
             ctx = get_context()
             assert ctx is not None
-            captured["input_ids"] = input_ids.tolist()
             captured["hidden_states"] = target_hidden_states.tolist()
             captured["embeddings"] = target_input_embeddings.tolist()
             captured["cache"] = target_kv_cache
@@ -288,7 +286,11 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
             assert ctx.kv_groups is not None
             captured["group_slots"] = [group.slot_mapping for group in ctx.kv_groups]
             captured["group_tables"] = [group.block_tables for group in ctx.kv_groups]
-            return mx.array([101, 102], dtype=mx.int32)
+            return mx.array([101, 102], dtype=mx.int32), target_hidden_states
+
+    def embed(input_ids):
+        captured["input_ids"] = input_ids.tolist()
+        return mx.ones((1, input_ids.shape[-1], 4))
 
     layer_types = ("full_attention",)
     runtime = Gemma4MTPAssistantRuntime(
@@ -338,7 +340,8 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
         target_hidden_states=mx.array(
             [[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0], [3.0, 0.0, 0.0, 0.0]]
         ),
-        target_input_embeddings=mx.ones((1, 2, 4)),
+        embed_target_tokens=embed,
+        num_speculative_tokens=1,
     )
 
     assert drafts == [[101], [102]]
@@ -352,6 +355,85 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
     assert captured["block_tables"] == [[0], [0]]
     assert captured["group_slots"] == [[1, 3], [21, 23]]
     assert captured["group_tables"] == [[[0], [0]], [[5], [5]]]
+    assert get_context() is None
+
+
+def test_runtime_drafts_k_tokens_by_recurrence() -> None:
+    # One assistant module, so K tokens come from re-running it on its own
+    # output; a drafted token never enters the KV cache, so every step queries
+    # the same position -- which is what lets one prepare_grouped serve all K.
+    steps: list[dict[str, Any]] = []
+    embedded: list[list[int]] = []
+
+    class AssistantModel:
+        def draft_step(self, *, target_hidden_states, target_kv_cache, **_):
+            ctx = get_context()
+            assert ctx is not None
+            step = len(steps)
+            steps.append(
+                {
+                    "hidden": target_hidden_states.tolist(),
+                    "context_lens": ctx.context_lens,
+                    "offsets": ctx.offsets,
+                }
+            )
+            # Step-indexed ids and feedback so "fed the previous step" is
+            # distinguishable from "fed step 0" or "fed the seed rows".
+            return (
+                mx.array([200 + step, 300 + step], dtype=mx.int32),
+                mx.full((1, 2, 4), float(step + 1)),
+            )
+
+    def embed(input_ids: mx.array) -> mx.array:
+        embedded.append(input_ids.tolist()[0])
+        return mx.zeros((1, input_ids.shape[-1], 4))
+
+    layer_types = ("full_attention",)
+    runtime = Gemma4MTPAssistantRuntime(
+        model_name="/assistant",
+        model=AssistantModel(),
+        metadata=_assistant_metadata(layer_types),
+    )
+    wired = runtime.with_target_kv_sharing(
+        target_metadata=_target_metadata(layer_types),
+        target_kv_cache=_target_cache(num_layers=1),
+        block_size=_BLOCK_SIZE,
+    )
+
+    drafts = wired.propose_draft_token_ids(
+        seeds=(
+            Gemma4MTPDraftSeed(
+                req_id="r0",
+                token_id=7,
+                target_hidden_row=0,
+                target_position=1,
+                block_ids=((0,),),
+            ),
+            Gemma4MTPDraftSeed(
+                req_id="r1",
+                token_id=8,
+                target_hidden_row=1,
+                target_position=3,
+                block_ids=((0,),),
+            ),
+        ),
+        target_hidden_states=mx.array([[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]]),
+        embed_target_tokens=embed,
+        num_speculative_tokens=3,
+    )
+
+    # K tokens per seed, row-major.
+    assert drafts == [[200, 201, 202], [300, 301, 302]]
+    # Step i consumes step i-1's tokens and backbone feedback.
+    assert embedded == [[7, 8], [200, 300], [201, 301]]
+    assert [step["hidden"] for step in steps] == [
+        [[[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]]],
+        [[[1.0] * 4] * 2],
+        [[[2.0] * 4] * 2],
+    ]
+    # The query position never advances, so the context is built once.
+    assert [step["context_lens"] for step in steps] == [[2, 4]] * 3
+    assert [step["offsets"] for step in steps] == [[1, 3]] * 3
     assert get_context() is None
 
 
@@ -416,6 +498,12 @@ def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
         block_size=_BLOCK_SIZE,
     )
 
+    seen_ids: list[list[int]] = []
+
+    def embed(input_ids: mx.array) -> mx.array:
+        seen_ids.append(input_ids.tolist()[0])
+        return mx.ones((1, input_ids.shape[-1], hidden_size))
+
     drafts = wired.propose_draft_token_ids(
         seeds=(
             Gemma4MTPDraftSeed(
@@ -427,12 +515,15 @@ def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
             ),
         ),
         target_hidden_states=mx.ones((1, hidden_size)),
-        target_input_embeddings=mx.ones((1, 1, hidden_size)),
+        embed_target_tokens=embed,
+        num_speculative_tokens=2,
     )
 
+    # K=2 closes the recurrence through the real post_projection feedback and
+    # the real argmax dtype, which K=1 never exercises.
     assert len(drafts) == 1
-    assert len(drafts[0]) == 1
-    assert 0 <= drafts[0][0] < 8
+    assert [0 <= token_id < 8 for token_id in drafts[0]] == [True, True]
+    assert seen_ids == [[1], [drafts[0][0]]]
 
 
 def test_reused_wrapper_rebinds_cache_through_owner_method() -> None:

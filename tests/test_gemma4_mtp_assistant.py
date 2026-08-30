@@ -211,17 +211,6 @@ def test_validate_rejects_non_positive_assistant_backbone_hidden_size() -> None:
         )
 
 
-@pytest.mark.parametrize("value", ["1", "bad", 1.5])
-def test_validate_rejects_non_integer_assistant_config_values(
-    value: object,
-) -> None:
-    with pytest.raises(ValueError, match="assistant n_predict must be an integer"):
-        _validate_assistant_config(
-            _assistant_config(n_predict=value),
-            target_model_args=_target_args(),
-        )
-
-
 @pytest.mark.parametrize("field", ["num_centroids", "centroid_intermediate_top_k"])
 @pytest.mark.parametrize("value", ["1", True, 1.5])
 def test_validate_rejects_non_integer_assistant_mask_config_values(
@@ -419,14 +408,6 @@ def test_validate_rejects_non_string_assistant_layer_type_entries() -> None:
                     ],
                 }
             ),
-            target_model_args=_target_args(),
-        )
-
-
-def test_validate_rejects_mapped_config_with_unsupported_n_predict() -> None:
-    with pytest.raises(ValueError, match="n_predict=1"):
-        _validate_assistant_config(
-            _assistant_config(model_type="gemma4_mtp", n_predict=2),
             target_model_args=_target_args(),
         )
 

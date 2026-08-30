@@ -141,12 +141,14 @@ class Gemma4MTPProposer:
         if not seeds:
             return None
 
-        input_ids = mx.array([[seed.token_id for seed in seeds]], dtype=mx.int32)
-        target_input_embeddings = runner._target_input_embeddings(input_ids)
         draft_token_ids = assistant.propose_draft_token_ids(
             seeds=seeds,
             target_hidden_states=ctx.target_hidden_states,
-            target_input_embeddings=target_input_embeddings,
+            # Each recurrence step embeds its own drafted token, so the
+            # runtime needs the target's backbone-width table, not one
+            # pre-computed row block.
+            embed_target_tokens=runner._target_input_embeddings,
+            num_speculative_tokens=ctx.num_speculative_tokens,
         )
         if not draft_token_ids:
             return None

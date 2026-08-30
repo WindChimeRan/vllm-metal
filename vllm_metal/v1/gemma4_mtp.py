@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Gemma4 MTP assistant loading and validation."""
+"""Gemma4 MTP assistant loading, validation, and draft recurrence."""
 
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 
 GEMMA4_MTP_DEFAULT_NUM_CENTROIDS = 2048
 GEMMA4_MTP_DEFAULT_CENTROID_TOP_K = 32
-GEMMA4_MTP_N_PREDICT = 1
 GEMMA4_MTP_DRAFT_MODEL_TYPES = frozenset({"gemma4_assistant", "gemma4_mtp"})
 GEMMA4_MTP_DRAFT_ARCHITECTURES = frozenset(
     {"Gemma4AssistantForCausalLM", "Gemma4MTPModel"}
@@ -99,25 +98,26 @@ class Gemma4MTPAssistantRuntime:
         *,
         seeds: Sequence[Gemma4MTPDraftSeed],
         target_hidden_states: mx.array,
-        target_input_embeddings: mx.array,
+        embed_target_tokens: Callable[[mx.array], mx.array],
+        num_speculative_tokens: int,
     ) -> list[list[int]]:
-        """Run the assistant and return one draft token per seed."""
+        """Draft ``num_speculative_tokens`` tokens per seed, recurrently.
+
+        The assistant is one module, so depth comes from re-running it on its
+        own output: step *i* consumes the token drafted at step *i-1* -- hence
+        ``embed_target_tokens``, since only the target owns a backbone-width
+        embedding table -- plus that step's ``backbone_hidden_states``.
+
+        The assistant reads the target's paged K/V read-only, so a drafted
+        token never gets a cache entry and every step queries the same
+        position.  That is why one ``prepare_grouped`` outside the loop serves
+        the whole recurrence; keep it that way when editing the loop.
+        """
         if not seeds:
             return []
         if self.kv_sharing is None:
             raise RuntimeError("Gemma4 MTP assistant requires target KV sharing")
 
-        if len(target_hidden_states.shape) == 3:
-            if target_hidden_states.shape[0] != 1:
-                raise ValueError(
-                    "Gemma4 MTP target_hidden_states must use a single batch"
-                )
-            target_hidden_states = target_hidden_states[0]
-        elif len(target_hidden_states.shape) != 2:
-            raise ValueError(
-                "Gemma4 MTP target_hidden_states must be row-major "
-                f"[num_tokens, hidden], got {target_hidden_states.shape}"
-            )
         row_indices = mx.array(
             [seed.target_hidden_row for seed in seeds],
             dtype=mx.int32,
@@ -131,26 +131,25 @@ class Gemma4MTPAssistantRuntime:
             self.kv_sharing.group_block_sizes,
         )
         try:
-            draft_token_ids = self.model.draft_token_ids(
-                input_ids,
-                target_hidden_states=hidden_rows,
-                target_input_embeddings=target_input_embeddings,
-                target_kv_cache=self.kv_sharing.target_kv_cache,
-                target_cache_indices=(
-                    self.kv_sharing.plan.assistant_layer_to_target_cache_idx
-                ),
-            )
+            step_token_ids: list[mx.array] = []
+            for _ in range(num_speculative_tokens):
+                draft_token_ids, hidden_rows = self.model.draft_step(
+                    target_hidden_states=hidden_rows,
+                    target_input_embeddings=embed_target_tokens(input_ids),
+                    target_kv_cache=self.kv_sharing.target_kv_cache,
+                    target_cache_indices=(
+                        self.kv_sharing.plan.assistant_layer_to_target_cache_idx
+                    ),
+                )
+                step_token_ids.append(draft_token_ids)
+                input_ids = draft_token_ids[None, :]
+            drafts = mx.stack(step_token_ids, axis=-1)
         finally:
             clear_context()
 
-        mx.eval(draft_token_ids)
-        token_ids: list[int] = draft_token_ids.tolist()  # type: ignore[assignment]
-        if len(token_ids) != len(seeds):
-            raise RuntimeError(
-                "Gemma4 MTP assistant returned the wrong number of draft tokens: "
-                f"got {len(token_ids)}, expected {len(seeds)}"
-            )
-        return [[int(token_id)] for token_id in token_ids]
+        # [num_seeds, num_speculative_tokens]; tolist() resolves the whole
+        # lazy recurrence in one evaluation.
+        return drafts.tolist()  # type: ignore[return-value]
 
 
 @dataclass(frozen=True, slots=True)
@@ -593,12 +592,6 @@ class Gemma4MTPAssistantMetadata:
                 f"architectures={architectures!r}"
             )
 
-        n_predict = cls._optional_int(config, "n_predict", context="assistant")
-        if n_predict is not None and n_predict != GEMMA4_MTP_N_PREDICT:
-            raise ValueError(
-                "Gemma4 MTP assistant config must use "
-                f"n_predict={GEMMA4_MTP_N_PREDICT}, got {n_predict!r}"
-            )
         tie_word_embeddings = cls._optional_bool(
             config,
             "tie_word_embeddings",

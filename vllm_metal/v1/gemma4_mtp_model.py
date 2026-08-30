@@ -207,7 +207,6 @@ class Gemma4MTPAssistantModel(nn.Module):
 
     def __call__(
         self,
-        input_ids: mx.array | None,
         *,
         target_hidden_states: mx.array,
         target_input_embeddings: mx.array,
@@ -216,10 +215,9 @@ class Gemma4MTPAssistantModel(nn.Module):
     ) -> tuple[mx.array, mx.array]:
         """Run one Gemma4 MTP assistant draft step over target KV cache.
 
-        ``input_ids`` is accepted for parity with upstream's proposer API; this
-        Metal path receives already-scaled target/backbone embeddings from the
-        target model because the assistant's own embedding table is draft-dim
-        and is kept for logits.
+        Takes already-scaled backbone-dim embeddings rather than token ids:
+        the assistant's own embedding table is draft-dim and is kept for
+        logits, so the caller embeds through the target's table.
         """
         hidden_states, input_embeddings = self._normalize_forward_inputs(
             target_hidden_states,
@@ -245,24 +243,26 @@ class Gemma4MTPAssistantModel(nn.Module):
         backbone_hidden_states = self.post_projection(draft_hidden_states)
         return draft_hidden_states, backbone_hidden_states
 
-    def draft_token_ids(
+    def draft_step(
         self,
-        input_ids: mx.array | None,
         *,
         target_hidden_states: mx.array,
         target_input_embeddings: mx.array,
         target_kv_cache: Any,
         target_cache_indices: Sequence[int],
-    ) -> mx.array:
-        """Return one greedy draft token id per packed request row."""
-        draft_hidden_states, _ = self(
-            input_ids,
+    ) -> tuple[mx.array, mx.array]:
+        """Return ``(token_ids [T], backbone_hidden_states [1, T, H])``.
+
+        The second value is this step's feedback for the next one -- see
+        ``Gemma4MTPAssistantRuntime.propose_draft_token_ids``.
+        """
+        draft_hidden_states, backbone_hidden_states = self(
             target_hidden_states=target_hidden_states,
             target_input_embeddings=target_input_embeddings,
             target_kv_cache=target_kv_cache,
             target_cache_indices=target_cache_indices,
         )
-        return self.get_top_tokens(draft_hidden_states[0])
+        return self.get_top_tokens(draft_hidden_states[0]), backbone_hidden_states
 
     def compute_logits(self, hidden_states: mx.array) -> mx.array:
         """Compute assistant logits from draft-dim hidden states."""

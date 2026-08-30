@@ -8,7 +8,7 @@ path. All require synchronous scheduling and greedy sampling.
 | `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
 | Target models | Gemma4 (paged) | Any paged-attention model | Any paged-attention model |
 | Draft source | MTP assistant checkpoint (reads target KV cache) | Separate smaller model (own KV cache) | Prompt/output token history (no model) |
-| `num_speculative_tokens` | 1 | Configurable (3–5 typical) | Configurable (3–5 typical) |
+| `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) |
 | Extra memory | None (reads target KV cache) | Second scheduler-managed KV cache | None |
 
 All three methods:
@@ -28,6 +28,29 @@ All three methods:
 Gemma4 MTP speculative decoding is experimental on Metal. It uses vLLM's
 scheduler contract and verifies scheduled draft tokens on the target
 paged-decode path.
+
+The assistant checkpoint predicts one token per forward (`n_predict=1`), so
+depth past one draft token comes from **running that one module again on its
+own output** — the same MTP module reuse upstream does in
+`vllm/v1/spec_decode/llm_base_proposer.py`. Step *i* consumes the token drafted
+at step *i-1* plus that step's backbone-width hidden state. Because the
+assistant is Q-only and reads the target's KV cache read-only, a drafted token
+never gets a cache entry, so every step queries the *same* target position
+(upstream's `constant_draft_positions`) over the same context.
+
+That has a practical consequence: the assistant sees each token it drafts only
+through the recurrence, never through attention, so per-position acceptance
+decays faster than it would for a draft model that builds its own KV.
+
+Against that, the cost of a speculative step is nearly flat in K on this
+backend — speculative decoding disables the one-step-ahead decode pipeline
+(`decode_pipeline.py`), and that fixed sync cost dominates the marginal cost of
+another assistant pass and another verify row. So `num_speculative_tokens=1`
+tends to break even, and depth is what pays for the overhead already incurred.
+
+Start at `num_speculative_tokens=3`. Going higher helps a single stream and
+hurts a saturated one, where the extra verify rows compete with real batch
+work; benchmark your own shape with the tool below.
 
 Use matching target and assistant checkpoint families (assistant checkpoints
 use `gemma4_assistant` or `gemma4_mtp` model config):
@@ -53,7 +76,7 @@ VLLM_METAL_MEMORY_FRACTION=0.5 \
     --max-num-batched-tokens 1024 \
     --max-num-seqs 4 \
     --no-async-scheduling \
-    --speculative-config "{\"method\":\"mtp\",\"model\":\"$ASSISTANT\",\"num_speculative_tokens\":1}"
+    --speculative-config "{\"method\":\"mtp\",\"model\":\"$ASSISTANT\",\"num_speculative_tokens\":3}"
 ```
 
 For remote Hugging Face checkpoints, use the same shape and set `model` to the
