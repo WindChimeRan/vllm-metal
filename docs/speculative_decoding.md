@@ -15,7 +15,6 @@ for method behavior and configuration details.
 
 All three methods currently have these Metal-specific constraints:
 
-- Target verification requires paged attention.
 - Only greedy requests (`temperature=0`) are drafted. Other requests run
   without speculation.
 - Scheduling must be synchronous. The Metal platform disables async scheduling
@@ -24,8 +23,6 @@ All three methods currently have these Metal-specific constraints:
 - Hybrid GDN targets and heterogeneous draft vocabularies are not supported.
 - `long_prefill_token_threshold`, when set, must be at least
   `1 + num_speculative_tokens`.
-
-Unsupported combinations fail instead of falling back silently.
 
 ## Gemma4 MTP
 

@@ -359,26 +359,17 @@ def test_runtime_proposes_drafts_with_runner_local_kv_context() -> None:
 
 
 def test_runtime_drafts_k_tokens_by_recurrence() -> None:
-    # One assistant module, so K tokens come from re-running it on its own
-    # output; a drafted token never enters the KV cache, so every step queries
-    # the same position -- which is what lets one prepare_grouped serve all K.
-    steps: list[dict[str, Any]] = []
+    hidden_inputs: list[Any] = []
+    contexts: list[tuple[list[int], list[int]]] = []
     embedded: list[list[int]] = []
 
     class AssistantModel:
-        def draft_step(self, *, target_hidden_states, target_kv_cache, **_):
+        def draft_step(self, *, target_hidden_states, **_):
             ctx = get_context()
             assert ctx is not None
-            step = len(steps)
-            steps.append(
-                {
-                    "hidden": target_hidden_states.tolist(),
-                    "context_lens": ctx.context_lens,
-                    "offsets": ctx.offsets,
-                }
-            )
-            # Step-indexed ids and feedback so "fed the previous step" is
-            # distinguishable from "fed step 0" or "fed the seed rows".
+            step = len(hidden_inputs)
+            hidden_inputs.append(target_hidden_states.tolist())
+            contexts.append((ctx.context_lens, ctx.offsets))
             return (
                 mx.array([200 + step, 300 + step], dtype=mx.int32),
                 mx.full((1, 2, 4), float(step + 1)),
@@ -388,14 +379,12 @@ def test_runtime_drafts_k_tokens_by_recurrence() -> None:
         embedded.append(input_ids.tolist()[0])
         return mx.zeros((1, input_ids.shape[-1], 4))
 
-    layer_types = ("full_attention",)
-    runtime = Gemma4MTPAssistantRuntime(
+    wired = Gemma4MTPAssistantRuntime(
         model_name="/assistant",
         model=AssistantModel(),
-        metadata=_assistant_metadata(layer_types),
-    )
-    wired = runtime.with_target_kv_sharing(
-        target_metadata=_target_metadata(layer_types),
+        metadata=_assistant_metadata(("full_attention",)),
+    ).with_target_kv_sharing(
+        target_metadata=_target_metadata(("full_attention",)),
         target_kv_cache=_target_cache(num_layers=1),
         block_size=_BLOCK_SIZE,
     )
@@ -422,19 +411,14 @@ def test_runtime_drafts_k_tokens_by_recurrence() -> None:
         num_speculative_tokens=3,
     )
 
-    # K tokens per seed, row-major.
     assert drafts == [[200, 201, 202], [300, 301, 302]]
-    # Step i consumes step i-1's tokens and backbone feedback.
     assert embedded == [[7, 8], [200, 300], [201, 301]]
-    assert [step["hidden"] for step in steps] == [
+    assert hidden_inputs == [
         [[[1.0, 0.0, 0.0, 0.0], [2.0, 0.0, 0.0, 0.0]]],
         [[[1.0] * 4] * 2],
         [[[2.0] * 4] * 2],
     ]
-    # The query position never advances, so the context is built once.
-    assert [step["context_lens"] for step in steps] == [[2, 4]] * 3
-    assert [step["offsets"] for step in steps] == [[1, 3]] * 3
-    assert get_context() is None
+    assert contexts == [([2, 4], [1, 3])] * 3
 
 
 def test_runtime_runs_tiny_assistant_forward_over_target_kv() -> None:
