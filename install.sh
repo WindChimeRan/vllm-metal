@@ -277,6 +277,12 @@ EOF
     release_tag=$(printf '%s' "$selected" | sed -n '1p')
     wheel_url=$(printf '%s' "$selected" | sed -n '2p')
 
+    if [[ "$channel" == "stable" &&
+          ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$ ]]; then
+      error "No stable release is available yet. Use --dev for the latest development build."
+      exit 1
+    fi
+
     if [[ -z "$wheel_url" ]]; then
       error "No wheel file found in the latest ${channel} release."
       exit 1

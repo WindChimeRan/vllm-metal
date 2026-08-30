@@ -38,6 +38,12 @@ jobs:
           echo "::error::Version ${RELEASE_VERSION} does not belong to ${RELEASE_REF}."
           exit 1
         fi
+        project_version=$(python3 -c \
+          "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+        if [ "$project_version" != "$branch_version" ]; then
+          echo "::error::pyproject version ${project_version} does not match ${RELEASE_REF}."
+          exit 1
+        fi
       env:
         RELEASE_REF: ${{ github.ref_name }}
         RELEASE_VERSION: ${{ inputs.version }}
