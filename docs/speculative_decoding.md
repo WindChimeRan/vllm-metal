@@ -110,6 +110,7 @@ python -m tools.benchmark.gemma4_mtp_benchmark \
 python -m tools.benchmark.gemma4_mtp_benchmark \
   --model "$TARGET" \
   --assistant-model "$ASSISTANT" \
+  --num-speculative-tokens 3 \
   --batch-size 4 \
   --max-tokens 64 \
   --repeats 1 \

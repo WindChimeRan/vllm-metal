@@ -121,6 +121,7 @@ python -m tools.benchmark.gemma4_mtp_benchmark \
 python -m tools.benchmark.gemma4_mtp_benchmark \
   --model /path/to/gemma-4-E2B-it \
   --assistant-model /path/to/gemma-4-E2B-it-assistant-bf16 \
+  --num-speculative-tokens 3 \
   --batch-size 4 --max-tokens 64 --repeats 1 --warmup 0 \
   --ignore-eos --max-model-len 1024 --max-num-batched-tokens 512 \
   --label e2b-mtp-bs4-64 \
