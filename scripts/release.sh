@@ -123,7 +123,7 @@ main() {
   fi
   verify_wheel_artifacts "${wheels[0]}"
 
-  local tag
+  local tag previous_dev_tag=""
   tag="v${version}"
   echo "Generated tag: $tag"
 
@@ -139,7 +139,17 @@ main() {
   if [ "$prerelease" -eq 1 ]; then
     release_args+=(--prerelease)
   fi
+
+  if [ "$channel" = "dev" ]; then
+    previous_dev_tag=$(gh release list --limit 30 --json tagName \
+      --jq '[.[] | select(.tagName | contains(".dev"))][0].tagName // ""')
+  fi
+
   gh release create "$tag" "${release_args[@]}" dist/*.whl
+
+  if [ -n "$previous_dev_tag" ]; then
+    gh release delete "$previous_dev_tag" --yes
+  fi
 }
 
 main "$@"
