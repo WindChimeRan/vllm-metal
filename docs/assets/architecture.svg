@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 700" role="img" aria-labelledby="figTitle figDesc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 680" role="img" aria-labelledby="figTitle figDesc">
   <title id="figTitle">vllm-metal in the vLLM stack</title>
   <desc id="figDesc">A four-layer stack. Client apps speak the OpenAI API to upstream vLLM V1, which contributes the API server, V1 scheduler, paged block manager with prefix caching, and chunked prefill with continuous batching, all used unchanged. vLLM hands the vllm-metal model runner one packed step of queries plus per-request block tables. Inside the runner, mlx_lm's model definitions, weight loading, RMSNorm, linear, MLP and MoE layers are reused unchanged because they are token-wise; vllm-metal adds custom Metal paths for paged varlen attention, M5 NAX prefill, and MTP draft and verify, which need request boundaries from cu_seqlens. Those issue MLX ops and custom Metal kernels down to the MLX runtime, the Apple Silicon GPU, and unified memory holding weights and the paged KV cache.</desc>
 
@@ -18,7 +18,7 @@
     </marker>
   </defs>
 
-  <rect x="0" y="0" width="1000" height="700" fill="#ffffff"/>
+  <rect x="0" y="0" width="1000" height="680" fill="#ffffff"/>
 
   <!-- ── header ─────────────────────────────────────────────────────── -->
   <text class="h1"   x="500" y="40" text-anchor="middle">vllm-metal in the vLLM stack</text>
@@ -58,7 +58,6 @@
   <!-- ── layer 3: vllm-metal ────────────────────────────────────────── -->
   <rect x="28" y="334" width="944" height="216" rx="12" fill="#f7f9ff" stroke="#2a63c8" stroke-width="2.2"/>
   <text class="band" x="48"  y="365" fill="#12325c">vllm-metal model runner</text>
-  <text class="note" x="952" y="365" text-anchor="end">what this plugin adds</text>
 
   <!-- reused sub-panel -->
   <rect x="48" y="384" width="502" height="150" rx="10" fill="#f4f6f9" stroke="#d7dde5" stroke-width="1.4"/>
@@ -103,13 +102,4 @@
   <text class="t"  x="852" y="623" text-anchor="middle">unified memory</text>
   <text class="t2" x="852" y="642" text-anchor="middle">weights + paged KV</text>
 
-  <!-- ── legend ─────────────────────────────────────────────────────── -->
-  <rect x="48"  y="678" width="15" height="15" rx="4" fill="#eef3fb" stroke="#b9cde8" stroke-width="1.2"/>
-  <text class="note" x="71" y="690">upstream vLLM · mlx_lm (unchanged)</text>
-
-  <rect x="369" y="678" width="15" height="15" rx="4" fill="#eaf1ff" stroke="#2a63c8" stroke-width="1.4"/>
-  <text class="note" x="392" y="690">added by vllm-metal</text>
-
-  <rect x="576" y="678" width="15" height="15" rx="4" fill="#eef6ea" stroke="#a9cf9b" stroke-width="1.2"/>
-  <text class="note" x="599" y="690">MLX · Metal · hardware</text>
 </svg>
