@@ -8,6 +8,11 @@ from vllm_metal.attention.model_patches.base import (
     register_attention_contract,
     resolve_attention_contract,
 )
+from vllm_metal.attention.model_patches.hunyuan_v1_dense import (
+    register as _register_hunyuan_v1_dense,
+)
+
+_register_hunyuan_v1_dense()
 
 __all__ = [
     "DEFAULT_ATTENTION_CONTRACT",
