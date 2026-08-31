@@ -15,6 +15,10 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 
 ---
 
+## Architecture
+
+![vllm-metal in the vLLM stack](docs/assets/architecture.svg)
+
 ## Requirements
 
 - macOS 15 (Sequoia) or later, on Apple Silicon
