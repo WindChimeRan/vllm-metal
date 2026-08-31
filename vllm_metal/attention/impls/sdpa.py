@@ -35,15 +35,15 @@ from dataclasses import dataclass
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm_metal.attention.attention_contracts import (
+    DEFAULT_ATTENTION_CONTRACT,
+    AttentionContract,
+    QKNormPlacement,
+)
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
-)
-from vllm_metal.attention.model_patches import (
-    DEFAULT_ATTENTION_CONTRACT,
-    AttentionContract,
-    QKNormPlacement,
 )
 from vllm_metal.metal import get_ops
 

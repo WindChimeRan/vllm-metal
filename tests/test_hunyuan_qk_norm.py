@@ -4,9 +4,9 @@
 import mlx.core as mx
 from mlx_lm.models.hunyuan_v1_dense import Attention, ModelArgs
 
+from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import prepare_sdpa_qkv
-from vllm_metal.attention.model_patches import resolve_attention_contract
 
 
 def _context(seq_len: int) -> PagedAttentionContext:
@@ -65,7 +65,7 @@ def test_hunyuan_qk_norm_is_applied_after_rope() -> None:
         _context(seq_len=3),
         attention.n_heads,
         attention.n_kv_heads,
-        attention_contract=resolve_attention_contract(attention),
+        attention_contract=attention_contract_for(attention),
     )
     mx.eval(queries, keys, expected_q, expected_k, wrong_q, wrong_k)
 

@@ -21,12 +21,12 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import get_context
 from vllm_metal.attention.impls.sdpa import (
     sdpa_forward,
 )
-from vllm_metal.attention.model_patches import resolve_attention_contract
 from vllm_metal.attention.patching import walk_and_wrap
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ class SDPAPagedAttentionWrapper(nn.Module):
         object.__setattr__(self, "_mk_kv_cache", kv_cache)
         object.__setattr__(self, "_mk_block_size", block_size)
         object.__setattr__(
-            self, "_mk_attention_contract", resolve_attention_contract(inner)
+            self, "_mk_attention_contract", attention_contract_for(inner)
         )
         # For compact caches (hybrid models), cache_idx maps to the
         # per-type cache array.  Defaults to layer_idx for non-hybrid.
