@@ -40,6 +40,11 @@ from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.varlen_rope_compat import (
     apply_attention_rope,
 )
+from vllm_metal.attention.model_patches import (
+    DEFAULT_ATTENTION_CONTRACT,
+    AttentionContract,
+    QKNormPlacement,
+)
 from vllm_metal.metal import get_ops
 
 # === Metal kernel block-size support ===
@@ -211,7 +216,6 @@ def _kernel_metadata(
     return meta
 
 
-# TODO(#660): Make Q/K norm placement relative to RoPE architecture-aware.
 def _named_norm(module: nn.Module, *names: str) -> nn.Module | None:
     """Return the first per-head norm present on *module* among *names*.
 
@@ -229,6 +233,19 @@ def _named_norm(module: nn.Module, *names: str) -> nn.Module | None:
     return None
 
 
+def _apply_qk_norms(
+    queries: mx.array,
+    keys: mx.array,
+    q_norm: nn.Module | None,
+    k_norm: nn.Module | None = None,
+) -> tuple[mx.array, mx.array]:
+    if q_norm is not None:
+        queries = q_norm(queries)
+    if k_norm is not None:
+        keys = k_norm(keys)
+    return queries, keys
+
+
 # === Q/K/V preparation (YOCO, K-eq-V, v_norm variants) ===
 
 
@@ -242,8 +259,9 @@ def prepare_sdpa_qkv(
     *,
     read_existing_kv: bool = False,
     position_embeddings: tuple[mx.array, mx.array] | None = None,
+    attention_contract: AttentionContract = DEFAULT_ATTENTION_CONTRACT,
 ) -> tuple[mx.array, mx.array, mx.array, mx.array | None, tuple[mx.array, mx.array]]:
-    """Project ``x`` into Q/K/V with norms, RoPE and Gemma4 variants.
+    """Project ``x`` into Q/K/V with architecture-aware norms and RoPE.
 
     Handles three Gemma4-specific branches:
 
@@ -282,6 +300,7 @@ def prepare_sdpa_qkv(
             ``rotary_emb`` (only RoPE-based models are supported).
     """
     B, L, _ = x.shape  # noqa: N806
+    norm_placement = attention_contract.qk_norm_placement
     if shared_kv is not None and read_existing_kv:
         raise ValueError("shared_kv and read_existing_kv are mutually exclusive")
 
@@ -341,8 +360,8 @@ def prepare_sdpa_qkv(
         else:
             keys, values = shared_kv
         q_norm = _named_norm(inner, "q_norm", "query_layernorm")
-        if q_norm is not None:
-            queries = q_norm(queries)
+        if norm_placement is QKNormPlacement.BEFORE_ROPE:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm)
         queries = queries.transpose(0, 2, 1, 3)
         queries, _ = apply_attention_rope(
             inner,
@@ -354,6 +373,8 @@ def prepare_sdpa_qkv(
             positions=ctx.segment_positions,
             position_embeddings=position_embeddings,
         )
+        if norm_placement is QKNormPlacement.AFTER_ROPE:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm)
     else:
         if not packed_qkv:
             keys = inner.k_proj(x).reshape(B, L, n_kv_heads, -1)
@@ -366,10 +387,8 @@ def prepare_sdpa_qkv(
         # Per-head RMSNorm (Qwen3, Qwen3.5, Gemma4, Phi3/Phi4 when present).
         q_norm = _named_norm(inner, "q_norm", "query_layernorm")
         k_norm = _named_norm(inner, "k_norm", "key_layernorm")
-        if q_norm is not None:
-            queries = q_norm(queries)
-        if k_norm is not None:
-            keys = k_norm(keys)
+        if norm_placement is QKNormPlacement.BEFORE_ROPE:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
         if hasattr(inner, "v_norm"):
             values = inner.v_norm(values)
 
@@ -387,6 +406,8 @@ def prepare_sdpa_qkv(
             positions=ctx.segment_positions,
             position_embeddings=position_embeddings,
         )
+        if norm_placement is QKNormPlacement.AFTER_ROPE:
+            queries, keys = _apply_qk_norms(queries, keys, q_norm, k_norm)
 
     kv_for_sharing = (keys, values)
     return queries, keys, values, gate, kv_for_sharing
@@ -491,8 +512,9 @@ def sdpa_forward(
     *,
     read_existing_kv: bool = False,
     position_embeddings: tuple[mx.array, mx.array] | None = None,
+    attention_contract: AttentionContract = DEFAULT_ATTENTION_CONTRACT,
 ) -> tuple[mx.array, tuple[mx.array, mx.array]]:
-    """Full SDPA forward pass: project → norm → RoPE → Metal kernel.
+    """Full SDPA forward pass: project → norm/RoPE → Metal kernel.
 
     Handles MHA, GQA, and MQA uniformly — the head ratio between
     query and KV heads is passed to the Metal kernel which handles
@@ -538,6 +560,7 @@ def sdpa_forward(
         shared_kv,
         read_existing_kv=read_existing_kv,
         position_embeddings=position_embeddings,
+        attention_contract=attention_contract,
     )
 
     # --- Metal kernel dispatch ---
