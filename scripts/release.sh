@@ -141,6 +141,13 @@ main() {
   fi
 
   if [ "$channel" = "dev" ]; then
+    local main_sha
+    main_sha=$(git ls-remote --exit-code origin refs/heads/main | cut -f1)
+    if [ "$(git rev-parse HEAD)" != "$main_sha" ]; then
+      echo "Skipping stale dev release: checkout is no longer the tip of main."
+      exit 0
+    fi
+
     previous_dev_tag=$(gh release list --limit 30 --json tagName \
       --jq '[.[] | select(.tagName | contains(".dev"))][0].tagName // ""')
   fi
