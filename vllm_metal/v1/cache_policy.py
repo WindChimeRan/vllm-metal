@@ -392,7 +392,7 @@ class ModelCachePolicy:
 
         if self._runner.is_hybrid:
             hybrid_plan = self._hybrid_plan()
-            state_spec = self._state_layer_spec(hybrid_plan, torch_dtype)
+            state_spec = self._state_layer_spec(hybrid_plan)
             for layer_idx in range(num_spec_layers):
                 if hybrid_plan.layers.is_state_layer(layer_idx):
                     specs[f"layers.{layer_idx}.{hybrid_plan.family.layer_name}"] = (
@@ -409,16 +409,13 @@ class ModelCachePolicy:
         )
         return specs
 
-    def _state_layer_spec(
-        self, hybrid_plan: HybridRuntimePlan, torch_dtype: torch.dtype
-    ) -> MambaSpec:
+    def _state_layer_spec(self, hybrid_plan: HybridRuntimePlan) -> MambaSpec:
         """Build the scheduler-visible spec shared by every state layer."""
         cache_config = self._runner.cache_config
         mamba_block_size = cache_config.mamba_block_size
         # Upstream resolves this during config setup and asserts it here.
         assert mamba_block_size is not None
         return hybrid_plan.state_cache_spec(
-            conv_dtype=torch_dtype,
             mamba_block_size=mamba_block_size,
             page_size_padded=cache_config.mamba_page_size_padded,
             mamba_cache_mode=cache_config.mamba_cache_mode,
@@ -896,25 +893,18 @@ class ModelCachePolicy:
         if not self._runner.is_hybrid:
             raise RuntimeError("linear_cache_bytes_per_slot() requires a hybrid model")
         hybrid_plan = self._hybrid_plan()
-        return hybrid_plan.layers.num_state * hybrid_plan.state_bytes_per_layer(
-            self._require_kv_cache_dtype().size
-        )
+        return hybrid_plan.layers.num_state * hybrid_plan.state_bytes_per_layer()
 
     def hybrid_align_state_bytes_per_block(self) -> int:
         """Per-pool-block linear-state bytes under align-mode prefix caching."""
         hybrid_plan = self._hybrid_plan()
         layer_plan = hybrid_plan.layers
         pools = _align_state_pool_count(layer_plan.num_state, layer_plan.num_attention)
-        return (
-            hybrid_plan.state_bytes_per_layer(self._require_kv_cache_dtype().size)
-            * pools
-        )
+        return hybrid_plan.state_bytes_per_layer() * pools
 
     def hybrid_align_growth_bytes_per_block(self) -> int:
         """One old physical state pool retained during align-cache growth."""
-        return self._hybrid_plan().state_bytes_per_layer(
-            self._require_kv_cache_dtype().size
-        )
+        return self._hybrid_plan().state_bytes_per_layer()
 
     def build_paged_attention_runtime(
         self, *, block_size: int
@@ -1018,9 +1008,7 @@ class ModelCachePolicy:
         padded = self._runner.cache_config.mamba_page_size_padded
         if padded is not None:
             return padded
-        return self._hybrid_plan().state_bytes_per_layer(
-            self._require_kv_cache_dtype().size
-        )
+        return self._hybrid_plan().state_bytes_per_layer()
 
     def _build_hybrid_backend(self, block_size: int) -> HybridPagedAttentionRuntime:
         config = get_config()

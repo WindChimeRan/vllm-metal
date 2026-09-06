@@ -86,17 +86,28 @@ def _ordinary_paged_cache(monkeypatch):
     )
 
 
-def _runner(model, *, mode="align"):
+def _runner(model, *, mode="align", cache_dtype="auto"):
     runner = make_stub_runner(
         model=model,
         model_args=asdict(model.args),
         is_hybrid=True,
         kv_cache_dtype=mx.bfloat16,
+        model_config=SimpleNamespace(
+            is_hybrid=True,
+            model_impl="vllm",
+            architecture=(
+                "Lfm2ForCausalLM"
+                if model.args.model_type == "lfm2"
+                else "Lfm2MoeForCausalLM"
+            ),
+            dtype=torch.bfloat16,
+        ),
         cache_config=SimpleNamespace(
             block_size=BLOCK_SIZE,
             mamba_block_size=BLOCK_SIZE if mode == "align" else 128,
             mamba_page_size_padded=None,
             mamba_cache_mode=mode,
+            mamba_cache_dtype=cache_dtype,
             num_gpu_blocks_override=None,
         ),
         scheduler_config=SimpleNamespace(
@@ -144,7 +155,7 @@ def test_scheduler_spec_bills_only_the_convolution_tail(lfm_model, mode):
 
 def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_model):
     """Round-trip real vLLM grouping, including its shared_by physical layout."""
-    runner = _runner(lfm_model)
+    runner = _runner(lfm_model, cache_dtype="float32")
     runtime = _runtime(runner)
     engine_config = SimpleNamespace(
         cache_config=runner.cache_config,
@@ -179,6 +190,7 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
     cache = runtime.state_cache
     assert cache.allocated_seqs == 0
     cache.ensure_capacity(NUM_BLOCKS)
+    assert cache.conv_states[0].dtype == mx.float32
     assert cache.num_state_pools == 2
     for tensor in scheduler_cache.kv_cache_tensors:
         indices = [
@@ -193,7 +205,7 @@ def test_upstream_scheduler_groups_adopt_conv_names_and_shared_state_pools(lfm_m
         )
     assert (
         sum(array.nbytes for array in cache.updated_state_arrays())
-        == NUM_BLOCKS * 2 * 256
+        == NUM_BLOCKS * 2 * 512
     )
-    assert runner._cache_policy.hybrid_align_state_bytes_per_block() == 2 * 256
-    assert runner._cache_policy.hybrid_align_growth_bytes_per_block() == 256
+    assert runner._cache_policy.hybrid_align_state_bytes_per_block() == 2 * 512
+    assert runner._cache_policy.hybrid_align_growth_bytes_per_block() == 512

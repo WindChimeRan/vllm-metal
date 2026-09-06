@@ -7,6 +7,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
+import torch
+
 from vllm_metal.attention.runtime.families.gdn import (
     GDN_FAMILY,
     GDN_MODEL_TYPES,
@@ -29,7 +31,9 @@ from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan, StateFam
 class StateFamilyPlanBuilder:
     model_types: frozenset[str]
     family: StateFamilySpec
-    build: Callable[[Mapping[str, Any], int], HybridRuntimePlan]
+    build: Callable[
+        [Mapping[str, Any], int, tuple[torch.dtype, ...]], HybridRuntimePlan
+    ]
 
 
 _STATE_FAMILY_PLAN_BUILDERS = (
@@ -68,7 +72,9 @@ def state_family_for_model_type(model_type: str) -> StateFamilySpec:
 
 
 def build_hybrid_runtime_plan(
-    model_args: Mapping[str, Any], num_layers: int
+    model_args: Mapping[str, Any],
+    num_layers: int,
+    state_dtypes: tuple[torch.dtype, ...],
 ) -> HybridRuntimePlan:
     builder = _builder_for_model_type(model_args["model_type"])
-    return builder.build(model_args, num_layers)
+    return builder.build(model_args, num_layers, state_dtypes)

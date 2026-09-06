@@ -1,4 +1,4 @@
-// Template params: T (output/input dtype), StT (state dtype), CONV_DIM, KERNEL_SIZE
+// Template params: T (output dtype), StT (state dtype), CONV_DIM, KERNEL_SIZE
 // Inputs: input, conv_state_in, weights, slot_mapping, num_requests
 // Outputs: output, conv_state_out
 // Grid: (num_requests * CONV_DIM, 1, 1) — one thread per (request, channel)

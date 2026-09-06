@@ -142,21 +142,18 @@ class StateCacheFactory(Protocol):
         num_layers: int,
         max_seqs: int,
         initial_seqs: int,
-        dtype: mx.Dtype,
+        dtypes: tuple[mx.Dtype, ...],
     ) -> PagedStateCache: ...
 
 
 @dataclass(frozen=True, slots=True)
 class StateFamilySpec:
-    """Per-family policy: how state layers are detected, wrapped and typed."""
+    """Per-family implementation: how state layers are detected and wrapped."""
 
     label: str
     wrapper_cls: type[PagedStateWrapper]
     is_state_module: Callable[[Any], bool]
     mamba_type: MambaAttentionBackendEnum
-    # None follows the runtime's convolution dtype; fixed dtypes describe
-    # accumulation state such as GDN's fp32 recurrent matrix.
-    state_dtypes: tuple[torch.dtype | None, ...]
     supported_cache_modes: tuple[str, ...]
     supports_decode_pipeline: bool
     layer_name: str
@@ -170,20 +167,28 @@ class HybridRuntimePlan:
     layers: HybridLayerPlan
     family: StateFamilySpec
     geometry: StateGeometry
+    state_dtypes: tuple[torch.dtype, ...]
 
-    def state_bytes_per_layer(self, conv_dtype_size: int) -> int:
+    def __post_init__(self) -> None:
+        if len(self.state_dtypes) != len(self.geometry.state_shapes):
+            raise ValueError(
+                f"{self.family.label} state geometry has "
+                f"{len(self.geometry.state_shapes)} tensors, but upstream resolved "
+                f"{len(self.state_dtypes)} state dtypes"
+            )
+
+    def state_bytes_per_layer(self) -> int:
         """Bytes one request holds in one recurrent state layer."""
         return sum(
-            prod(shape) * (conv_dtype_size if dtype is None else dtype.itemsize)
+            prod(shape) * dtype.itemsize
             for shape, dtype in zip(
-                self.geometry.state_shapes, self.family.state_dtypes, strict=True
+                self.geometry.state_shapes, self.state_dtypes, strict=True
             )
         )
 
     def state_cache_spec(
         self,
         *,
-        conv_dtype: torch.dtype,
         mamba_block_size: int,
         page_size_padded: int | None,
         mamba_cache_mode: str,
@@ -191,10 +196,7 @@ class HybridRuntimePlan:
         """Build the scheduler-visible state spec for one state layer."""
         return MambaSpec(
             shapes=self.geometry.state_shapes,
-            dtypes=tuple(
-                conv_dtype if dtype is None else dtype
-                for dtype in self.family.state_dtypes
-            ),
+            dtypes=self.state_dtypes,
             block_size=mamba_block_size,
             page_size_padded=page_size_padded,
             mamba_type=self.family.mamba_type,

@@ -25,6 +25,7 @@ from vllm_metal.attention.patching import DEFAULT_ATTN_ATTR_NAMES, walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.state import AlignStateManager, RequestStateManager
+from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
 
 logger = init_logger(__name__)
 
@@ -108,7 +109,9 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
             num_layers=self._hybrid_plan.layers.num_state,
             max_seqs=state_slots,
             initial_seqs=0,
-            dtype=self._dtype,
+            dtypes=tuple(
+                TORCH_TO_MLX_DTYPE[dtype] for dtype in self._hybrid_plan.state_dtypes
+            ),
         )
         self._state_manager = (
             AlignStateManager(self._state_cache, self._block_size)

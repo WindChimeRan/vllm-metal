@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
+import torch
 
 import vllm_metal.v1.model_runner as mr
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
@@ -58,6 +59,8 @@ def make_stub_runner(
             mamba_page_size_padded=None,
             mamba_block_size=2048,
             mamba_cache_mode="none",
+            mamba_cache_dtype="auto",
+            mamba_ssm_cache_dtype="float32",
         ),
         "model_config": SimpleNamespace(
             runner_type="generate",
@@ -107,6 +110,9 @@ def make_stub_runner(
         setattr(runner, k, v)
     for k, v in attrs.items():
         setattr(runner, k, v)
+    if "vllm_config" not in attrs:
+        runner.vllm_config.model_config = runner.model_config
+        runner.vllm_config.cache_config = runner.cache_config
     if "_paged_block_size" in attrs and "_paged_group_block_sizes" not in attrs:
         runner._paged_scheduler_group_indices = (0,)
         runner._paged_group_block_sizes = (attrs["_paged_block_size"],)
@@ -261,6 +267,7 @@ _GDN_FAMILY_SPEC = build_hybrid_runtime_plan(
         "linear_conv_kernel_dim": 1,
     },
     2,
+    (torch.float16, torch.float32),
 ).family
 
 
@@ -273,6 +280,7 @@ def make_gdn_hybrid_plan(
     num_v_heads: int,
     value_head_dim: int,
     key_head_dim: int,
+    state_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.float32),
 ) -> HybridRuntimePlan:
     """Build a GDN hybrid plan with explicit topology and geometry."""
     attention = frozenset(attention_indices)
@@ -282,6 +290,7 @@ def make_gdn_hybrid_plan(
     return HybridRuntimePlan(
         layers=HybridLayerPlan(layer_roles=layer_roles),
         family=_GDN_FAMILY_SPEC,
+        state_dtypes=state_dtypes,
         geometry=RecurrentStateGeometry(
             conv_kernel_dim=conv_kernel_dim,
             conv_dim=conv_dim,
@@ -292,8 +301,14 @@ def make_gdn_hybrid_plan(
     )
 
 
-def make_nemotron_hybrid_plan(pattern: str) -> HybridRuntimePlan:
+def make_nemotron_hybrid_plan(
+    pattern: str,
+    *,
+    state_dtypes: tuple[torch.dtype, ...] = (torch.float16, torch.float32),
+) -> HybridRuntimePlan:
     """Build a Nemotron-H plan for ``pattern`` through the family table."""
     return build_hybrid_runtime_plan(
-        {**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": pattern}, len(pattern)
+        {**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": pattern},
+        len(pattern),
+        state_dtypes,
     )

@@ -22,12 +22,6 @@ _RECURRENT_MAX_KEY_HEAD_DIM = 256
 _RECURRENT_PREFILL_THREADGROUP_DV = 4
 
 
-def _astype_if_needed(array: mx.array, dtype: mx.Dtype) -> mx.array:
-    if array.dtype == dtype:
-        return array
-    return array.astype(dtype)
-
-
 @dataclass(frozen=True)
 class GDNRecurrentRequest:
     """Common inputs for one lazy GDN recurrent kernel attempt."""
@@ -252,6 +246,7 @@ class GDNLazyKernels:
         state_view = state_cache.conv_state_for_decode(cache_idx, slot_ids)
         conv_state_in = state_view.state
         weight = inner.conv1d.weight
+        output_dtype = mx.result_type(mixed_qkv, conv_state_in, weight)
 
         mixed_qkv_2d = mixed_qkv.reshape(num_requests, conv_dim)
         slot_ids_arr = state_view.cache_slot_ids
@@ -269,7 +264,7 @@ class GDNLazyKernels:
             num_requests,
         ]
         template = [
-            ("T", mixed_qkv.dtype),
+            ("T", output_dtype),
             ("StT", conv_state_in.dtype),
             ("CONV_DIM", conv_dim),
             ("KERNEL_SIZE", kernel_size),
@@ -280,7 +275,7 @@ class GDNLazyKernels:
             grid=(grid_size, 1, 1),
             threadgroup=(tg_size, 1, 1),
             output_shapes=[(num_requests, conv_dim), state_updates_shape],
-            output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
+            output_dtypes=[output_dtype, conv_state_in.dtype],
         )
         state_cache.write_conv_rows(cache_idx, conv_state_updates, slot_ids_arr)
         if state_view.uses_compact_state:
@@ -317,6 +312,7 @@ class GDNLazyKernels:
         if state_cache.has_pending_conv_state(cache_idx):
             state_cache.apply_pending_conv_state(cache_idx)
         conv_state_in = state_cache.conv_states[cache_idx]
+        output_dtype = mx.result_type(mixed_qkv, conv_state_in, inner.conv1d.weight)
         mixed_qkv_2d = mixed_qkv.reshape(total_tokens, conv_dim)
         slot_ids_arr = mx.array(slot_ids, dtype=mx.int32)
         cu_seqlens_arr = mx.array(cu_seqlens, dtype=mx.int32)
@@ -335,7 +331,7 @@ class GDNLazyKernels:
                 total_tokens,
             ],
             template=[
-                ("T", mixed_qkv.dtype),
+                ("T", output_dtype),
                 ("StT", conv_state_in.dtype),
                 ("CONV_DIM", conv_dim),
                 ("KERNEL_SIZE", kernel_size),
@@ -343,7 +339,7 @@ class GDNLazyKernels:
             grid=(grid_size, 1, 1),
             threadgroup=(tg_size, 1, 1),
             output_shapes=[(total_tokens, conv_dim), state_updates_shape],
-            output_dtypes=[mixed_qkv.dtype, conv_state_in.dtype],
+            output_dtypes=[output_dtype, conv_state_in.dtype],
         )
         state_cache.set_pending_conv_state(cache_idx, slot_ids, conv_state_updates)
         return conv_out.reshape(1, total_tokens, conv_dim)
@@ -393,7 +389,7 @@ class GDNLazyKernels:
         ]
         template = [
             ("T", request.output_dtype),
-            ("StT", mx.float32),
+            ("StT", state_in.dtype),
             ("Dk", d_k),
             ("Dv", d_v),
             ("Hk", n_hk),
@@ -405,7 +401,7 @@ class GDNLazyKernels:
             grid=(_RECURRENT_SIMDGROUP_WIDTH, d_v, num_requests * n_hv),
             threadgroup=(_RECURRENT_SIMDGROUP_WIDTH, request.threadgroup_dv, 1),
             output_shapes=[(total_tokens, n_hv, d_v), (num_requests, n_hv, d_v, d_k)],
-            output_dtypes=[request.output_dtype, mx.float32],
+            output_dtypes=[request.output_dtype, state_in.dtype],
         )
         # Park the compact update instead of scattering it into the stable
         # pool.  A steady-state decode chain then reads and writes only
@@ -465,11 +461,11 @@ class GDNLazyKernels:
         state_dtype = state_in.dtype
 
         kernel_inputs = [
-            _astype_if_needed(request.q.reshape(total_tokens, n_hk, d_k), kernel_dtype),
-            _astype_if_needed(request.k.reshape(total_tokens, n_hk, d_k), kernel_dtype),
-            _astype_if_needed(request.v.reshape(total_tokens, n_hv, d_v), kernel_dtype),
-            _astype_if_needed(request.g.reshape(total_tokens, n_hv), kernel_dtype),
-            _astype_if_needed(request.beta.reshape(total_tokens, n_hv), kernel_dtype),
+            request.q.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype),
+            request.k.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype),
+            request.v.reshape(total_tokens, n_hv, d_v).astype(kernel_dtype),
+            request.g.reshape(total_tokens, n_hv).astype(kernel_dtype),
+            request.beta.reshape(total_tokens, n_hv).astype(kernel_dtype),
             state_in,
             cu_seqlens_arr,
             slot_ids_arr,
@@ -503,5 +499,5 @@ class GDNLazyKernels:
             request.state_cache.write_recurrent_rows(
                 request.cache_idx, state_updates, slot_ids_arr
             )
-        y_out = _astype_if_needed(y_out, request.output_dtype)
+        y_out = y_out.astype(request.output_dtype)
         return y_out

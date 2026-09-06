@@ -39,6 +39,8 @@ from vllm_metal.attention.runtime.hybrid_plan import (
     HybridRuntimePlan,
 )
 
+STATE_DTYPES = (torch.float16, torch.float32)
+
 NEMOTRON_H_ARGS = {
     "model_type": "nemotron_h",
     "hybrid_override_pattern": ["M", "E", "M", "*", "-", "M"],
@@ -97,7 +99,7 @@ class _FakeModel(nn.Module):
         ]
 
 
-def _make_tiny_plan() -> HybridRuntimePlan:
+def _make_tiny_plan(state_dtypes=STATE_DTYPES) -> HybridRuntimePlan:
     """Four layers, attention at 1 and 3, geometry sized for the fakes."""
     return make_gdn_hybrid_plan(
         4,
@@ -107,13 +109,16 @@ def _make_tiny_plan() -> HybridRuntimePlan:
         num_v_heads=1,
         value_head_dim=4,
         key_head_dim=32,
+        state_dtypes=state_dtypes,
     )
 
 
 def _make_nemotron_runtime() -> HybridPagedAttentionRuntime:
     """Four real Nemotron-H blocks (M-*M) on an fp32 pool sized for the tiny args."""
     return HybridPagedAttentionRuntime(
-        hybrid_plan=make_nemotron_hybrid_plan("M-*M"),
+        hybrid_plan=make_nemotron_hybrid_plan(
+            "M-*M", state_dtypes=(torch.float32, torch.float32)
+        ),
         max_num_seqs=2,
         num_kv_heads=2,
         head_dim=8,
@@ -122,9 +127,9 @@ def _make_nemotron_runtime() -> HybridPagedAttentionRuntime:
     )
 
 
-def _make_runtime() -> HybridPagedAttentionRuntime:
+def _make_runtime(state_dtypes=STATE_DTYPES) -> HybridPagedAttentionRuntime:
     return HybridPagedAttentionRuntime(
-        hybrid_plan=_make_tiny_plan(),
+        hybrid_plan=_make_tiny_plan(state_dtypes),
         max_num_seqs=2,
         num_kv_heads=1,
         head_dim=4,
@@ -135,7 +140,7 @@ def _make_runtime() -> HybridPagedAttentionRuntime:
 
 class TestGdnPlanDecision:
     def test_topology_follows_the_interval_rule(self) -> None:
-        plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
+        plan = build_gdn_hybrid_plan(GDN_ARGS, 8, STATE_DTYPES)
 
         assert plan.layers.attention_indices == (3, 7)
         assert plan.layers.state_indices == (0, 1, 2, 4, 5, 6)
@@ -153,7 +158,7 @@ class TestGdnPlanDecision:
         )
 
     def test_geometry_packs_qk_and_v_into_the_conv_stream(self) -> None:
-        plan = build_gdn_hybrid_plan(GDN_ARGS, 8)
+        plan = build_gdn_hybrid_plan(GDN_ARGS, 8, STATE_DTYPES)
 
         # conv_dim = 2*32*2 + 4*16 = 192, hand-written.
         assert plan.geometry.conv_kernel_dim == 3
@@ -172,7 +177,7 @@ class TestGdnPlanRejection:
         expected = f"GDN hybrid model args are missing required {missing!r}."
 
         with pytest.raises(ValueError) as excinfo:
-            build_gdn_hybrid_plan(args, 8)
+            build_gdn_hybrid_plan(args, 8, STATE_DTYPES)
         assert str(excinfo.value) == expected
 
     @pytest.mark.parametrize(
@@ -191,7 +196,7 @@ class TestGdnPlanRejection:
         )
 
         with pytest.raises(ValueError) as excinfo:
-            build_gdn_hybrid_plan(args, num_layers)
+            build_gdn_hybrid_plan(args, num_layers, STATE_DTYPES)
         assert str(excinfo.value) == expected
 
 
@@ -201,7 +206,9 @@ class TestStateFamilyFactory:
         ["qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next"],
     )
     def test_routes_gdn_model_types_to_the_gdn_family(self, model_type: str) -> None:
-        plan = build_hybrid_runtime_plan({**GDN_ARGS, "model_type": model_type}, 8)
+        plan = build_hybrid_runtime_plan(
+            {**GDN_ARGS, "model_type": model_type}, 8, STATE_DTYPES
+        )
 
         assert plan.family.label == "gdn"
         assert plan.layers.attention_indices == (3, 7)
@@ -213,11 +220,11 @@ class TestStateFamilyFactory:
         )
 
         with pytest.raises(NotImplementedError) as excinfo:
-            build_hybrid_runtime_plan(args, 8)
+            build_hybrid_runtime_plan(args, 8, STATE_DTYPES)
         assert str(excinfo.value) == expected
 
     def test_routes_nemotron_args_to_the_nemotron_family(self) -> None:
-        plan = build_hybrid_runtime_plan(NEMOTRON_H_ARGS, 6)
+        plan = build_hybrid_runtime_plan(NEMOTRON_H_ARGS, 6, STATE_DTYPES)
 
         assert plan.family.label == "nemotron_h"
         assert plan.layers.layer_roles == (
@@ -233,13 +240,13 @@ class TestStateFamilyFactory:
         args = {**GDN_ARGS, "full_attention_interval": "4"}
 
         with pytest.raises(ValueError, match="must be positive integers"):
-            build_hybrid_runtime_plan(args, 8)
+            build_hybrid_runtime_plan(args, 8, STATE_DTYPES)
 
 
 class TestNemotronHPlanDecision:
     def test_string_pattern_reads_as_characters(self) -> None:
         plan = build_nemotron_h_hybrid_plan(
-            {**NEMOTRON_H_ARGS, "hybrid_override_pattern": "M*E"}, 3
+            {**NEMOTRON_H_ARGS, "hybrid_override_pattern": "M*E"}, 3, STATE_DTYPES
         )
 
         assert plan.layers.layer_roles == (
@@ -249,7 +256,9 @@ class TestNemotronHPlanDecision:
         )
 
     def test_spec_is_mamba2_typed_with_fp32_state(self) -> None:
-        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_ARGS, 6)
+        plan = build_nemotron_h_hybrid_plan(
+            NEMOTRON_H_ARGS, 6, (torch.bfloat16, torch.float32)
+        )
         expected = MambaSpec(
             shapes=((3, 160), (4, 8, 32)),
             dtypes=(torch.bfloat16, torch.float32),
@@ -260,7 +269,6 @@ class TestNemotronHPlanDecision:
         )
 
         spec = plan.state_cache_spec(
-            conv_dtype=torch.bfloat16,
             mamba_block_size=2048,
             page_size_padded=None,
             mamba_cache_mode="none",
@@ -269,7 +277,7 @@ class TestNemotronHPlanDecision:
         assert spec == expected
 
     def test_geometry_matches_the_built_mixer(self) -> None:
-        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_TINY_ARGS, 2)
+        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_TINY_ARGS, 2, STATE_DTYPES)
         mixer = NemotronHMamba2Mixer(ModelArgs(**NEMOTRON_H_TINY_ARGS))
 
         geometry = plan.geometry
@@ -281,7 +289,9 @@ class TestNemotronHPlanDecision:
         assert geometry.key_head_dim == mixer.ssm_state_size
 
     def test_spec_shapes_match_vllm_mamba2_calculator(self) -> None:
-        plan = build_nemotron_h_hybrid_plan(NEMOTRON_H_ARGS, 6)
+        plan = build_nemotron_h_hybrid_plan(
+            NEMOTRON_H_ARGS, 6, (torch.bfloat16, torch.float32)
+        )
         expected = MambaStateShapeCalculator.mamba2_state_shape(
             tp_world_size=1,
             intermediate_size=32,
@@ -293,7 +303,6 @@ class TestNemotronHPlanDecision:
         )
 
         spec = plan.state_cache_spec(
-            conv_dtype=torch.bfloat16,
             mamba_block_size=2048,
             page_size_padded=None,
             mamba_cache_mode="none",
@@ -309,7 +318,7 @@ class TestNemotronHPlanRejection:
         expected = f"Nemotron-H hybrid model args are missing required {missing!r}."
 
         with pytest.raises(ValueError) as excinfo:
-            build_nemotron_h_hybrid_plan(args, 6)
+            build_nemotron_h_hybrid_plan(args, 6, STATE_DTYPES)
         assert str(excinfo.value) == expected
 
     @pytest.mark.parametrize(("value", "shown"), [(0, "0"), ("32", "'32'")])
@@ -321,7 +330,7 @@ class TestNemotronHPlanRejection:
         )
 
         with pytest.raises(ValueError) as excinfo:
-            build_nemotron_h_hybrid_plan(args, 6)
+            build_nemotron_h_hybrid_plan(args, 6, STATE_DTYPES)
         assert str(excinfo.value) == expected
 
     def test_unknown_block_token_rejects(self) -> None:
@@ -329,7 +338,7 @@ class TestNemotronHPlanRejection:
         expected = "Nemotron-H hybrid_override_pattern must use M, *, - or E; got 'Z'."
 
         with pytest.raises(ValueError) as excinfo:
-            build_nemotron_h_hybrid_plan(args, 3)
+            build_nemotron_h_hybrid_plan(args, 3, STATE_DTYPES)
         assert str(excinfo.value) == expected
 
     @pytest.mark.parametrize(
@@ -343,7 +352,7 @@ class TestNemotronHPlanRejection:
         )
 
         with pytest.raises(ValueError) as excinfo:
-            build_nemotron_h_hybrid_plan(args, len(pattern))
+            build_nemotron_h_hybrid_plan(args, len(pattern), STATE_DTYPES)
         assert str(excinfo.value) == expected
 
 
@@ -368,7 +377,6 @@ class TestStateCacheSpec:
         )
 
         spec = plan.state_cache_spec(
-            conv_dtype=torch.float16,
             mamba_block_size=2048,
             page_size_padded=None,
             mamba_cache_mode="align",
@@ -397,11 +405,15 @@ class TestRuntimeUsesThePlan:
         assert str(excinfo.value) == expected
 
     def test_state_cache_is_sized_from_the_plan_geometry(self) -> None:
-        runtime = _make_runtime()
+        runtime = _make_runtime((torch.float32, torch.bfloat16))
 
         runtime.initialize(num_blocks=2)
 
         state_cache = runtime.state_cache
+        state_cache.ensure_capacity(1)
+        state_cache.ensure_capacity(2)
+        assert state_cache.conv_states[0].dtype == mx.float32
+        assert state_cache.recurrent_states[0].dtype == mx.bfloat16
         assert state_cache.num_layers == 2
         assert state_cache.conv_kernel_dim == 2
         assert state_cache.conv_dim == 4
@@ -487,17 +499,21 @@ class TestHybridPatchModel:
         assert wrapper_before._mamba2_state_cache is runtime_b.state_cache
         assert wrapper_before._mamba2_cache_idx == 1
 
-    def test_state_pool_dtype_mismatch_rejects_at_patch_time(self) -> None:
+    def test_nemotron_state_pool_dtype_mismatch_rejects_at_patch_time(self) -> None:
         runtime = HybridPagedAttentionRuntime(
-            hybrid_plan=_make_tiny_plan(),
+            hybrid_plan=make_nemotron_hybrid_plan(
+                "M-*M", state_dtypes=(torch.bfloat16, torch.float32)
+            ),
             max_num_seqs=2,
-            num_kv_heads=1,
-            head_dim=4,
+            num_kv_heads=2,
+            head_dim=8,
             block_size=4,
             dtype=mx.bfloat16,
         )
         runtime.initialize(num_blocks=2)
-        model = _FakeModel("sasa")
+        model = Model(
+            ModelArgs(**{**NEMOTRON_H_TINY_ARGS, "hybrid_override_pattern": "M-*M"})
+        )
         expected = (
             "state pool dtype mlx.core.bfloat16 does not match the layer 0 mixer "
             "dtype mlx.core.float32; pass --dtype matching the checkpoint so "

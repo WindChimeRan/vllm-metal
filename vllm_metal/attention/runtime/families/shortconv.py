@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import mlx.core as mx
+import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 from vllm_metal.attention.caches.shortconv_cache import ShortConvStateCache
@@ -28,7 +29,7 @@ def _create_shortconv_state_cache(
     num_layers: int,
     max_seqs: int,
     initial_seqs: int,
-    dtype: mx.Dtype,
+    dtypes: tuple[mx.Dtype, ...],
 ) -> ShortConvStateCache:
     if not isinstance(geometry, ConvStateGeometry):
         raise TypeError("ShortConv state cache requires convolution-only geometry")
@@ -38,7 +39,7 @@ def _create_shortconv_state_cache(
         conv_kernel_dim=geometry.conv_kernel_dim,
         conv_dim=geometry.conv_dim,
         initial_seqs=initial_seqs,
-        dtype=dtype,
+        dtype=dtypes[0],
     )
 
 
@@ -49,7 +50,6 @@ SHORTCONV_FAMILY = StateFamilySpec(
     wrapper_cls=ShortConvPagedWrapper,
     is_state_module=is_shortconv,
     mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
-    state_dtypes=(None,),
     supported_cache_modes=("none", "align"),
     # Served with the decode pipeline since it landed on main.
     supports_decode_pipeline=True,
@@ -59,7 +59,9 @@ SHORTCONV_FAMILY = StateFamilySpec(
 
 
 def build_shortconv_hybrid_plan(
-    model_args: Mapping[str, Any], num_layers: int
+    model_args: Mapping[str, Any],
+    num_layers: int,
+    state_dtypes: tuple[torch.dtype, ...],
 ) -> HybridRuntimePlan:
     """Resolve explicit attention/conv layer roles and the pre-conv tail shape."""
     layer_types = model_args.get("layer_types")
@@ -106,4 +108,5 @@ def build_shortconv_hybrid_plan(
         ),
         family=SHORTCONV_FAMILY,
         geometry=ConvStateGeometry(conv_kernel_dim=kernel, conv_dim=width),
+        state_dtypes=state_dtypes,
     )

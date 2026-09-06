@@ -1387,25 +1387,18 @@ class TestMetalPlatform:
         assert cache_config.enable_prefix_caching is True
         assert cache_config.mamba_cache_mode == "align"
 
-    @pytest.mark.parametrize(
-        ("dtype", "reject"),
-        [("auto", False), ("float16", True), ("bfloat16", True)],
-    )
-    def test_check_and_update_config_hybrid_gdn_state_dtype(
-        self, dtype: str, reject: bool, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("dtype", ["auto", "float16", "bfloat16", "float32"])
+    def test_check_and_update_config_preserves_upstream_state_dtype(
+        self, dtype: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         cache_config = CacheConfig(
             enable_prefix_caching=False, mamba_ssm_cache_dtype=dtype
         )
         vllm_config = self._hybrid_vllm_config(cache_config)
 
-        if reject:
-            with pytest.raises(NotImplementedError, match="require.*float32"):
-                MetalPlatform.check_and_update_config(vllm_config)
-        else:
-            self._patch_stt_resolution(monkeypatch, is_stt=False)
-            MetalPlatform.check_and_update_config(vllm_config)
-            assert cache_config.mamba_ssm_cache_dtype == "float32"
+        self._patch_stt_resolution(monkeypatch, is_stt=False)
+        MetalPlatform.check_and_update_config(vllm_config)
+        assert cache_config.mamba_ssm_cache_dtype == dtype
 
     def test_check_and_update_config_increases_max_num_scheduled_tokens_below_max_model_len(
         self, monkeypatch: pytest.MonkeyPatch

@@ -12,6 +12,7 @@ import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
 from vllm.logger import init_logger
+from vllm.model_executor.models import ModelRegistry
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
 from vllm_metal.attention.runtime.factory import build_hybrid_runtime_plan
@@ -494,8 +495,14 @@ class ModelLifecycle:
     def _install_hybrid_state_plan(self, args: dict[str, Any]) -> None:
         """Resolve the state family that owns this model's hybrid layers."""
         if self._runner.is_hybrid:
+            model_config = self._runner.model_config
+            model_cls, _ = ModelRegistry.resolve_model_cls(
+                model_config.architecture, model_config=model_config
+            )
             self._runner.hybrid_runtime_plan = build_hybrid_runtime_plan(
-                args, self._runner.num_layers
+                args,
+                self._runner.num_layers,
+                model_cls.get_mamba_state_dtype_from_config(self._runner.vllm_config),
             )
 
     def _install_runtime_extensions(

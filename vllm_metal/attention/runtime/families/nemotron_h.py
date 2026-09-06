@@ -116,8 +116,6 @@ NEMOTRON_H_FAMILY = StateFamilySpec(
     wrapper_cls=Mamba2PagedStateWrapper,
     is_state_module=is_mamba2_mixer,
     mamba_type=MambaAttentionBackendEnum.MAMBA2,
-    # Conv tail follows the runtime dtype; match the fp32 SSM state of ssm_update.
-    state_dtypes=(None, torch.float32),
     # One private slot per resident request; state is not block-keyed.
     supported_cache_modes=("none",),
     # Full-step path only; not validated on the decode pipeline.
@@ -129,7 +127,9 @@ NEMOTRON_H_FAMILY = StateFamilySpec(
 
 
 def build_nemotron_h_hybrid_plan(
-    model_args: Mapping[str, Any], num_layers: int
+    model_args: Mapping[str, Any],
+    num_layers: int,
+    state_dtypes: tuple[torch.dtype, ...],
 ) -> HybridRuntimePlan:
     """Resolve Nemotron-H block roles and Mamba-2 geometry from model args."""
     nemotron_config = NemotronHHybridConfig.from_model_args(model_args)
@@ -137,4 +137,5 @@ def build_nemotron_h_hybrid_plan(
         layers=HybridLayerPlan(layer_roles=nemotron_config.layer_roles()),
         family=NEMOTRON_H_FAMILY,
         geometry=nemotron_config.state_geometry(),
+        state_dtypes=state_dtypes,
     )

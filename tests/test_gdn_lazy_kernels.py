@@ -18,6 +18,7 @@ from vllm_metal.attention.impls.gdn_lazy import (
     GDNRecurrentDecodeRequest,
     GDNRecurrentPrefillRequest,
 )
+from vllm_metal.attention.impls.linear import GDNPagedAttentionWrapper, _GDNForwardState
 from vllm_metal.metal import get_ops
 
 
@@ -276,6 +277,8 @@ def _make_state_cache(
     num_v_heads: int = 1,
     value_head_dim: int = 4,
     key_head_dim: int = 32,
+    dtype: mx.Dtype = mx.float32,
+    recurrent_dtype: mx.Dtype = mx.float32,
 ) -> GDNPagedStateCache:
     return GDNPagedStateCache(
         num_layers=num_layers,
@@ -285,7 +288,8 @@ def _make_state_cache(
         num_v_heads=num_v_heads,
         value_head_dim=value_head_dim,
         key_head_dim=key_head_dim,
-        dtype=mx.float32,
+        dtype=dtype,
+        recurrent_dtype=recurrent_dtype,
     )
 
 
@@ -432,20 +436,28 @@ class TestLazyConvDecode:
         expected_state[slot_ids] = 9
         np.testing.assert_array_equal(np.array(cache.conv_states[0]), expected_state)
 
-    def test_mixed_dtype_state_update_matches_eager_conv(self) -> None:
+    @pytest.mark.parametrize(
+        "input_dtype,state_dtype",
+        [(mx.float32, mx.bfloat16), (mx.bfloat16, mx.float32)],
+    )
+    def test_mixed_dtype_state_update_matches_eager_conv(
+        self, input_dtype, state_dtype
+    ) -> None:
         # Arrange
         _require_metal()
         mx.random.seed(1)
         conv_dim = 4
         kernel_size = 3
-        cache = _make_state_cache(conv_kernel_dim=kernel_size, conv_dim=conv_dim)
-        initial_state = mx.random.normal(cache.conv_states[0].shape).astype(mx.bfloat16)
+        cache = _make_state_cache(
+            conv_kernel_dim=kernel_size, conv_dim=conv_dim, dtype=state_dtype
+        )
+        initial_state = mx.random.normal(cache.conv_states[0].shape).astype(state_dtype)
         cache.conv_states[0] = mx.array(initial_state)
         weight = mx.random.normal((conv_dim, kernel_size)).astype(mx.float32)
         inner = SimpleNamespace(
             conv_kernel_size=kernel_size, conv1d=_DepthwiseConv1D(weight)
         )
-        mixed_qkv = mx.random.normal((1, 2, conv_dim)).astype(mx.float32)
+        mixed_qkv = mx.random.normal((1, 2, conv_dim)).astype(input_dtype)
         slot_ids = [1, 0]
 
         expected_state = mx.array(initial_state)
@@ -460,7 +472,7 @@ class TestLazyConvDecode:
             )
             expected_state[slot : slot + 1] = conv_input[
                 :, -(kernel_size - 1) :
-            ].astype(mx.bfloat16)
+            ].astype(state_dtype)
             expected_outputs.append(nn.silu(inner.conv1d(conv_input))[:, -1:])
         expected = mx.concatenate(expected_outputs, axis=1)
 
@@ -473,7 +485,7 @@ class TestLazyConvDecode:
         assert actual is not None
         mx.eval(actual, expected, cache.conv_states[0], expected_state)
         assert actual.dtype == mx.float32
-        assert cache.conv_states[0].dtype == mx.bfloat16
+        assert cache.conv_states[0].dtype == state_dtype
         np.testing.assert_allclose(np.array(actual), np.array(expected), atol=5e-3)
         np.testing.assert_allclose(
             np.array(cache.conv_states[0].astype(mx.float32)),
@@ -537,7 +549,7 @@ class TestLazyConvPrefill:
             conv_kernel_size=kernel_size, conv1d=_DepthwiseConv1D(weight)
         )
         slot_ids = [3, 1]
-        mixed_qkv = mx.random.normal((1, total_tokens, conv_dim)).astype(mx.float32)
+        mixed_qkv = mx.random.normal((1, total_tokens, conv_dim)).astype(mx.bfloat16)
 
         expected_state = mx.array(initial_state)
         expected_outputs = []
@@ -956,7 +968,9 @@ class TestLazyRecurrentDecode:
         assert result is not None
         assert fake_kernel.threadgroup == (32, 8, 1)
 
-    def test_matches_cpp_recurrent_path(self) -> None:
+    @pytest.mark.parametrize("input_dtype", [mx.float32, mx.bfloat16, mx.float16])
+    @pytest.mark.parametrize("state_dtype", [mx.float32, mx.bfloat16, mx.float16])
+    def test_matches_cpp_recurrent_path(self, input_dtype, state_dtype) -> None:
         # Arrange
         _require_metal()
         mx.random.seed(0)
@@ -966,19 +980,23 @@ class TestLazyRecurrentDecode:
         d_k = 32
         d_v = 4
         slot_ids = [1, 0]
-        cache_lazy = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
-        cache_cpp = _make_state_cache(value_head_dim=d_v, key_head_dim=d_k)
+        cache_lazy = _make_state_cache(
+            value_head_dim=d_v, key_head_dim=d_k, recurrent_dtype=state_dtype
+        )
+        cache_cpp = _make_state_cache(
+            value_head_dim=d_v, key_head_dim=d_k, recurrent_dtype=state_dtype
+        )
         initial_state = mx.random.normal(cache_lazy.recurrent_states[0].shape).astype(
-            mx.float32
+            state_dtype
         )
         cache_lazy.recurrent_states[0] = mx.array(initial_state)
         cache_cpp.recurrent_states[0] = mx.array(initial_state)
 
-        q = mx.random.normal((1, total_tokens, n_hk, d_k)).astype(mx.float32)
-        k = mx.random.normal((1, total_tokens, n_hk, d_k)).astype(mx.float32)
-        v = mx.random.normal((1, total_tokens, n_hv, d_v)).astype(mx.float32)
-        g = mx.random.normal((1, total_tokens, n_hv)).astype(mx.float32)
-        beta = mx.random.normal((1, total_tokens, n_hv)).astype(mx.float32)
+        q = mx.random.normal((1, total_tokens, n_hk, d_k)).astype(input_dtype)
+        k = mx.random.normal((1, total_tokens, n_hk, d_k)).astype(input_dtype)
+        v = mx.random.normal((1, total_tokens, n_hv, d_v)).astype(input_dtype)
+        g = mx.random.normal((1, total_tokens, n_hv)).astype(input_dtype)
+        beta = mx.random.normal((1, total_tokens, n_hv)).astype(input_dtype)
         request = _recurrent_request(
             q=q,
             k=k,
@@ -987,6 +1005,7 @@ class TestLazyRecurrentDecode:
             beta=beta,
             cache=cache_lazy,
             slot_ids=slot_ids,
+            output_dtype=input_dtype,
         )
 
         # Act
@@ -999,35 +1018,24 @@ class TestLazyRecurrentDecode:
         cache_lazy.apply_pending_recurrent_state(0)
         mx.eval(lazy_out, cache_lazy.recurrent_states[0])
 
-        q_flat = mx.contiguous(q.reshape(total_tokens, n_hk, d_k))
-        k_flat = mx.contiguous(k.reshape(total_tokens, n_hk, d_k))
-        v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v))
-        g_flat = mx.contiguous(g.reshape(total_tokens, n_hv))
-        beta_flat = mx.contiguous(beta.reshape(total_tokens, n_hv))
-        cpp_out = mx.zeros((total_tokens, n_hv, d_v), dtype=mx.float32)
-        mx.eval(
-            q_flat,
-            k_flat,
-            v_flat,
-            g_flat,
-            beta_flat,
-            cache_cpp.recurrent_states[0],
-            cpp_out,
+        _get_native_ops_or_skip()
+        fallback = GDNPagedAttentionWrapper(
+            _TinyGDNInner(), layer_idx=0, cache_idx=0, state_cache=cache_cpp
         )
-        _get_native_ops_or_skip().gdn_linear_attention(
-            q_flat,
-            k_flat,
-            v_flat,
-            g_flat,
-            beta_flat,
-            cache_cpp.recurrent_states[0],
-            mx.array([0, 1, 2], dtype=mx.int32),
-            mx.array(slot_ids, dtype=mx.int32),
-            cpp_out,
-            n_hk,
-            n_hv,
-            d_k,
-            d_v,
+        cpp_out = fallback._run_recurrent_fallback(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            _GDNForwardState(
+                x=mx.zeros((1, total_tokens, 68), dtype=input_dtype),
+                cu_seqlens=[0, 1, 2],
+                num_requests=2,
+                total_tokens=total_tokens,
+                slot_ids=slot_ids,
+                num_decode_requests=2,
+            ),
         )
         mx.synchronize()
         mx.eval(
@@ -1036,14 +1044,16 @@ class TestLazyRecurrentDecode:
             cache_lazy.recurrent_states[0],
             cache_cpp.recurrent_states[0],
         )
-        np.testing.assert_allclose(np.array(lazy_out), np.array(cpp_out), atol=1e-4)
-        # The lazy typed prefill path intentionally runs the recurrence at the
-        # requested output dtype to avoid extra graph casts.  The fallback C++
-        # oracle above runs in fp32, so the state can differ slightly more than
-        # the rounded y output while still remaining numerically close.
         np.testing.assert_allclose(
-            np.array(cache_lazy.recurrent_states[0]),
-            np.array(cache_cpp.recurrent_states[0]),
+            np.array(lazy_out.astype(mx.float32)),
+            np.array(cpp_out.astype(mx.float32)),
+            atol=1e-4,
+        )
+        assert cache_lazy.recurrent_states[0].dtype == state_dtype
+        assert cache_cpp.recurrent_states[0].dtype == state_dtype
+        np.testing.assert_allclose(
+            np.array(cache_lazy.recurrent_states[0].astype(mx.float32)),
+            np.array(cache_cpp.recurrent_states[0].astype(mx.float32)),
             atol=1e-3,
         )
 

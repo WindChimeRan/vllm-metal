@@ -67,6 +67,7 @@ def _make_module() -> ShortConv:
 
 def _make_wrapper(
     module: ShortConv,
+    state_dtype: mx.Dtype = mx.float32,
 ) -> tuple[ShortConvPagedWrapper, ShortConvStateCache]:
     state_cache = ShortConvStateCache(
         num_layers=1,
@@ -74,7 +75,7 @@ def _make_wrapper(
         conv_kernel_dim=L_CACHE,
         conv_dim=HIDDEN,
         initial_seqs=MAX_SEQS,
-        dtype=mx.float32,
+        dtype=state_dtype,
     )
     wrapper = ShortConvPagedWrapper(
         module, layer_idx=0, cache_idx=0, state_cache=state_cache
@@ -130,18 +131,22 @@ def _run_wrapper_step(
 
 def _assert_close(actual: mx.array, expected: mx.array) -> None:
     np.testing.assert_allclose(
-        np.array(actual, copy=False),
-        np.array(expected, copy=False),
+        np.array(actual.astype(mx.float32), copy=False),
+        np.array(expected.astype(mx.float32), copy=False),
         atol=ATOL,
         rtol=RTOL,
     )
 
 
 class TestShortConvPagedWrapper:
+    @pytest.mark.parametrize("input_dtype", [mx.float32, mx.bfloat16])
+    @pytest.mark.parametrize("state_dtype", [mx.float32, mx.bfloat16, mx.float16])
     @pytest.mark.parametrize(
         "grouped", [False, True], ids=["request-slots", "block-slots"]
     )
-    def test_packed_multi_request_matches_sequential_reference(self, grouped) -> None:
+    def test_packed_multi_request_matches_sequential_reference(
+        self, grouped, input_dtype, state_dtype
+    ) -> None:
         """Three requests packed per step vs mlx_lm cache-by-cache reference.
 
         Runs a prefill step and two decode steps; both the per-step outputs
@@ -149,14 +154,14 @@ class TestShortConvPagedWrapper:
         """
         mx.random.seed(0)
         module = _make_module()
-        wrapper, state_cache = _make_wrapper(module)
+        module.set_dtype(input_dtype)
+        wrapper, state_cache = _make_wrapper(module, state_dtype)
 
         slot_ids = [2, 0, 5]
         # Per request: prefill chunk then two single-token decode chunks.
         request_chunks = [
-            [mx.random.normal((1, t, HIDDEN)) for t in (5, 1, 1)],
-            [mx.random.normal((1, t, HIDDEN)) for t in (3, 1, 1)],
-            [mx.random.normal((1, t, HIDDEN)) for t in (7, 1, 1)],
+            [mx.random.normal((1, t, HIDDEN)).astype(input_dtype) for t in lengths]
+            for lengths in ((5, 1, 1), (3, 1, 1), (7, 1, 1))
         ]
 
         # Reference: each request sequentially with mlx_lm's own cache.
@@ -164,9 +169,12 @@ class TestShortConvPagedWrapper:
         ref_caches: list[ArraysCache] = []
         for chunks in request_chunks:
             cache = ArraysCache(size=1)
-            ref_outputs.append(
-                [module(chunk, mask=None, cache=cache) for chunk in chunks]
-            )
+            cache[0] = mx.zeros((1, L_CACHE - 1, HIDDEN), dtype=state_dtype)
+            outputs = []
+            for chunk in chunks:
+                outputs.append(module(chunk, mask=None, cache=cache))
+                cache[0] = cache[0].astype(state_dtype)
+            ref_outputs.append(outputs)
             ref_caches.append(cache)
 
         # Wrapper: the three requests packed together, one step at a time.
@@ -177,6 +185,7 @@ class TestShortConvPagedWrapper:
                 _assert_close(outputs[req], ref_outputs[req][step])
 
         # Final per-request conv state must match the mlx_lm cache tail.
+        assert state_cache.conv_states[0].dtype == state_dtype
         for req, slot in enumerate(slot_ids):
             _assert_close(
                 state_cache.conv_states[0][slot : slot + 1],

@@ -69,6 +69,7 @@ class GDNPagedStateCache:
         key_head_dim: int,
         initial_seqs: int | None = None,
         dtype: mx.Dtype = mx.float16,
+        recurrent_dtype: mx.Dtype = mx.float32,
     ) -> None:
         if dtype not in (mx.float16, mx.bfloat16, mx.float32):
             raise ValueError(f"Unsupported dtype for GDN state cache: {dtype}")
@@ -91,14 +92,14 @@ class GDNPagedStateCache:
         self.value_head_dim = value_head_dim
         self.key_head_dim = key_head_dim
         self.dtype = dtype
+        self.recurrent_dtype = recurrent_dtype
 
         self.conv_states: list[mx.array] = [
             mx.zeros(self._conv_shape(initial_seqs), dtype=dtype)
             for _ in range(num_layers)
         ]
-        # Recurrent state uses float32 to avoid overflow in kernel accumulation.
         self.recurrent_states: list[mx.array] = [
-            mx.zeros(self._recurrent_shape(initial_seqs), dtype=mx.float32)
+            mx.zeros(self._recurrent_shape(initial_seqs), dtype=recurrent_dtype)
             for _ in range(num_layers)
         ]
         self.pending_conv_states: list[mx.array | None] = [
@@ -177,7 +178,9 @@ class GDNPagedStateCache:
                 conv[:old_allocated] = old_conv
 
             old_recurrent = self.recurrent_states[layer_idx]
-            recurrent = mx.zeros(self._recurrent_shape(num_seqs), dtype=mx.float32)
+            recurrent = mx.zeros(
+                self._recurrent_shape(num_seqs), dtype=self.recurrent_dtype
+            )
             if old_allocated:
                 recurrent[:old_allocated] = old_recurrent
 

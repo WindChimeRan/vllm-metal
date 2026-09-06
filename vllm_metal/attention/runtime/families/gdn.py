@@ -105,7 +105,7 @@ def create_gdn_state_cache(
     num_layers: int,
     max_seqs: int,
     initial_seqs: int,
-    dtype: mx.Dtype,
+    dtypes: tuple[mx.Dtype, ...],
 ) -> GDNPagedStateCache:
     if not isinstance(geometry, RecurrentStateGeometry):
         raise TypeError("GDN state cache requires recurrent state geometry")
@@ -118,7 +118,8 @@ def create_gdn_state_cache(
         value_head_dim=geometry.value_head_dim,
         key_head_dim=geometry.key_head_dim,
         initial_seqs=initial_seqs,
-        dtype=dtype,
+        dtype=dtypes[0],
+        recurrent_dtype=dtypes[1],
     )
 
 
@@ -133,8 +134,6 @@ GDN_FAMILY = StateFamilySpec(
     wrapper_cls=GDNPagedAttentionWrapper,
     is_state_module=is_linear_attention,
     mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
-    # Match the fp32 recurrent pool used for kernel accumulation.
-    state_dtypes=(None, torch.float32),
     # Scheduler-side mamba caching strategies the GDN state path implements.
     supported_cache_modes=("none", "align"),
     supports_decode_pipeline=True,
@@ -144,7 +143,9 @@ GDN_FAMILY = StateFamilySpec(
 
 
 def build_gdn_hybrid_plan(
-    model_args: Mapping[str, Any], num_layers: int
+    model_args: Mapping[str, Any],
+    num_layers: int,
+    state_dtypes: tuple[torch.dtype, ...],
 ) -> HybridRuntimePlan:
     """Resolve GDN layer topology and recurrent geometry from model args."""
     gdn_config = GDNHybridConfig.from_model_args(model_args)
@@ -152,4 +153,5 @@ def build_gdn_hybrid_plan(
         layers=HybridLayerPlan(layer_roles=gdn_config.layer_roles(num_layers)),
         family=GDN_FAMILY,
         geometry=gdn_config.state_geometry(),
+        state_dtypes=state_dtypes,
     )

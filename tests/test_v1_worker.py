@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
+import torch
 
 pytest.importorskip("vllm", reason="vllm not installed")
 
@@ -547,6 +548,7 @@ class TestAlignStateSizing:
                     "linear_conv_kernel_dim": 2,
                 },
                 24,
+                (torch.float16, torch.float32),
             ),
         )
 

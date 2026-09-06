@@ -150,7 +150,7 @@ def test_hybrid_one_sequence_estimate_charges_vllm_group_padding() -> None:
         ),
     )
     attention_layer_bytes = 2 * cdiv(2048, 544) * 544 * 2 * 1 * 128
-    state_layer_bytes = plan.state_bytes_per_layer(2)
+    state_layer_bytes = plan.state_bytes_per_layer()
     expected = 2 * attention_layer_bytes + 6 * state_layer_bytes
 
     estimate = runner._cache_policy.estimate_one_sequence_kv_bytes(
