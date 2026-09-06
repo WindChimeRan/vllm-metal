@@ -8,8 +8,6 @@ the wrapper writes only the destination selected for each request.
 
 from __future__ import annotations
 
-from typing import Any
-
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -52,7 +50,6 @@ class ShortConvPagedWrapper(nn.Module):
         x: mx.array,
         mask: mx.array | None = None,
         cache: nn.Module | None = None,
-        **kwargs: Any,
     ) -> mx.array:
         ctx = get_context()
         if ctx is None:
