@@ -21,7 +21,7 @@ from vllm_metal.attention.impls.sdpa import is_sdpa
 from vllm_metal.attention.impls.sdpa_wrapper import (
     SDPAPagedAttentionWrapper,
 )
-from vllm_metal.attention.patching import walk_and_wrap
+from vllm_metal.attention.patching import DEFAULT_ATTN_ATTR_NAMES, walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
 from vllm_metal.attention.state import AlignStateManager, RequestStateManager
@@ -209,7 +209,13 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
                 f"the hybrid plan but {type(attn).__name__} is not SDPA."
             )
 
-        return walk_and_wrap(model, wrap_layer)
+        # Stateless layers keep their module; only plan-owned layers are probed.
+        return walk_and_wrap(
+            model,
+            wrap_layer,
+            only_layers=[*layer_plan.attention_indices, *layer_plan.state_indices],
+            attr_names=(*DEFAULT_ATTN_ATTR_NAMES, self._hybrid_plan.family.layer_name),
+        )
 
     @property
     def kv_cache(self) -> MetalPagedKVCache:

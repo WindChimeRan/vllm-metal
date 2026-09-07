@@ -21,10 +21,11 @@ from vllm.v1.kv_cache_interface import MambaSpec
 
 from vllm_metal.attention.caches.protocol import PagedStateCache
 
-LayerRole: TypeAlias = Literal["attention", "state"]
+LayerRole: TypeAlias = Literal["attention", "state", "stateless"]
 
 ATTENTION_LAYER: LayerRole = "attention"
 STATE_LAYER: LayerRole = "state"
+STATELESS_LAYER: LayerRole = "stateless"
 
 
 class PagedStateWrapper(Protocol):
@@ -45,7 +46,7 @@ class PagedStateWrapper(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class HybridLayerPlan:
-    """Which model layers own paged attention KV pages and which own state.
+    """Which model layers own paged KV pages, which own state, and which own neither.
 
     ``layer_roles`` is the single source of truth; index tuples and counts
     are derived from it on access.
@@ -84,6 +85,10 @@ class HybridLayerPlan:
     def is_state_layer(self, layer_idx: int) -> bool:
         """Return whether ``layer_idx`` is owned by the state runtime."""
         return self.layer_roles[layer_idx] == STATE_LAYER
+
+    def is_attention_layer(self, layer_idx: int) -> bool:
+        """Return whether ``layer_idx`` owns paged attention KV pages."""
+        return self.layer_roles[layer_idx] == ATTENTION_LAYER
 
     def attention_cache_index(self, layer_idx: int) -> int:
         """Return the compact KV cache ordinal owned by an attention layer."""
@@ -153,6 +158,7 @@ class StateFamilySpec:
     # accumulation state such as GDN's fp32 recurrent matrix.
     state_dtypes: tuple[torch.dtype | None, ...]
     supported_cache_modes: tuple[str, ...]
+    supports_decode_pipeline: bool
     layer_name: str
     create_state_cache: StateCacheFactory
 

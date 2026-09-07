@@ -42,20 +42,20 @@ def _create_shortconv_state_cache(
     )
 
 
-_SHORTCONV_FAMILY = StateFamilySpec(
+SHORTCONV_MODEL_TYPES = frozenset({"lfm2", "lfm2_moe"})
+
+SHORTCONV_FAMILY = StateFamilySpec(
     label="shortconv",
     wrapper_cls=ShortConvPagedWrapper,
     is_state_module=is_shortconv,
     mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
     state_dtypes=(None,),
     supported_cache_modes=("none", "align"),
+    # Served with the decode pipeline since it landed on main.
+    supports_decode_pipeline=True,
     layer_name="conv",
     create_state_cache=_create_shortconv_state_cache,
 )
-
-
-def supports_shortconv_hybrid(model_args: Mapping[str, Any]) -> bool:
-    return model_args.get("model_type") in ("lfm2", "lfm2_moe")
 
 
 def build_shortconv_hybrid_plan(
@@ -104,6 +104,6 @@ def build_shortconv_hybrid_plan(
                 for role in layer_types
             )
         ),
-        family=_SHORTCONV_FAMILY,
+        family=SHORTCONV_FAMILY,
         geometry=ConvStateGeometry(conv_kernel_dim=kernel, conv_dim=width),
     )

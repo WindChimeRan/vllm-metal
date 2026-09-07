@@ -29,12 +29,14 @@ _EXPANDED_RECURRENT_DECODE_THREADGROUP_DV = 8
 
 
 def is_linear_attention(module: nn.Module) -> bool:
-    """Return True if *module* is a linear attention layer (e.g. GatedDeltaNet).
+    """Return True for an mlx_lm GatedDeltaNet module (Qwen3.5 family, Qwen3-Next).
 
-    Checks for ``conv1d`` (present in all known GatedDeltaNet variants) and
-    the absence of ``q_proj`` (which would indicate SDPA).
+    Matches the projection layout the wrapper dispatches on, so Mamba-2 mixers
+    (``in_proj`` + ``conv1d``) are not mistaken for GDN.
     """
-    return hasattr(module, "conv1d") and not hasattr(module, "q_proj")
+    return hasattr(module, "conv1d") and (
+        hasattr(module, "in_proj_qkv") or hasattr(module, "in_proj_qkvz")
+    )
 
 
 @dataclass(frozen=True)
@@ -116,6 +118,7 @@ class GDNPagedAttentionWrapper(nn.Module):
         state_cache: GDNPagedStateCache,
     ) -> None:
         super().__init__()
+        state_cache.require_mixer_dtype(inner.conv1d.weight.dtype, layer_idx=layer_idx)
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_gdn_layer_idx", layer_idx)
         object.__setattr__(self, "_gdn_cache_idx", cache_idx)
@@ -159,18 +162,9 @@ class GDNPagedAttentionWrapper(nn.Module):
             raise RuntimeError("GDN wrapper requires cu_seqlens in context")
 
         num_requests = len(cu_seqlens) - 1
-        if ctx.state_group_slot_mappings is not None:
-            ordinal = self._gdn_state_cache.layer_group_ordinal(self._gdn_cache_idx)
-            slot_ids = ctx.state_group_slot_mappings[ordinal]
-        elif ctx.state_slot_mapping is not None:
-            slot_ids = ctx.state_slot_mapping
-        else:
-            raise RuntimeError("GDN wrapper requires state_slot_mapping in context")
-        if len(slot_ids) != num_requests:
-            raise RuntimeError("GDN wrapper requires one slot per request")
-        if len(set(slot_ids)) != len(slot_ids):
-            raise RuntimeError("GDN wrapper requires unique slots per request")
-        self._gdn_state_cache.require_allocated_slots(slot_ids)
+        slot_ids = self._gdn_state_cache.step_slot_ids(
+            ctx, self._gdn_cache_idx, num_requests
+        )
 
         return _GDNForwardState(
             x=x,
