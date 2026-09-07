@@ -98,4 +98,4 @@ class ShortConvPagedWrapper(nn.Module):
         # All tokens in this forward are committed. Speculative verification
         # remains rejected because it would require rolling this state back.
         state_cache.write_conv_rows(cache_idx, updates, ids)
-        return inner.out_proj(c_gate * conv_out)
+        return inner.out_proj(c_gate * conv_out).astype(x.dtype)

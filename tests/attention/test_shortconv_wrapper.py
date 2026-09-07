@@ -182,7 +182,8 @@ class TestShortConvPagedWrapper:
             chunks = [request_chunks[req][step] for req in range(3)]
             outputs = _run_wrapper_step(wrapper, chunks, slot_ids, grouped)
             for req in range(3):
-                _assert_close(outputs[req], ref_outputs[req][step])
+                assert outputs[req].dtype == input_dtype
+                _assert_close(outputs[req], ref_outputs[req][step].astype(input_dtype))
 
         # Final per-request conv state must match the mlx_lm cache tail.
         assert state_cache.conv_states[0].dtype == state_dtype
