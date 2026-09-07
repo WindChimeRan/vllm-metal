@@ -417,6 +417,13 @@ class GDNPagedAttentionWrapper(nn.Module):
         # Promote only as needed to preserve input, state, and output precision.
         recurrent_pool = self._gdn_state_cache.recurrent_states[self._gdn_cache_idx]
         kernel_dtype = mx.result_type(q, k, v, g, beta, recurrent_pool, state.x)
+        if recurrent_pool.dtype != kernel_dtype:
+            raise RuntimeError(
+                f"GDN fallback does not support {recurrent_pool.dtype} recurrent "
+                f"state with {kernel_dtype} kernel buffers. Set "
+                f"--mamba-ssm-cache-dtype {str(kernel_dtype).removeprefix('mlx.core.')} "
+                "to enable in-place state updates."
+            )
         q_flat = mx.contiguous(q.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype))
         k_flat = mx.contiguous(k.reshape(total_tokens, n_hk, d_k).astype(kernel_dtype))
         v_flat = mx.contiguous(v.reshape(total_tokens, n_hv, d_v).astype(kernel_dtype))
@@ -425,16 +432,9 @@ class GDNPagedAttentionWrapper(nn.Module):
 
         cu_seqlens_arr = mx.array(state.cu_seqlens, dtype=mx.int32)
         # Stable request → slot mapping from model_runner's allocator.
-        slot_ids = mx.array(state.slot_ids, dtype=mx.int32)
-        slot_mapping = slot_ids
+        slot_mapping = mx.array(state.slot_ids, dtype=mx.int32)
 
         y_flat = mx.zeros((total_tokens, n_hv, d_v), dtype=kernel_dtype)
-        cast_state = recurrent_pool.dtype != kernel_dtype
-        if cast_state:
-            recurrent_pool = mx.contiguous(
-                recurrent_pool[slot_mapping].astype(kernel_dtype)
-            )
-            slot_mapping = mx.arange(state.num_requests, dtype=mx.int32)
 
         mx.eval(
             q_flat,
@@ -465,12 +465,6 @@ class GDNPagedAttentionWrapper(nn.Module):
             d_v,
         )
         mx.eval(y_flat, recurrent_pool)
-        if cast_state:
-            self._gdn_state_cache.write_recurrent_rows(
-                self._gdn_cache_idx,
-                recurrent_pool,
-                slot_ids,
-            )
         return y_flat.astype(state.x.dtype)
 
     def _project_output(

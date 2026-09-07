@@ -1022,7 +1022,7 @@ class TestLazyRecurrentDecode:
         fallback = GDNPagedAttentionWrapper(
             _TinyGDNInner(), layer_idx=0, cache_idx=0, state_cache=cache_cpp
         )
-        cpp_out = fallback._run_recurrent_fallback(
+        fallback_args = (
             q,
             k,
             v,
@@ -1037,6 +1037,11 @@ class TestLazyRecurrentDecode:
                 num_decode_requests=2,
             ),
         )
+        if mx.result_type(input_dtype, state_dtype) != state_dtype:
+            with pytest.raises(RuntimeError, match="--mamba-ssm-cache-dtype float32"):
+                fallback._run_recurrent_fallback(*fallback_args)
+            return
+        cpp_out = fallback._run_recurrent_fallback(*fallback_args)
         mx.synchronize()
         mx.eval(
             lazy_out,
