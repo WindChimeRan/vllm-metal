@@ -14,6 +14,7 @@ import pytest
 import torch
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
 from mlx_lm.models.nemotron_h import ModelArgs as NemotronHModelArgs
+from vllm.model_executor.models import ModelRegistry
 
 import vllm_metal.envs as envs
 from tests.stub_runner import NEMOTRON_H_TINY_ARGS, make_stub_runner
@@ -60,6 +61,7 @@ def _runner_model_config(**overrides: object) -> object:
         "is_hybrid": False,
         "architecture": "Qwen3NextForCausalLM",
         "model_impl": "vllm",
+        "registry": ModelRegistry,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -1196,6 +1198,23 @@ class TestResolveModelDims:
             torch.bfloat16,
             torch.bfloat16,
         )
+
+    def test_hybrid_state_dtypes_come_from_the_configured_registry(self) -> None:
+        state_dtypes = (torch.float32, torch.float16)
+        model_cls = SimpleNamespace(
+            get_mamba_state_dtype_from_config=lambda _: state_dtypes
+        )
+        registry = SimpleNamespace(
+            resolve_model_cls=lambda *_args, **_kwargs: (model_cls, "override")
+        )
+        lifecycle, runner = _make_lifecycle(
+            model_args=_GDN_HYBRID_ARGS,
+            model_config=_runner_model_config(is_hybrid=True, registry=registry),
+        )
+
+        lifecycle.resolve_model_dims()
+
+        assert runner.hybrid_runtime_plan.state_dtypes == state_dtypes
 
     def test_routing_follows_the_typed_field_not_the_args(self) -> None:
         runner = self._resolve(_GDN_HYBRID_ARGS, is_hybrid=False)

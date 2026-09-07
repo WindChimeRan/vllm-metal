@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 import torch
+from vllm.model_executor.models import ModelRegistry
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_config_from_groups,
@@ -95,6 +96,7 @@ def _runner(model, *, mode="align", cache_dtype="auto"):
         model_config=SimpleNamespace(
             is_hybrid=True,
             model_impl="vllm",
+            registry=ModelRegistry,
             architecture=(
                 "Lfm2ForCausalLM"
                 if model.args.model_type == "lfm2"
