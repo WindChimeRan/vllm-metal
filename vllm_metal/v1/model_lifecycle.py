@@ -498,11 +498,26 @@ class ModelLifecycle:
             model_cls, _ = model_config.registry.resolve_model_cls(
                 model_config.architecture, model_config=model_config
             )
-            self._runner.hybrid_runtime_plan = build_hybrid_runtime_plan(
+            plan = build_hybrid_runtime_plan(
                 args,
                 self._runner.num_layers,
                 model_cls.get_mamba_state_dtype_from_config(self._runner.vllm_config),
             )
+            if plan.family.label == "gdn":
+                # Every request shape must be supported by the in-place fallback.
+                conv_dtype, recurrent_dtype = plan.state_dtypes
+                kernel_dtype = torch.promote_types(
+                    torch.promote_types(model_config.dtype, conv_dtype), recurrent_dtype
+                )
+                if recurrent_dtype != kernel_dtype:
+                    raise ValueError(
+                        "GDN on Metal cannot update recurrent state in place with "
+                        f"model={model_config.dtype}, conv={conv_dtype}, "
+                        f"recurrent={recurrent_dtype}. Set --mamba-ssm-cache-dtype "
+                        f"{str(kernel_dtype).removeprefix('torch.')} "
+                        "to support all request shapes."
+                    )
+            self._runner.hybrid_runtime_plan = plan
 
     def _install_runtime_extensions(
         self,
