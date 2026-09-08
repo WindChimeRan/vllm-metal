@@ -388,6 +388,7 @@ class MetalModelRunner:
         self._pooling_backend: ExecutablePoolingBackend | None = None
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
+        self._eagle3_model: Any | None = None
         self._drafter: MetalProposer | None = None
         # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
         # can size a scheduler-visible KV-cache group for the draft model
@@ -395,7 +396,7 @@ class MetalModelRunner:
         # The draft's MLX weights load later, in `install_drafter`.
         self._draft_dims: DraftDims | None = None
         spec = vllm_config.speculative_config
-        if spec is not None and spec.uses_draft_model():
+        if spec is not None and (spec.uses_draft_model() or spec.method == "eagle3"):
             from vllm_metal.v1.draft_model_proposer import resolve_draft_dims
 
             self._draft_dims = resolve_draft_dims(spec, vllm_config.parallel_config)
@@ -970,6 +971,19 @@ class MetalModelRunner:
             return
         if Gemma4MTPAssistantSource.is_gemma4_mtp(spec):
             self._drafter = Gemma4MTPProposer(self)
+        elif spec.method == "eagle3":
+            from vllm_metal.v1.eagle3_proposer import Eagle3Proposer
+
+            if self._eagle3_model is None:
+                raise RuntimeError("EAGLE3 head was not loaded before cache allocation")
+            self._drafter = Eagle3Proposer.build(
+                model=self._eagle3_model,
+                controller=self._spec_decode_controller,
+                committed_num_blocks=num_blocks,
+                scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
+                block_size=block_size,
+                dtype=self.kv_cache_dtype,
+            )
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
@@ -1003,7 +1017,7 @@ class MetalModelRunner:
         else:
             raise NotImplementedError(
                 f"Speculative method {spec.method!r} is not supported on Metal "
-                "(supported: Gemma4 MTP, draft_model, ngram)."
+                "(supported: Gemma4 MTP, eagle3, draft_model, ngram)."
             )
 
     def warm_up(self) -> None:

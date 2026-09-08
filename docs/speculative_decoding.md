@@ -1,19 +1,19 @@
 # Speculative Decoding
 
-vllm-metal supports three speculative decoding methods on the paged-attention
+vllm-metal implements four speculative decoding methods on the paged-attention
 path. Use vLLM's [speculative decoding guide](https://docs.vllm.ai/en/latest/features/speculative_decoding/)
 for method behavior and configuration details.
 
-| | MTP | Draft model | N-gram |
-|---|---|---|---|
-| `--speculative-config` method | `mtp` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
-| Draft source | Matching Gemma4 assistant checkpoint | Separate smaller model | Prompt and output token history |
-| `num_speculative_tokens` | Configurable (2–3 typical) | Configurable (3–5 typical) | Configurable (3–5 typical) |
-| Additional model weights | Assistant checkpoint | Draft model | None |
-| Additional KV cache | None; reads target KV | Second scheduler-managed cache | None |
+| | MTP | EAGLE3 (experimental) | Draft model | N-gram |
+|---|---|---|---|---|
+| `--speculative-config` method | `mtp` | `eagle3` | `draft_model` | `ngram` |
+| Target models | Gemma4 | Dense Qwen3 and Llama with full attention | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
+| Draft source | Matching Gemma4 assistant checkpoint | Matching EAGLE3 speculator checkpoint | Separate smaller model | Prompt and output token history |
+| `num_speculative_tokens` | Configurable (2–3 typical) | Linear chain; 1–3 tested | Configurable (3–5 typical) | Configurable (3–5 typical) |
+| Additional model weights | Assistant checkpoint | EAGLE3 head | Draft model | None |
+| Additional KV cache | None; reads target KV | Scheduler-managed draft cache and boundary features | Second scheduler-managed cache | None |
 
-All three methods currently have these Metal-specific constraints:
+All methods currently have these Metal-specific constraints:
 
 - Only plain greedy requests (`temperature=0`, without penalties, token
   constraints, or sample logprobs) are drafted. Other requests run without
@@ -24,6 +24,94 @@ All three methods currently have these Metal-specific constraints:
 - Hybrid GDN targets and heterogeneous draft vocabularies are not supported.
 - `long_prefill_token_threshold`, when set, must be at least
   `1 + num_speculative_tokens`.
+
+EAGLE3's reduced output vocabulary is mapped to target token IDs before
+verification. It does not require `use_heterogeneous_vocab`.
+
+## EAGLE3
+
+The implementation drafts one linear chain and uses the existing greedy target
+verifier. It does not construct or verify trees. Initial checkpoint pairs are:
+
+| Target | EAGLE3 head |
+|---|---|
+| `Qwen/Qwen3-8B` | `RedHatAI/Qwen3-8B-speculator.eagle3` |
+| `meta-llama/Llama-3.1-8B-Instruct` | `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B` |
+| `meta-llama/Llama-3.1-8B-Instruct` | `RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3` |
+
+These heads use one Llama-style draft layer. The Qwen3 checkpoint was trained
+with thinking disabled; use its target chat template with
+`enable_thinking=false`. Tensor parallelism and LoRA are not supported by the
+Metal EAGLE3 path.
+
+```bash
+vllm serve Qwen/Qwen3-8B \
+  --max-model-len 2048 \
+  --enable-prefix-caching \
+  --no-async-scheduling \
+  --speculative-config '{"method":"eagle3","model":"RedHatAI/Qwen3-8B-speculator.eagle3","num_speculative_tokens":3}'
+```
+
+Original EAGLE checkpoints and Red Hat's speculators format are supported.
+Original checkpoints may omit token embeddings; the loader then uses the
+matching target embedding weights.
+
+For a smaller draft projection footprint, quantize a self-contained speculator:
+
+```bash
+python -m tools.quantize_eagle3 \
+  --model RedHatAI/Qwen3-8B-speculator.eagle3 \
+  --bits 8 --output ./qwen3-8b-eagle3-8bit
+```
+
+Use that directory as `speculative_config.model`. The tool quantizes the draft
+projections and keeps its token embeddings dense. Measure acceptance and
+throughput for the intended workload before choosing a draft precision.
+
+The draft cache stores each feature/token pair at the token's position, so a
+cached block depends only on its hashed token prefix. A boundary-feature buffer
+supplies the preceding target feature when a request resumes from a prefix hit.
+Verified rows are ingested with actual target features, replacing speculative
+hidden states even when the proposed tokens were accepted. Intermediate prefill
+chunks and steps with zero drafting budget also maintain this cache.
+
+The validation tool saves output token IDs, cache-hit counts, acceptance counts,
+and elapsed time for separate cold and cached runs. Run each method in a fresh
+process. `--reference` makes the process fail on any token-ID mismatch:
+
+```bash
+python -m tools.benchmark.eagle3_benchmark \
+  --target qwen --method off --output baseline.json
+python -m tools.benchmark.eagle3_benchmark \
+  --target qwen --method eagle3 --k 3 \
+  --reference baseline.json --output eagle3.json
+```
+
+Use `--target llama` for the Llama pair, `--method draft_model` for the ordinary
+draft baseline, and `--self-draft` with that method for the identical-checkpoint
+acceptance check. `--drafter` overrides the selected checkpoint.
+
+For top-K diagnostics, collect candidates in both benchmark processes:
+
+```bash
+python -m tools.benchmark.eagle3_benchmark \
+  --target qwen --method off --top-k 5 --output baseline-top5.json
+python -m tools.benchmark.eagle3_benchmark \
+  --target qwen --method eagle3 --k 3 --top-k 5 \
+  --reference baseline-top5.json --output eagle3-top5.json
+```
+
+This reuses the [parity tool's](tools.md) comparison function. It observes actual
+sampling and target-verification logits without requesting sample logprobs,
+which would disable drafting. Cold and reused-prefix phases remain separate.
+`TOP_K_MATCH` diagnoses mutual candidate membership at the first divergence;
+it does not establish exact equality or validate the remaining continuation.
+Diagnostic runs retain exact mismatch locations and are marked
+`diagnostic_only`; collect throughput separately without `--top-k`.
+
+Use `--gpu-memory-utilization` to set the KV-cache budget. Ordinary native
+execution can choose different greedy winners across batch and cache shapes;
+investigate mismatches before attributing them to rounding.
 
 ## Gemma4 MTP
 

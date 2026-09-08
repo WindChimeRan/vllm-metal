@@ -317,6 +317,7 @@ def compare_results(
     *,
     max_tokens: int,
     top_k: int | None = None,
+    reference_label: str = "mlx-lm",
 ) -> bool:
     """Compare exact tokens or mutual top-k membership at the first divergence."""
     passed = True
@@ -352,11 +353,11 @@ def compare_results(
                 print(f"  Expected {max_tokens} tokens, got {len(ref['tokens'])}")
             else:
                 print(f"  First differing token (0-based): {mismatch}")
-            print(f"  mlx-lm: {ref['tokens']}\n          {ref['text']!r}")
+            print(f"  {reference_label}: {ref['tokens']}\n          {ref['text']!r}")
             print(f"  metal:  {got['tokens']}\n          {got['text']!r}")
             if complete and mismatch is not None and top_k is not None:
                 candidates = (ref["tokens"][mismatch], got["tokens"][mismatch])
-                for label, top in (("mlx-lm", ref_top), ("metal", got_top)):
+                for label, top in ((reference_label, ref_top), ("metal", got_top)):
                     for token in candidates:
                         entry = top.get(token)
                         if entry is None:

@@ -1206,6 +1206,15 @@ class WorkerCachePlanner:
         # replacement materializes, so budget that one-pool overlap too.
         per_block_bytes += self._hybrid_align_state_bytes_per_block()
         per_block_bytes += self._hybrid_align_growth_bytes_per_block()
+        # EAGLE3 retains one fused target feature at each physical block
+        # boundary. Charge the sidecar to physical capacity, not the
+        # scheduler's attention-page specification.
+        eagle3_model = getattr(self._worker.model_runner, "_eagle3_model", None)
+        if eagle3_model is not None:
+            per_block_bytes += (
+                eagle3_model.config.layer.hidden_size
+                * mx.array(0, dtype=self._worker.model_runner.kv_cache_dtype).itemsize
+            )
         usable_metal = int(metal_limit * fraction)
         base_kv_budget = self.base_kv_budget_bytes(
             metal_limit,

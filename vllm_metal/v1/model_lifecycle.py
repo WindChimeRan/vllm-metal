@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
@@ -329,6 +330,7 @@ class ModelLifecycle:
                 tokenizer_config,
                 lazy=lazy_weights,
                 revision=revision,
+                target_dtype=target_dtype,
             )
 
         loaded_from = (
@@ -384,14 +386,26 @@ class ModelLifecycle:
         *,
         lazy: bool = False,
         revision: str | None = None,
+        target_dtype: Any | None = None,
     ) -> tuple[Any, Any]:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             model, tokenizer = mlx_lm_load(
                 str(compatible_model_name),
                 tokenizer_config=tokenizer_config,
-                lazy=lazy,
+                lazy=lazy or target_dtype is not None,
                 revision=revision,
             )
+        if target_dtype is not None:
+            # Match low-precision checkpoint weights to the requested compute
+            # and KV dtype. BF16 weights with an FP16 attention result promote
+            # every following projection to FP32. Preserve explicitly FP32
+            # parameters (e.g. recurrent-model state coefficients) and integers.
+            model.set_dtype(
+                target_dtype,
+                predicate=lambda dtype: dtype in (mx.float16, mx.bfloat16),
+            )
+            if not lazy:
+                mx.eval(model.parameters())
         return model, tokenizer
 
     def _install_generation_model(
@@ -558,6 +572,32 @@ class ModelLifecycle:
         )
         runner.kv_cache_dtype = request.target_dtype
         runner._gemma4_mtp_assistant = gemma4_mtp_assistant
+        runner._eagle3_model = None
+        self._model_adapter.eagle3_aux_layers = ()
+        spec = runner.vllm_config.speculative_config
+        if spec is not None and spec.method == "eagle3":
+            from vllm_metal.v1.eagle3 import Eagle3Model
+
+            if runner._is_vlm or runner.vllm_config.lora_config is not None:
+                raise NotImplementedError(
+                    "Metal EAGLE3 currently supports text-only targets without LoRA"
+                )
+            if runner.vllm_config.parallel_config.tensor_parallel_size != 1:
+                raise NotImplementedError(
+                    "Metal EAGLE3 currently requires tensor_parallel_size=1"
+                )
+            runner._eagle3_model = Eagle3Model.load(
+                spec.model,
+                dict(model_args),
+                request.target_dtype,
+                revision=getattr(spec, "revision", None),
+                target_embedding=self._model_adapter.text_model(
+                    runner.model
+                ).model.embed_tokens,
+            )
+            self._model_adapter.eagle3_aux_layers = (
+                runner._eagle3_model.config.aux_layer_ids
+            )
 
     def _extract_model_args(self, model: Any, is_vlm: bool) -> dict[str, Any]:
         # Both the .args (mlx-lm) and .config (HF) paths may expose a nested
