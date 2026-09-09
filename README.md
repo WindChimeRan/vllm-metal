@@ -32,6 +32,18 @@ vllm-metal supports a growing set of models on Apple Silicon. See the full matri
 
 ## Installation
 
+### Homebrew (stable)
+
+```bash
+brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal
+brew install vllm-project/vllm-metal/vllm-metal
+```
+
+Homebrew installs Python 3.12 and exposes `vllm` without environment activation.
+See [installation](docs/installation.md#homebrew) for updates and removal.
+
+### Install script (development)
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```

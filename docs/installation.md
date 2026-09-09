@@ -7,12 +7,28 @@
   tagged `macosx_15_0_arm64` and will not install on earlier releases.
 - Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
 
-> **No compiler required.** The install script below fetches vLLM core and the
+> **No compiler required.** Both installation methods fetch vLLM core and the
 > vllm-metal plugin as prebuilt wheels, so nothing is compiled on your machine.
 > Installing from a source checkout instead builds the native Metal kernels
 > locally and needs a toolchain; see [Contributing](CONTRIBUTING.md).
 
-`uv` is bootstrapped automatically.
+## Homebrew
+
+Homebrew installs the stable release with Python 3.12 and its matching vLLM
+core. Run `vllm serve <model>` without activating a virtual environment.
+
+```bash
+brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal
+brew install vllm-project/vllm-metal/vllm-metal
+```
+
+Upgrade with `brew update && brew upgrade vllm-metal`.
+Remove with `brew uninstall vllm-metal`.
+
+## Install script
+
+The script defaults to the latest development build and installs `uv`
+automatically.
 
 Verify the Python architecture before installing:
 
@@ -22,8 +38,6 @@ file "$(which python3)"
 ```
 
 The first command should print `arm64`. If it prints `x86_64`, switch to a native arm64 Python and remove `~/.venv-vllm-metal` before reinstalling.
-
-## Install
 
 Using the install script, the following will be installed under the `~/.venv-vllm-metal` directory (the default).
 - vllm-metal plugin
@@ -48,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/instal
 
 `pip install vllm-metal` is not supported. Use one of the commands above.
 
-## Reinstallation and Update
+### Reinstallation and Update
 
 If any issues occur, please use the following command to switch to the latest release version and check if the problem is resolved.
 If the issue continues to occur in the latest release, please report the details of the issue.
@@ -58,7 +72,7 @@ If the issue continues to occur in the latest release, please report the details
 rm -rf ~/.venv-vllm-metal && curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
 ```
 
-## Uninstall
+### Uninstall
 
 Please delete the directory that was installed by the installation script.
 (If you have installed it in a directory other than the default `~/.venv-vllm-metal`, substitute that path and run the command accordingly.)
