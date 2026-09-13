@@ -64,7 +64,7 @@ class EncoderEmbeddingPooler:
         vector = hidden_states[0, token_index, :].astype(mx.float32)
         norm = mx.sqrt(mx.sum(vector * vector))
         norm = mx.maximum(norm, mx.array(_MIN_NORM, dtype=mx.float32))
-        tensor = mlx_to_torch(mx.contiguous(vector / norm), device="cpu")
+        tensor = mlx_to_torch(vector / norm, device="cpu")
         return tensor.detach().clone()
 
     def _supports_embed(self) -> bool:
