@@ -217,10 +217,6 @@ class DraftModelProposer:
         dtype: mx.Dtype,
     ) -> DraftModelProposer:
         model, dims = _load_draft_model(speculative_config, parallel_config)
-        model.set_dtype(
-            dtype, predicate=lambda value: value in (mx.float16, mx.bfloat16)
-        )
-        mx.eval(model.parameters())
         total_blocks = committed_num_blocks + scratch_reserve_blocks
         backend = SDPAPagedAttentionRuntime(
             num_layers=dims.num_layers,

@@ -134,17 +134,17 @@ class Eagle3Proposer(DraftModelProposer):
             num_layers=1,
             extract_logits=lambda output: output[0],
         )
-        args = model.config.layer
+        attention = model.layers[0].self_attn
         proposer._kv = MetalPagedKVCache(
             num_layers=1,
-            num_kv_heads=args.num_key_value_heads,
-            head_dim=args.head_dim or args.hidden_size // args.num_attention_heads,
+            num_kv_heads=attention.n_kv_heads,
+            head_dim=attention.head_dim,
             num_blocks=committed_num_blocks + scratch_reserve_blocks,
             block_size=block_size,
             dtype=dtype,
         )
         proposer._boundary_features = mx.zeros(
-            (committed_num_blocks, args.hidden_size), dtype=dtype
+            (committed_num_blocks, model.config.layer.hidden_size), dtype=dtype
         )
         mx.eval(proposer._boundary_features)
         return proposer
@@ -167,6 +167,8 @@ class Eagle3Proposer(DraftModelProposer):
         is_drafting: bool,
         k: int,
     ) -> _EaglePlan:
+        # Callers supply the anchor token followed by one token per feature.
+        # Keep the anchor only when reconstructing a cached boundary pair.
         start = target_start + 1
         known_end = self._draft_seq_lens.get(req_id, 0)
         if target_start and (known_end < start or target_start % self._block_size == 0):
@@ -181,11 +183,9 @@ class Eagle3Proposer(DraftModelProposer):
             )
             features = mx.concatenate((boundary_feature, features), axis=0)
             start -= 1
-            # The caller prepends the token at target_start for this case.
-        elif len(tokens) > features.shape[0]:
+        else:
             tokens = tokens[1:]
-        if len(tokens) != features.shape[0]:
-            raise RuntimeError("EAGLE3 token/feature alignment mismatch")
+        assert len(tokens) == features.shape[0]
         owned = self._ensure_blocks(
             req_id,
             committed_group_block_ids=blocks,
@@ -197,8 +197,7 @@ class Eagle3Proposer(DraftModelProposer):
         assert self._committed_group_index is not None
         group = self._committed_group_index
         plans: list[_EaglePlan] = []
-        boundary_ids: list[int] = []
-        boundary_rows: list[int] = []
+        rows_by_block: dict[int, int] = {}
 
         def save_boundaries(
             start: int, length: int, row: int, blocks: list[int]
@@ -208,8 +207,7 @@ class Eagle3Proposer(DraftModelProposer):
                 start + length,
                 self._block_size,
             ):
-                boundary_ids.append(blocks[pos // self._block_size])
-                boundary_rows.append(row + pos - start)
+                rows_by_block[blocks[pos // self._block_size]] = row + pos - start
 
         # The scheduler can expose an earlier request's newly allocated prefix
         # to another request in the SAME forward. Resolve those dependencies
@@ -232,7 +230,6 @@ class Eagle3Proposer(DraftModelProposer):
                 ctx.cu_seqlens[ctx.num_decode_segments + i],
                 prefill.block_ids[group],
             )
-        rows_by_block = dict(zip(boundary_ids, boundary_rows, strict=True))
         current_boundaries = {
             block: fused[row : row + 1] for block, row in rows_by_block.items()
         }
@@ -244,19 +241,12 @@ class Eagle3Proposer(DraftModelProposer):
                 continue
             start, row, count = segment.cache_start_pos, segment.start_row, len(output)
             blocks = state.block_ids[group]
-            tokens = list(output)
-            # At ordinary decode, prior ingestion already built the anchor KV.
-            if start and (
-                self._draft_seq_lens.get(req_id, 0) < start + 1
-                or start % self._block_size == 0
-            ):
-                tokens = [segment.input_token_ids[0], *tokens]
             plans.append(
                 self._plan(
                     req_id=req_id,
                     blocks=blocks,
                     target_start=start,
-                    tokens=tokens,
+                    tokens=[segment.input_token_ids[0], *output],
                     features=fused[row : row + count],
                     current_boundaries=current_boundaries,
                     is_drafting=self._controller.can_draft_greedy(req_id, state),
@@ -267,50 +257,32 @@ class Eagle3Proposer(DraftModelProposer):
         for i, (prefill, mode) in enumerate(
             zip(ctx.prefill_reqs, ctx.prefill_result_modes, strict=True)
         ):
-            if not prefill.token_ids:
-                continue
             row = ctx.cu_seqlens[ctx.num_decode_segments + i]
             start, count = prefill.start_pos, len(prefill.token_ids)
             end = start + count
             blocks = prefill.block_ids[group]
-            state = ctx.request_states.get(prefill.req_id)
+            state = ctx.request_states[prefill.req_id]
             if mode == "intermediate":
                 # Recompute can replay committed outputs beyond the original
                 # prompt. Sampling's full_prompt field excludes those tokens.
-                full = (
-                    state.token_ids
-                    if state is not None
-                    else (prefill.full_prompt_token_ids or [])
-                )
-                if end >= len(full):
-                    raise RuntimeError(
-                        "EAGLE3 intermediate prefill is missing its next prompt token"
-                    )
-                next_token = full[end]
+                next_token = state.token_ids[end]
             else:
                 next_token = ctx.prefill_token_ids[i]
-            # Optional first token reconstructs a pair at a prefix-hit boundary.
-            tokens = (
-                [*prefill.token_ids, next_token]
-                if start
-                else [*prefill.token_ids[1:], next_token]
-            )
             plans.append(
                 self._plan(
                     req_id=prefill.req_id,
                     blocks=blocks,
                     target_start=start,
-                    tokens=tokens,
+                    tokens=[*prefill.token_ids, next_token],
                     features=fused[row : row + count],
                     current_boundaries=current_boundaries,
                     is_drafting=mode != "intermediate"
-                    and state is not None
                     and self._controller.can_draft_greedy(prefill.req_id, state),
                     k=ctx.num_speculative_tokens,
                 )
             )
 
-        if boundary_rows:
+        if rows_by_block:
             # Multiple requests can share a cached block; identical prefix
             # features are equivalent, but the scatter needs unique destinations.
             self._boundary_features = get_ops().gdn_state_scatter(
@@ -341,12 +313,9 @@ class Eagle3Proposer(DraftModelProposer):
         return normalized[rows, cols], recurrent[rows, cols]
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
-        if self._committed_group_index is None:
-            raise RuntimeError("EAGLE3 draft cache has no scheduler group")
         self.release_requests(ctx.finished_req_ids)
         self._prune_finished(ctx.request_states)
-        if ctx.target_hidden_states is None:
-            raise RuntimeError("EAGLE3 requires target auxiliary hidden states")
+        assert ctx.target_hidden_states is not None
         fused = self._model.combine_hidden_states(ctx.target_hidden_states)
         plans = self._plans(ctx, fused)
         if not plans:

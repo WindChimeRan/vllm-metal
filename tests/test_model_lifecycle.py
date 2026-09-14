@@ -11,7 +11,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-import mlx.nn as nn
 import pytest
 import torch
 from mlx_lm.models.nemotron_h import Model as NemotronHModel
@@ -200,7 +199,7 @@ class TestModelLifecycle:
     def test_generation_load_preserves_revision(
         self, monkeypatch: pytest.MonkeyPatch, revision: str | None, backend: str
     ) -> None:
-        model, tokenizer = nn.Module(), object()
+        model, tokenizer = object(), object()
         loader = Mock(return_value=(model, tokenizer))
         awq_loader = SimpleNamespace(load=loader) if backend == "awq" else None
         detect_awq = Mock(return_value=awq_loader)
@@ -397,43 +396,6 @@ class TestModelLifecycle:
         lifecycle._load_mlx_lm_text_model("stub", {}, lazy=False)
         assert captured["lazy"] is False
 
-    @pytest.mark.parametrize("lazy", [False, True])
-    def test_requested_dtype_casts_low_precision_weights_before_eval(
-        self, monkeypatch: pytest.MonkeyPatch, lazy: bool
-    ) -> None:
-        import mlx.core as mx
-        import mlx.nn as nn
-
-        model = nn.Module()
-        model.weight = mx.ones((2, 2), dtype=mx.bfloat16)
-        model.state_coefficient = mx.ones((2,), dtype=mx.float32)
-        model.packed = mx.ones((2,), dtype=mx.uint32)
-        captured = {}
-
-        def load(path, *, tokenizer_config, lazy, revision):
-            captured["lazy"] = lazy
-            captured["revision"] = revision
-            return model, None
-
-        evaluated = []
-        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", load)
-        monkeypatch.setattr(
-            model_lifecycle, "_mlx_lm_compatible_model_path", contextlib.nullcontext
-        )
-        monkeypatch.setattr(
-            mx, "eval", lambda *arrays: evaluated.append(model.weight.dtype)
-        )
-        lifecycle, _ = _make_lifecycle()
-        loaded, _ = lifecycle._load_mlx_lm_text_model(
-            "stub", {}, lazy=lazy, target_dtype=mx.float16, revision="release-tag"
-        )
-        assert loaded.weight.dtype == mx.float16
-        assert loaded.state_coefficient.dtype == mx.float32
-        assert loaded.packed.dtype == mx.uint32
-        assert captured["lazy"] is True
-        assert captured["revision"] == "release-tag"
-        assert evaluated == ([] if lazy else [mx.float16])
-
     def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -602,8 +564,7 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        text_model = nn.Module()
-        text_model.config = _text_config()
+        text_model = SimpleNamespace(config=_text_config())
         text_tokenizer = object()
 
         class _StubAWQLoader:
@@ -1017,8 +978,7 @@ class TestModelLifecycle:
         model-name string or any other heuristic — is what gates the
         dispatch.
         """
-        fake_model = nn.Module()
-        fake_model.config = _text_config()
+        fake_model = SimpleNamespace(config=_text_config())
         fake_tokenizer = object()
         awq_load_calls: list[dict[str, object]] = []
         mlx_lm_load_calls: list[dict[str, object]] = []
@@ -1101,8 +1061,7 @@ class TestModelLifecycle:
         ``model_config.model_weights``, the ``--tokenizer`` dir, derived dtype,
         and tokenizer config to the owner.
         """
-        fake_model = nn.Module()
-        fake_model.config = _text_config()
+        fake_model = SimpleNamespace(config=_text_config())
         fake_tokenizer = object()
         loader_calls: list[dict[str, object]] = []
         mlx_lm_load_calls: list[dict[str, object]] = []
@@ -1187,8 +1146,7 @@ class TestModelLifecycle:
         raises on import). A clean generic load proves a default install with no
         gguf extra is unaffected by the lazy owner import.
         """
-        fake_model = nn.Module()
-        fake_model.config = _text_config()
+        fake_model = SimpleNamespace(config=_text_config())
         fake_tokenizer = object()
 
         class _StubAWQLoader:

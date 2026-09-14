@@ -56,18 +56,6 @@ Original EAGLE checkpoints and Red Hat's speculators format are supported.
 Original checkpoints may omit token embeddings; the loader then uses the
 matching target embedding weights.
 
-For a smaller draft projection footprint, quantize a self-contained speculator:
-
-```bash
-python -m tools.quantize_eagle3 \
-  --model RedHatAI/Qwen3-8B-speculator.eagle3 \
-  --bits 8 --output ./qwen3-8b-eagle3-8bit
-```
-
-Use that directory as `speculative_config.model`. The tool quantizes the draft
-projections and keeps its token embeddings dense. Measure acceptance and
-throughput for the intended workload before choosing a draft precision.
-
 The draft cache stores each feature/token pair at the token's position, so a
 cached block depends only on its hashed token prefix. A boundary-feature buffer
 supplies the preceding target feature when a request resumes from a prefix hit.
@@ -75,43 +63,9 @@ Verified rows are ingested with actual target features, replacing speculative
 hidden states even when the proposed tokens were accepted. Intermediate prefill
 chunks and steps with zero drafting budget also maintain this cache.
 
-The validation tool saves output token IDs, cache-hit counts, acceptance counts,
-and elapsed time for separate cold and cached runs. Run each method in a fresh
-process. `--reference` makes the process fail on any token-ID mismatch:
-
-```bash
-python -m tools.benchmark.eagle3_benchmark \
-  --target qwen --method off --output baseline.json
-python -m tools.benchmark.eagle3_benchmark \
-  --target qwen --method eagle3 --k 3 \
-  --reference baseline.json --output eagle3.json
-```
-
-Use `--target llama` for the Llama pair, `--method draft_model` for the ordinary
-draft baseline, and `--self-draft` with that method for the identical-checkpoint
-acceptance check. `--drafter` overrides the selected checkpoint.
-
-For top-K diagnostics, collect candidates in both benchmark processes:
-
-```bash
-python -m tools.benchmark.eagle3_benchmark \
-  --target qwen --method off --top-k 5 --output baseline-top5.json
-python -m tools.benchmark.eagle3_benchmark \
-  --target qwen --method eagle3 --k 3 --top-k 5 \
-  --reference baseline-top5.json --output eagle3-top5.json
-```
-
-This reuses the [parity tool's](tools.md) comparison function. It observes actual
-sampling and target-verification logits without requesting sample logprobs,
-which would disable drafting. Cold and reused-prefix phases remain separate.
-`TOP_K_MATCH` diagnoses mutual candidate membership at the first divergence;
-it does not establish exact equality or validate the remaining continuation.
-Diagnostic runs retain exact mismatch locations and are marked
-`diagnostic_only`; collect throughput separately without `--top-k`.
-
-Use `--gpu-memory-utilization` to set the KV-cache budget. Ordinary native
-execution can choose different greedy winners across batch and cache shapes;
-investigate mismatches before attributing them to rounding.
+This path currently supports full-attention Llama and Qwen3 targets. It uses
+ordinary native execution, so batch-dependent rounding can change greedy
+winners. Exact SD-on/off token identity is not guaranteed.
 
 ## Gemma4 MTP
 

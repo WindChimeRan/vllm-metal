@@ -29,26 +29,17 @@ class Eagle3Config:
 
     @classmethod
     def from_dict(cls, config: dict[str, Any], target: dict[str, Any]) -> Eagle3Config:
-        if "speculators_model_type" not in config and "draft_vocab_size" in config:
-            # Original EAGLE checkpoints store a plain decoder config and
-            # place hidden_norm after the residual capture by default.
-            config = {
-                **config,
-                "speculators_model_type": "eagle3",
-                "transformer_layer_config": config,
-                "norm_before_residual": config.get("norm_before_residual", False),
-            }
-        if config.get("speculators_model_type") != "eagle3":
-            raise ValueError("Metal EAGLE3 requires an EAGLE3 speculators checkpoint")
-        raw_layer = config["transformer_layer_config"]
-        if raw_layer.get("model_type") != "llama":
-            raise NotImplementedError(
-                "Metal EAGLE3 currently supports Llama draft layers"
-            )
+        # Red Hat nests the decoder config; original EAGLE checkpoints store
+        # it at the top level and use a different residual-normalization default.
+        raw_layer = config.get("transformer_layer_config", config)
         layer = ModelArgs.from_dict(raw_layer)
-        if layer.num_hidden_layers != 1 or layer.sliding_window is not None:
+        if (
+            raw_layer["model_type"] != "llama"
+            or layer.num_hidden_layers != 1
+            or layer.sliding_window is not None
+        ):
             raise NotImplementedError(
-                "Metal EAGLE3 requires one full-attention draft layer"
+                "Metal EAGLE3 requires one full-attention Llama draft layer"
             )
         if config.get("fc_norm"):
             raise NotImplementedError(
@@ -67,23 +58,24 @@ class Eagle3Config:
             config.get("eagle_aux_hidden_state_layer_ids")
             or (2, num_layers // 2, num_layers - 3)
         )
-        if (
-            len(ids) != 3
-            or len(set(ids)) != 3
-            or not all(0 < i < num_layers for i in ids)
-        ):
+        if len(ids) != 3 or not all(0 < i < num_layers for i in ids):
             raise ValueError(f"Invalid EAGLE3 target hidden-state indices: {ids}")
         target_hidden = int(config.get("target_hidden_size") or layer.hidden_size)
-        if target_hidden != target["hidden_size"]:
-            raise ValueError("EAGLE3 target hidden size does not match the checkpoint")
-        if layer.vocab_size != target["vocab_size"]:
-            raise ValueError("EAGLE3 target vocabulary does not match the checkpoint")
+        if (target_hidden, layer.vocab_size) != (
+            target["hidden_size"],
+            target["vocab_size"],
+        ):
+            raise ValueError(
+                "EAGLE3 hidden size or vocabulary does not match the target"
+            )
         return cls(
             layer=layer,
             draft_vocab_size=int(config["draft_vocab_size"]),
             target_hidden_size=target_hidden,
             aux_layer_ids=ids,
-            norm_before_residual=bool(config.get("norm_before_residual", True)),
+            norm_before_residual=bool(
+                config.get("norm_before_residual", "transformer_layer_config" in config)
+            ),
             norm_before_fc=bool(config.get("norm_before_fc", False)),
             norm_output=bool(config.get("norm_output", False)),
         )
@@ -100,23 +92,17 @@ class Eagle3Layer(nn.Module):
             args.hidden_size, eps=args.rms_norm_eps
         )
         self.self_attn = Attention(args)
-        head_dim = self.self_attn.head_dim
-        assert args.num_key_value_heads is not None
-        self.self_attn.q_proj = nn.Linear(
-            2 * args.hidden_size,
-            args.num_attention_heads * head_dim,
-            bias=args.attention_bias,
-        )
-        self.self_attn.k_proj = nn.Linear(
-            2 * args.hidden_size,
-            args.num_key_value_heads * head_dim,
-            bias=args.attention_bias,
-        )
-        self.self_attn.v_proj = nn.Linear(
-            2 * args.hidden_size,
-            args.num_key_value_heads * head_dim,
-            bias=args.attention_bias,
-        )
+        for name in ("q_proj", "k_proj", "v_proj"):
+            projection = getattr(self.self_attn, name)
+            setattr(
+                self.self_attn,
+                name,
+                nn.Linear(
+                    2 * args.hidden_size,
+                    projection.weight.shape[0],
+                    bias=args.attention_bias,
+                ),
+            )
         self.mlp = MLP(args)
 
     def __call__(
@@ -204,26 +190,15 @@ class Eagle3Model(nn.Module):
                 path / "pytorch_model.bin", map_location="cpu", weights_only=True
             )
             weights = {name: torch_to_mlx(value) for name, value in state.items()}
-        if not weights:
-            raise ValueError(f"No EAGLE3 weights in {path}")
         weights = {
             name.replace("midlayer.", "layers.0."): value
             for name, value in weights.items()
         }
         weights.pop("t2d", None)
-        if "d2t" not in weights:
-            raise ValueError("Reduced-vocabulary EAGLE3 checkpoint is missing d2t")
         if "embed_tokens.weight" not in weights:
             if not isinstance(target_embedding, nn.Embedding):
                 raise ValueError(
                     "This EAGLE3 checkpoint requires the target's dense embedding"
-                )
-            if target_embedding.weight.shape != (
-                config.layer.vocab_size,
-                config.layer.hidden_size,
-            ):
-                raise ValueError(
-                    "Target embedding shape does not match the EAGLE3 head"
                 )
             # Share immutable weights, not a mutable target module or KV state.
             weights["embed_tokens.weight"] = target_embedding.weight
@@ -249,6 +224,4 @@ class Eagle3Model(nn.Module):
         mapped = mx.arange(config.draft_vocab_size) + model.d2t
         if int(mx.min(mapped)) < 0 or int(mx.max(mapped)) >= config.layer.vocab_size:
             raise ValueError("EAGLE3 d2t contains target IDs outside the vocabulary")
-        if len(set(mapped.tolist())) != config.draft_vocab_size:
-            raise ValueError("EAGLE3 d2t must map to distinct target tokens")
         return model

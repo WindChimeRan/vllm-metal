@@ -8,7 +8,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-import mlx.core as mx
 import torch
 from mlx_lm import load as mlx_lm_load
 from mlx_vlm import load as mlx_vlm_load
@@ -330,7 +329,6 @@ class ModelLifecycle:
                 tokenizer_config,
                 lazy=lazy_weights,
                 revision=revision,
-                target_dtype=target_dtype,
             )
 
         loaded_from = (
@@ -386,26 +384,14 @@ class ModelLifecycle:
         *,
         lazy: bool = False,
         revision: str | None = None,
-        target_dtype: Any | None = None,
     ) -> tuple[Any, Any]:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             model, tokenizer = mlx_lm_load(
                 str(compatible_model_name),
                 tokenizer_config=tokenizer_config,
-                lazy=lazy or target_dtype is not None,
+                lazy=lazy,
                 revision=revision,
             )
-        if target_dtype is not None:
-            # Match low-precision checkpoint weights to the requested compute
-            # and KV dtype. BF16 weights with an FP16 attention result promote
-            # every following projection to FP32. Preserve explicitly FP32
-            # parameters (e.g. recurrent-model state coefficients) and integers.
-            model.set_dtype(
-                target_dtype,
-                predicate=lambda dtype: dtype in (mx.float16, mx.bfloat16),
-            )
-            if not lazy:
-                mx.eval(model.parameters())
         return model, tokenizer
 
     def _install_generation_model(
