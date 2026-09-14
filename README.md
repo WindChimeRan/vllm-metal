@@ -24,7 +24,6 @@ Upstream vLLM supplies the API server, scheduler, and paged block manager; mlx_l
 ## Requirements
 
 - macOS 15 (Sequoia) or later, on Apple Silicon
-- Native arm64 Python 3.12. Rosetta/x86_64 Python is not supported.
 
 ## Supported Models
 
@@ -32,28 +31,6 @@ vllm-metal supports a growing set of models on Apple Silicon. See the full matri
 
 ## Installation
 
-### Homebrew (stable)
-
-```bash
-brew tap vllm-project/vllm-metal https://github.com/vllm-project/vllm-metal
-brew install vllm-project/vllm-metal/vllm-metal
-```
-
-Homebrew installs Python 3.12 and exposes `vllm` without environment activation.
-See [installation](docs/installation.md#homebrew) for updates and removal.
-
-### Install script (development)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
-```
-
-Using the install script above, the following will be installed under the `~/.venv-vllm-metal` directory (the default).
-- vllm-metal plugin
-- vllm core
-- Related libraries
-
-If you run `source ~/.venv-vllm-metal/bin/activate`, the `vllm` CLI becomes available and you can access the vLLM right away.
-
-For how to use the `vllm` CLI, please refer to the official vLLM guide.
-https://docs.vllm.ai/en/latest/cli/
+- **Stable release:** [Install with Homebrew](docs/installation.md#homebrew), then run `vllm` without activating an environment.
+- **Latest development build:** [Use the curl installer](docs/installation.md#install-script), then activate its environment. No compiler needed.
+- **Contributing Python or kernel code:** Follow the [source setup](docs/CONTRIBUTING.md#development-setup) for an editable checkout and native build tools.
