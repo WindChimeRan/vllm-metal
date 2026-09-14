@@ -40,7 +40,7 @@ def _model(kv_heads=2, norm_before_residual=True):
                 "intermediate_size": 128,
                 "num_attention_heads": 4,
                 "num_key_value_heads": kv_heads,
-                "head_dim": 16,
+                "head_dim": 64,
                 "rms_norm_eps": 1e-6,
                 "vocab_size": 128,
                 "rope_theta": 10000.0,
@@ -85,22 +85,25 @@ def _reference(model, tokens, features):
         -1,
     )
     b, length, _ = x.shape
+    head_dim = model.config.layer.head_dim
     queries = (
-        linear(x, "layers.0.self_attn.q_proj").view(b, length, 4, 16).transpose(1, 2)
+        linear(x, "layers.0.self_attn.q_proj")
+        .view(b, length, 4, head_dim)
+        .transpose(1, 2)
     )
     kv_heads = model.config.layer.num_key_value_heads
     keys = (
         linear(x, "layers.0.self_attn.k_proj")
-        .view(b, length, kv_heads, 16)
+        .view(b, length, kv_heads, head_dim)
         .transpose(1, 2)
     )
     values = (
         linear(x, "layers.0.self_attn.v_proj")
-        .view(b, length, kv_heads, 16)
+        .view(b, length, kv_heads, head_dim)
         .transpose(1, 2)
     )
     angles = torch.arange(length)[:, None] * (
-        10000.0 ** (-torch.arange(0, 16, 2).float() / 16)
+        10000.0 ** (-torch.arange(0, head_dim, 2).float() / head_dim)
     )
     cosine, sine = angles.cos()[None, None], angles.sin()[None, None]
 
@@ -114,7 +117,8 @@ def _reference(model, tokens, features):
         rope(queries), rope(keys), values, is_causal=True, enable_gqa=True
     )
     hidden = residual + linear(
-        attention.transpose(1, 2).reshape(b, length, 64), "layers.0.self_attn.o_proj"
+        attention.transpose(1, 2).reshape(b, length, 4 * head_dim),
+        "layers.0.self_attn.o_proj",
     )
     x = norm(hidden, "layers.0.post_attention_layernorm")
     hidden = hidden + linear(
@@ -220,9 +224,23 @@ def _plain_drafts(model, prompt, features, k=3, cache=None):
     return mx.stack(columns, axis=1).tolist()[0]
 
 
+@pytest.mark.parametrize("kv_heads", [1, 2, 4])
 @pytest.mark.parametrize("k", [1, 2, 3])
-def test_ragged_batch_matches_independent_full_context_drafts(k):
-    model = _model()
+def test_ragged_batch_matches_independent_full_context_drafts(k, kv_heads, monkeypatch):
+    from vllm_metal.attention.context import get_context
+    from vllm_metal.attention.impls import sdpa_wrapper
+
+    native_forward = sdpa_wrapper.sdpa_forward
+    packed_rows = []
+
+    def record_forward(inner, x, ctx, *args, **kwargs):
+        assert x.shape[0] == 1
+        assert x.shape[1] == len(ctx.slot_mapping)
+        packed_rows.append(x.shape[1])
+        return native_forward(inner, x, ctx, *args, **kwargs)
+
+    monkeypatch.setattr(sdpa_wrapper, "sdpa_forward", record_forward)
+    model = _model(kv_heads)
     proposer = _proposer(model)
     prompts = [list(range(35)), list(range(21, 43))]
     features = [mx.random.normal((len(p) - 1, 192)) for p in prompts]
@@ -237,6 +255,8 @@ def test_ragged_batch_matches_independent_full_context_drafts(k):
     assert result.draft_token_ids == [
         _plain_drafts(model, p, f, k) for p, f in zip(prompts, features, strict=False)
     ]
+    assert packed_rows == [55] + [2] * (k - 1)
+    assert get_context() is None
 
 
 def test_prefix_hit_with_different_next_token_preserves_shared_kv():
@@ -247,50 +267,51 @@ def test_prefix_hit_with_different_next_token_preserves_shared_kv():
     _prefill(proposer, [("a", original, features, [1, 2, 3], 0, 34)])
     # Freeze values on the CPU; another MLX array can alias in-place writes.
     shared_keys = np.array(proposer._kv.key_caches[0][1]).copy()
-    changed = original[:16] + [87, 92, 12, 41, 56, 22, 75]
-    changed_features = mx.concatenate((features[:16], mx.random.normal((6, 192))))
+    changed = original[:32] + [87, 92, 12, 41, 56, 22, 75]
+    changed_features = mx.concatenate((features[:32], mx.random.normal((6, 192))))
     result = _prefill(
-        proposer, [("b", changed, changed_features, [1, 4], 16, 22)], finished=("a",)
+        proposer, [("b", changed, changed_features, [1, 4, 5], 16, 38)], finished=("a",)
     )
     reference_cache = KVCache()
     assert result.draft_token_ids == [
         _plain_drafts(model, changed, changed_features, cache=reference_cache)
     ]
     np.testing.assert_array_equal(shared_keys, np.array(proposer._kv.key_caches[0][1]))
-    physical = [16 + i for i in range(1, 16)] + [64 + i for i in range(7)]
+    # Of two matched blocks, upstream drops the last before resuming at 16.
+    physical = list(range(16, 32)) + list(range(64, 86))
     for pool, reference in (
         (proposer._kv.key_caches[0], reference_cache.keys),
         (proposer._kv.value_caches[0], reference_cache.values),
     ):
-        actual = pool.reshape(-1, 2, 16)[mx.array(physical)].transpose(1, 0, 2)
+        actual = pool.reshape(-1, 2, 64)[mx.array(physical)].transpose(1, 0, 2)
         np.testing.assert_allclose(
-            np.array(actual), np.array(reference[0, :, :22]), atol=3e-3, rtol=3e-3
+            np.array(actual), np.array(reference[0, :, :38]), atol=3e-3, rtol=3e-3
         )
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-def test_prefix_created_in_the_same_batch_uses_its_current_boundary_feature(reverse):
+def test_prefix_created_in_the_same_batch_uses_paged_kv(reverse):
     model = _model()
     proposer = _proposer(model)
     first = list(range(35))
     first_features = mx.random.normal((34, 192))
-    second = first[:16] + [87, 92, 12, 41, 56, 22, 75]
-    second_features = mx.concatenate((first_features[:16], mx.random.normal((6, 192))))
+    second = first[:32] + [87, 92, 12, 41, 56, 22, 75]
+    second_features = mx.concatenate((first_features[:32], mx.random.normal((6, 192))))
     requests = [
         ("owner", first, first_features, [1, 2, 3], 0, 34),
-        ("hit", second, second_features, [1, 4], 16, 22),
+        ("hit", second, second_features, [1, 4, 5], 16, 38),
     ]
     result = _prefill(proposer, requests[::-1] if reverse else requests)
     reference_cache = KVCache()
     expected = _plain_drafts(model, second, second_features, cache=reference_cache)
-    # The first uncached KV row depends on the boundary feature produced by
-    # the owner in THIS forward; the persistent sidecar was zero before it.
+    # The owner populates the shared first block in this same packed forward.
+    # Both request orders must see those writes before paged attention reads it.
     for pool, reference in (
         (proposer._kv.key_caches[0], reference_cache.keys),
         (proposer._kv.value_caches[0], reference_cache.values),
     ):
         np.testing.assert_allclose(
-            np.array(pool[4, 0]), np.array(reference[0, :, 15]), atol=3e-3, rtol=3e-3
+            np.array(pool[4, 0]), np.array(reference[0, :, 16]), atol=3e-3, rtol=3e-3
         )
     assert result.draft_token_ids[0 if reverse else 1] == expected
 
@@ -484,3 +505,84 @@ def test_preempted_request_replays_output_history_beyond_original_prompt():
     assert result is None
     final = _prefill(proposer, [("r", history, features, [1, 2, 3], 32, 40)])
     assert final.draft_token_ids == [_plain_drafts(model, history, features)]
+
+
+def test_upstream_cache_manager_recomputes_boundary_before_draft_prefix_reuse():
+    from vllm.utils.hashing import sha256
+    from vllm.v1.core.kv_cache_manager import KVCacheManager
+    from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+    from vllm.v1.kv_cache_interface import (
+        FullAttentionSpec,
+        KVCacheConfig,
+        KVCacheGroupSpec,
+    )
+    from vllm.v1.request import Request
+
+    init_none_hash(sha256)
+    hasher = get_request_block_hasher(16, sha256)
+    manager = KVCacheManager(
+        KVCacheConfig(
+            num_blocks=16,
+            kv_cache_tensors=[],
+            kv_cache_groups=[
+                KVCacheGroupSpec(
+                    ["draft_layers.0.self_attn"],
+                    FullAttentionSpec(
+                        block_size=16, num_kv_heads=2, head_size=64, dtype=torch.float32
+                    ),
+                )
+            ],
+        ),
+        max_model_len=128,
+        scheduler_block_size=16,
+        hash_block_size=16,
+        use_eagle=True,
+        num_prefill_lookahead=1,
+    )
+
+    def request(name, tokens):
+        return Request(
+            name,
+            tokens,
+            SamplingParams(temperature=0, max_tokens=8),
+            None,
+            block_hasher=hasher,
+        )
+
+    model = _model()
+    proposer = _proposer(model)
+    original = list(range(51))
+    features = mx.random.normal((50, 192))
+    owner = request("owner", original)
+    manager.allocate_slots(owner, 50, num_lookahead_tokens=3)
+    blocks = manager.get_blocks(owner.request_id).get_block_ids()[0]
+    _prefill(proposer, [("owner", original, features, blocks, 0, 50)])
+    manager.cache_blocks(owner, 50)
+    manager.free(owner)
+
+    # The next token differs just after two matched blocks. The final matched
+    # block contains a KV pair depending on that next token and must be replayed.
+    changed = original[:32] + [87, 92, 12, 41, 56, 22, 75]
+    changed_features = mx.concatenate((features[:32], mx.random.normal((6, 192))))
+    resumed = request("resumed", changed)
+    hit_blocks, hit_tokens, _ = manager.get_computed_blocks(resumed)
+    assert hit_tokens == 16
+    shared = hit_blocks.get_block_ids()[0][0]
+    shared_keys = np.array(proposer._kv.key_caches[0][shared]).copy()
+    manager.allocate_slots(
+        resumed,
+        38 - hit_tokens,
+        num_new_computed_tokens=hit_tokens,
+        new_computed_blocks=hit_blocks,
+        num_lookahead_tokens=3,
+    )
+    blocks = manager.get_blocks(resumed.request_id).get_block_ids()[0]
+    result = _prefill(
+        proposer,
+        [("resumed", changed, changed_features, blocks, hit_tokens, 38)],
+        finished=("owner",),
+    )
+    assert result.draft_token_ids == [_plain_drafts(model, changed, changed_features)]
+    np.testing.assert_array_equal(
+        shared_keys, np.array(proposer._kv.key_caches[0][shared])
+    )

@@ -11,7 +11,7 @@ for method behavior and configuration details.
 | Draft source | Matching Gemma4 assistant checkpoint | Matching EAGLE3 speculator checkpoint | Separate smaller model | Prompt and output token history |
 | `num_speculative_tokens` | Configurable (2–3 typical) | Linear chain; 1–3 tested | Configurable (3–5 typical) | Configurable (3–5 typical) |
 | Additional model weights | Assistant checkpoint | EAGLE3 head | Draft model | None |
-| Additional KV cache | None; reads target KV | Scheduler-managed draft cache and boundary features | Second scheduler-managed cache | None |
+| Additional KV cache | None; reads target KV | Scheduler-managed draft cache | Second scheduler-managed cache | None |
 
 All methods currently have these Metal-specific constraints:
 
@@ -60,12 +60,14 @@ Original EAGLE checkpoints and Red Hat's speculators format are supported.
 Original checkpoints may omit token embeddings; the loader then uses the
 matching target embedding weights.
 
-The draft cache stores each feature/token pair at the token's position, so a
-cached block depends only on its hashed token prefix. A boundary-feature buffer
-supplies the preceding target feature when a request resumes from a prefix hit.
-Verified rows are ingested with actual target features, replacing speculative
-hidden states even when the proposed tokens were accepted. Intermediate prefill
-chunks and steps with zero drafting budget also maintain this cache.
+Draft inputs are packed by request and use the existing Metal paged-attention
+kernels. The draft head reads its page table directly, without gathering padded
+KV histories. Like upstream EAGLE, target feature at position `t` is paired with
+token `t+1`, with draft KV and RoPE at position `t`. The scheduler reduces prefix
+hits by the final matching block so boundary states are recomputed; there is no
+separate boundary-feature buffer. Verified rows are ingested with actual target
+features even when proposals were accepted. Intermediate prefill chunks and
+steps with zero drafting budget also maintain this cache.
 
 Auxiliary features come from the target's native forward through a temporary,
 instance-local capture bridge. The bridge supports explicit MLX-LM Llama,

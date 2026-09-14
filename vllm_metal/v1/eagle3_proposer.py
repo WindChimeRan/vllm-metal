@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Batched linear EAGLE3 with scheduler-owned, prefix-cacheable draft state.
+"""Packed linear EAGLE3 using Metal paged attention.
 
-Pair feature[t] with token[t+1], storing its KV at *token position* t+1.
-Consequently a cached block depends only on its hashed token prefix. Physical
-slot zero is unused and masked. A small sidecar retains feature[t] at each
-target block boundary, allowing a prefix hit to reconstruct its first new pair
-without replaying the target prefix. Recursive draft features are scratch;
-every verified row is ingested again with the actual target features.
+Pair feature[t] with token[t+1], storing KV and applying RoPE at position t,
+matching upstream EAGLE. The scheduler drops the last matching prefix block
+before reuse because its draft KV can depend on the following token. Verified
+rows are ingested again with actual target features, replacing recurrence state.
 """
 
 from __future__ import annotations
@@ -18,8 +16,12 @@ import mlx.core as mx
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.metal import get_ops
-from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+from vllm_metal.attention.context import clear_context, prepare_unified
+from vllm_metal.attention.impls.sdpa_wrapper import patch_sdpa_attention
+from vllm_metal.v1.draft_model_proposer import (
+    _DECODE_INGEST_MAX_TOKENS,
+    DraftModelProposer,
+)
 from vllm_metal.v1.eagle3 import Eagle3Model
 from vllm_metal.v1.proposer import ProposeContext
 
@@ -38,81 +40,10 @@ class _EaglePlan:
         return self.start + len(self.tokens)
 
 
-class _PagedEagleBatch:
-    """One ragged batch, gathered into MLX SDPA's dense batch layout.
-
-    The paged backing stays scheduler owned. Padding neither writes KV nor
-    contributes to attention. Metadata is shared by the head's Q/K/V paths.
-    """
-
-    def __init__(self, kv: MetalPagedKVCache, plans: list[_EaglePlan]):
-        self.kv = kv
-        self.lengths = [len(plan.tokens) for plan in plans]
-        self.width = max(self.lengths)
-        self.offset = mx.array([plan.start - 1 for plan in plans], dtype=mx.int32)
-        ends = mx.array([plan.end for plan in plans], dtype=mx.int32)
-        max_end = max(plan.end for plan in plans)
-        table_width = (max_end + kv.block_size - 1) // kv.block_size
-        table = mx.array(
-            [
-                p.block_ids[:table_width] + [0] * max(0, table_width - len(p.block_ids))
-                for p in plans
-            ],
-            dtype=mx.int32,
-        )
-        positions = self.offset[:, None] + 1 + mx.arange(self.width)
-        valid = mx.arange(self.width)[None, :] < mx.array(self.lengths)[:, None]
-        block_indices = mx.minimum(positions // kv.block_size, table_width - 1)
-        write_blocks = mx.take_along_axis(table, block_indices, axis=1)
-        self.write_slots = (
-            mx.where(
-                valid, write_blocks * kv.block_size + positions % kv.block_size, -1
-            )
-            .reshape(-1)
-            .astype(mx.int64)
-        )
-        keys = mx.arange(max_end)
-        self.read_slots = (
-            table[:, keys // kv.block_size] * kv.block_size + keys % kv.block_size
-        )
-        self.mask = (
-            (keys[None, None, :] > 0)
-            & (keys[None, None, :] < ends[:, None, None])
-            & (keys[None, None, :] <= positions[:, :, None])
-        )[:, None]
-
-    def update_and_fetch(
-        self, keys: mx.array, values: mx.array
-    ) -> tuple[mx.array, mx.array]:
-        heads, dim = keys.shape[1], keys.shape[-1]
-        key_cache, value_cache = get_ops().reshape_and_cache(
-            mx.contiguous(
-                keys.transpose(0, 2, 1, 3).reshape(-1, heads, dim).astype(self.kv.dtype)
-            ),
-            mx.contiguous(
-                values.transpose(0, 2, 1, 3)
-                .reshape(-1, heads, dim)
-                .astype(self.kv.dtype)
-            ),
-            self.kv.key_caches[0],
-            self.kv.value_caches[0],
-            self.write_slots,
-        )
-        self.kv.replace_layer_cache(0, key_cache, value_cache)
-        gathered_keys = key_cache.reshape(-1, heads, dim)[self.read_slots].transpose(
-            0, 2, 1, 3
-        )
-        gathered_values = value_cache.reshape(-1, heads, dim)[
-            self.read_slots
-        ].transpose(0, 2, 1, 3)
-        return gathered_keys, gathered_values
-
-
 class Eagle3Proposer(DraftModelProposer):
     """Reuse draft block ownership, with EAGLE-specific feature reconciliation."""
 
     _kv: MetalPagedKVCache
-    _boundary_features: mx.array
 
     @classmethod
     def build(
@@ -143,10 +74,7 @@ class Eagle3Proposer(DraftModelProposer):
             block_size=block_size,
             dtype=dtype,
         )
-        proposer._boundary_features = mx.zeros(
-            (committed_num_blocks, model.config.layer.hidden_size), dtype=dtype
-        )
-        mx.eval(proposer._boundary_features)
+        patch_sdpa_attention(model, proposer._kv, block_size)
         return proposer
 
     def needs_target_hidden_states(
@@ -163,28 +91,12 @@ class Eagle3Proposer(DraftModelProposer):
         target_start: int,
         tokens: list[int],
         features: mx.array,
-        current_boundaries: dict[int, mx.array],
         is_drafting: bool,
         k: int,
     ) -> _EaglePlan:
-        # Callers supply the anchor token followed by one token per feature.
-        # Keep the anchor only when reconstructing a cached boundary pair.
-        start = target_start + 1
-        known_end = self._draft_seq_lens.get(req_id, 0)
-        if target_start and (known_end < start or target_start % self._block_size == 0):
-            if target_start % self._block_size:
-                raise RuntimeError("EAGLE3 prefix resumption must be block aligned")
-            # The cached block's final target feature supplies the missing pair.
-            boundary = blocks[target_start // self._block_size - 1]
-            boundary_feature = (
-                current_boundaries[boundary]
-                if boundary in current_boundaries
-                else self._boundary_features[boundary : boundary + 1]
-            )
-            features = mx.concatenate((boundary_feature, features), axis=0)
-            start -= 1
-        else:
-            tokens = tokens[1:]
+        # Shift tokens, leaving feature positions unchanged as in upstream EAGLE.
+        start = target_start
+        tokens = tokens[1:]
         assert len(tokens) == features.shape[0]
         owned = self._ensure_blocks(
             req_id,
@@ -197,43 +109,6 @@ class Eagle3Proposer(DraftModelProposer):
         assert self._committed_group_index is not None
         group = self._committed_group_index
         plans: list[_EaglePlan] = []
-        rows_by_block: dict[int, int] = {}
-
-        def save_boundaries(
-            start: int, length: int, row: int, blocks: list[int]
-        ) -> None:
-            for pos in range(
-                start + (-start - 1) % self._block_size,
-                start + length,
-                self._block_size,
-            ):
-                rows_by_block[blocks[pos // self._block_size]] = row + pos - start
-
-        # The scheduler can expose an earlier request's newly allocated prefix
-        # to another request in the SAME forward. Resolve those dependencies
-        # from the current target output, before consulting persistent state.
-        # Reading the old sidecar and merely submitting its in-place update
-        # later would leave the head dependent on stale/zero features.
-        for (_, state), segment, output in zip(
-            ctx.decode_reqs, ctx.decode_segments, ctx.decode_token_ids, strict=True
-        ):
-            save_boundaries(
-                segment.cache_start_pos,
-                len(output),
-                segment.start_row,
-                state.block_ids[group],
-            )
-        for i, prefill in enumerate(ctx.prefill_reqs):
-            save_boundaries(
-                prefill.start_pos,
-                len(prefill.token_ids),
-                ctx.cu_seqlens[ctx.num_decode_segments + i],
-                prefill.block_ids[group],
-            )
-        current_boundaries = {
-            block: fused[row : row + 1] for block, row in rows_by_block.items()
-        }
-
         for (req_id, state), segment, output in zip(
             ctx.decode_reqs, ctx.decode_segments, ctx.decode_token_ids, strict=True
         ):
@@ -248,7 +123,6 @@ class Eagle3Proposer(DraftModelProposer):
                     target_start=start,
                     tokens=[segment.input_token_ids[0], *output],
                     features=fused[row : row + count],
-                    current_boundaries=current_boundaries,
                     is_drafting=self._controller.can_draft_greedy(req_id, state),
                     k=ctx.num_speculative_tokens,
                 )
@@ -275,42 +149,42 @@ class Eagle3Proposer(DraftModelProposer):
                     target_start=start,
                     tokens=[*prefill.token_ids, next_token],
                     features=fused[row : row + count],
-                    current_boundaries=current_boundaries,
                     is_drafting=mode != "intermediate"
                     and self._controller.can_draft_greedy(prefill.req_id, state),
                     k=ctx.num_speculative_tokens,
                 )
             )
 
-        if rows_by_block:
-            # Multiple requests can share a cached block; identical prefix
-            # features are equivalent, but the scatter needs unique destinations.
-            self._boundary_features = get_ops().gdn_state_scatter(
-                self._boundary_features,
-                fused[mx.array(list(rows_by_block.values()), dtype=mx.int32)].astype(
-                    self._boundary_features.dtype
-                ),
-                mx.array(list(rows_by_block), dtype=mx.int32),
-            )
         return plans
 
     def _forward(self, plans: list[_EaglePlan]) -> tuple[mx.array, mx.array]:
-        batch = _PagedEagleBatch(self._kv, plans)
-        tokens = mx.array(
-            [p.tokens + [0] * (batch.width - len(p.tokens)) for p in plans],
-            dtype=mx.int32,
-        )
-        features = mx.stack(
-            [
-                mx.pad(p.features, ((0, batch.width - len(p.tokens)), (0, 0)))
-                for p in plans
-            ]
-        )
-        normalized, recurrent = self._model(
-            tokens, features, mask=batch.mask, cache=batch
-        )
-        rows, cols = mx.arange(len(plans)), mx.array(batch.lengths) - 1
-        return normalized[rows, cols], recurrent[rows, cols]
+        packed: list[int] = []
+        last_rows: list[int] = []
+        for plan in plans:
+            packed.extend(plan.tokens)
+            last_rows.append(len(packed) - 1)
+        tokens = mx.array([packed], dtype=mx.int32)
+        features = mx.concatenate([plan.features for plan in plans])[None]
+        if max(len(plan.tokens) for plan in plans) <= _DECODE_INGEST_MAX_TOKENS:
+            # Reuse draft-model SD's small-ingest decode path. Expanded rows
+            # handle different acceptance lengths without padded query tokens.
+            prepare_unified(
+                [(p.block_ids, p.start, len(p.tokens)) for p in plans],
+                [],
+                self._block_size,
+            )
+        else:
+            prepare_unified(
+                [],
+                [(p.block_ids, len(p.tokens), p.start) for p in plans],
+                self._block_size,
+            )
+        try:
+            normalized, recurrent = self._model(tokens, features)
+        finally:
+            clear_context()
+        indices = mx.array(last_rows)
+        return normalized[0, indices], recurrent[0, indices]
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         self.release_requests(ctx.finished_req_ids)
@@ -323,13 +197,9 @@ class Eagle3Proposer(DraftModelProposer):
         if not plans:
             return None
         normalized, recurrent = self._forward(plans)
-        for plan in plans:
-            self._draft_seq_lens[plan.req_id] = plan.end
         active = [i for i, plan in enumerate(plans) if plan.is_drafting]
         if not active or ctx.num_speculative_tokens <= 0:
-            mx.eval(
-                *self._kv.key_caches, *self._kv.value_caches, self._boundary_features
-            )
+            mx.eval(*self._kv.key_caches, *self._kv.value_caches)
             return None
         indices = mx.array(active)
         columns = [self._model.top_tokens(normalized[indices])]
@@ -337,29 +207,22 @@ class Eagle3Proposer(DraftModelProposer):
         drafting = [plans[i] for i in active]
         for depth in range(1, ctx.num_speculative_tokens):
             # Tokens stay on the GPU between recurrent draft steps.
-            metadata = [
-                _EaglePlan(
-                    p.req_id,
-                    p.block_ids,
-                    p.end + depth - 1,
-                    [0],
-                    recurrent[i : i + 1],
-                    True,
-                )
-                for i, p in enumerate(drafting)
-            ]
-            batch = _PagedEagleBatch(self._kv, metadata)
-            normalized, recurrent = self._model(
-                columns[-1][:, None], recurrent[:, None], mask=batch.mask, cache=batch
+            prepare_unified(
+                [(p.block_ids, p.end + depth - 1) for p in drafting],
+                [],
+                self._block_size,
             )
-            recurrent = recurrent[:, 0]
-            columns.append(self._model.top_tokens(normalized[:, 0]))
+            try:
+                normalized, hidden = self._model(columns[-1][None], recurrent[None])
+            finally:
+                clear_context()
+            recurrent = hidden[0]
+            columns.append(self._model.top_tokens(normalized[0]))
         drafts = mx.stack(columns, axis=1)
         mx.eval(
             drafts,
             *self._kv.key_caches,
             *self._kv.value_caches,
-            self._boundary_features,
         )
         return DraftTokenIds(
             req_ids=[p.req_id for p in drafting], draft_token_ids=drafts.tolist()
