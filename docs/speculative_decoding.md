@@ -7,7 +7,7 @@ for method behavior and configuration details.
 | | MTP | EAGLE3 (experimental) | Draft model | N-gram |
 |---|---|---|---|---|
 | `--speculative-config` method | `mtp` | `eagle3` | `draft_model` | `ngram` |
-| Target models | Gemma4 | Dense Qwen3 and Llama with full attention | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
+| Target models | Gemma4 | Dense Qwen3, Llama, and Gemma4 text | Non-hybrid paged-attention models | Non-hybrid paged-attention models |
 | Draft source | Matching Gemma4 assistant checkpoint | Matching EAGLE3 speculator checkpoint | Separate smaller model | Prompt and output token history |
 | `num_speculative_tokens` | Configurable (2–3 typical) | Linear chain; 1–3 tested | Configurable (3–5 typical) | Configurable (3–5 typical) |
 | Additional model weights | Assistant checkpoint | EAGLE3 head | Draft model | None |
@@ -38,11 +38,15 @@ verifier. It does not construct or verify trees. Initial checkpoint pairs are:
 | `Qwen/Qwen3-8B` | `RedHatAI/Qwen3-8B-speculator.eagle3` |
 | `meta-llama/Llama-3.1-8B-Instruct` | `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B` |
 | `meta-llama/Llama-3.1-8B-Instruct` | `RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3` |
+| `mlx-community/gemma-4-31b-it-4bit` | `RedHatAI/gemma-4-31B-it-speculator.eagle3` |
 
 These heads use one Llama-style draft layer. The Qwen3 checkpoint was trained
 with thinking disabled; use its target chat template with
 `enable_thinking=false`. Tensor parallelism and LoRA are not supported by the
 Metal EAGLE3 path.
+
+Gemma4 validation uses the 4-bit target above with the original Red Hat head;
+the full BF16 31B target has not been validated.
 
 ```bash
 vllm serve Qwen/Qwen3-8B \
@@ -63,9 +67,15 @@ Verified rows are ingested with actual target features, replacing speculative
 hidden states even when the proposed tokens were accepted. Intermediate prefill
 chunks and steps with zero drafting budget also maintain this cache.
 
-This path currently supports full-attention Llama and Qwen3 targets. It uses
-ordinary native execution, so batch-dependent rounding can change greedy
-winners. Exact SD-on/off token identity is not guaranteed.
+Auxiliary features come from the target's native forward through a temporary,
+instance-local capture bridge. The bridge supports explicit MLX-LM Llama,
+Qwen3, and Gemma4 decoder contracts, including Gemma4's tuple outputs; native
+execution retains embedding scaling, masks, and cache updates. Auxiliary
+features are separate from the final hidden state. This bridge can be removed
+once MLX-LM exposes native auxiliary outputs.
+
+Batch-dependent rounding can change greedy winners. Exact SD-on/off token
+identity is not guaranteed.
 
 ## Gemma4 MTP
 

@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import mlx.core as mx
@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
     from vllm_metal.distributed import PipelineGroup
     from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+    from vllm_metal.v1.aux_hidden_states import AuxHiddenStateCapture
 
 logger = init_logger(__name__)
 
@@ -24,7 +25,10 @@ class TargetModelForwardOutput:
     """Target-model forward output needed by sampling and speculative decode."""
 
     logits: mx.array
+    # Final backbone states and selected intermediate states retain all rows,
+    # even when logits_indices selects a subset for vocabulary projection.
     hidden_states: mx.array | None = None
+    aux_hidden_states: tuple[mx.array, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -157,6 +161,7 @@ class ModelAdapter(Protocol):
         cache: Any | None = None,
         collect_hidden_states: bool = False,
         logits_indices: mx.array | None = None,
+        aux_capture: AuxHiddenStateCapture | None = None,
     ) -> TargetModelForwardOutput:
         """Run the target text model and optionally retain target hidden states.
 
@@ -238,10 +243,6 @@ _PADDLEOCR_VL_ARCHITECTURES: frozenset[str] = frozenset(
 
 class DefaultModelAdapter(ModelAdapter):
     """Default adapter implementation for known model quirks."""
-
-    # Hidden-state numbering includes the embedding output at index zero.
-    # Configured only for the full-attention Llama/Qwen3 EAGLE3 path.
-    eagle3_aux_layers: tuple[int, ...] = ()
 
     def _multimodal_mode(self) -> str:
         from vllm_metal.config import get_config
@@ -429,6 +430,34 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         cache: Any | None = None,
         collect_hidden_states: bool = False,
         logits_indices: mx.array | None = None,
+        aux_capture: AuxHiddenStateCapture | None = None,
+    ) -> TargetModelForwardOutput:
+        """Run native execution with optional, separately returned auxiliary states."""
+        kwargs = {
+            "cache": cache,
+            "collect_hidden_states": collect_hidden_states,
+            "logits_indices": logits_indices,
+        }
+        if aux_capture is None:
+            return self._target_forward(model, input_ids, **kwargs)
+        output, auxiliary = aux_capture.run(
+            self._target_forward, model, input_ids, **kwargs
+        )
+        return replace(
+            output,
+            aux_hidden_states=tuple(
+                self._flatten_target_hidden_states(h) for h in auxiliary
+            ),
+        )
+
+    def _target_forward(
+        self,
+        model: Any,
+        input_ids: mx.array,
+        *,
+        cache: Any | None = None,
+        collect_hidden_states: bool = False,
+        logits_indices: mx.array | None = None,
     ) -> TargetModelForwardOutput:
         """Run the target model and return logits plus optional hidden states.
 
@@ -443,28 +472,17 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
                 hidden_states=None,
             )
 
-        auxiliary = None
-        if collect_hidden_states and self.eagle3_aux_layers:
-            hidden_states, auxiliary = self._forward_eagle3_hidden_states(
-                model, input_ids, cache=cache
-            )
-        else:
-            hidden_states = self._forward_target_hidden_states(
-                model, input_ids, cache=cache
-            )
-        flat_hidden_states = self._flatten_target_hidden_states(hidden_states)
-        collected_hidden_states = (
-            self._flatten_target_hidden_states(auxiliary)
-            if auxiliary is not None
-            else flat_hidden_states
+        hidden_states = self._forward_target_hidden_states(
+            model,
+            input_ids,
+            cache=cache,
         )
+        flat_hidden_states = self._flatten_target_hidden_states(hidden_states)
         if logits_indices is None:
             logits = self._compute_target_logits(model, hidden_states)
             return TargetModelForwardOutput(
                 logits=logits,
-                hidden_states=collected_hidden_states
-                if collect_hidden_states
-                else None,
+                hidden_states=flat_hidden_states if collect_hidden_states else None,
             )
 
         # `[None]` restores the leading batch axis the callers' `logits[0, row]`
@@ -473,32 +491,7 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
         selected_hidden_states = mx.take(flat_hidden_states, logits_indices, axis=0)
         return TargetModelForwardOutput(
             logits=self._compute_target_logits(model, selected_hidden_states[None]),
-            hidden_states=collected_hidden_states if collect_hidden_states else None,
-        )
-
-    def _forward_eagle3_hidden_states(
-        self, model: Any, input_ids: mx.array, *, cache: Any | None
-    ) -> tuple[mx.array, mx.array]:
-        """Run the ordinary dense backbone, retaining the requested block outputs."""
-        from mlx_lm.models.base import create_attention_mask
-
-        backbone = self._target_backbone(model)
-        if backbone is None:
-            raise NotImplementedError(
-                "EAGLE3 auxiliary states require a dense text backbone"
-            )
-        hidden = backbone.embed_tokens(input_ids)
-        caches = cache if cache is not None else [None] * len(backbone.layers)
-        mask = create_attention_mask(hidden, caches[0])
-        auxiliary: dict[int, mx.array] = {}
-        for index, (layer, layer_cache) in enumerate(
-            zip(backbone.layers, caches, strict=True), 1
-        ):
-            hidden = layer(hidden, mask, cache=layer_cache)
-            if index in self.eagle3_aux_layers:
-                auxiliary[index] = hidden
-        return backbone.norm(hidden), mx.concatenate(
-            [auxiliary[index] for index in self.eagle3_aux_layers], axis=-1
+            hidden_states=flat_hidden_states if collect_hidden_states else None,
         )
 
     def supports_selective_logits(self, model: Any) -> bool:

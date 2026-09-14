@@ -63,6 +63,7 @@ from vllm_metal.distributed import (
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
+from vllm_metal.v1.aux_hidden_states import AuxHiddenStateCapture
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.decode_pipeline import (
     PENDING_TOKEN_PLACEHOLDER,
@@ -336,6 +337,7 @@ class _PagedForwardState(NamedTuple):
     # forward was available (skip-sampling is decoupled from skip-projection
     # so unsupported models cannot advance seeded RNG on a discarded token).
     intermediate_only: bool = False
+    target_aux_hidden_states: tuple[mx.array, ...] = ()
 
 
 class MetalModelRunner:
@@ -389,6 +391,7 @@ class MetalModelRunner:
         self._multimodal_adapter: MultimodalRuntimeAdapter | None = None
         self._gemma4_mtp_assistant: Gemma4MTPAssistantRuntime | None = None
         self._eagle3_model: Any | None = None
+        self._target_aux_capture: AuxHiddenStateCapture | None = None
         self._drafter: MetalProposer | None = None
         # Resolved eagerly (config-only, no weights) so `ModelCachePolicy`
         # can size a scheduler-visible KV-cache group for the draft model
@@ -754,6 +757,7 @@ class MetalModelRunner:
             cache=cache,
             collect_hidden_states=collect_hidden_states,
             logits_indices=logits_indices,
+            aux_capture=self._target_aux_capture,
         )
 
     def _paged_logits_layout(
@@ -1145,6 +1149,7 @@ class MetalModelRunner:
         # branches project nothing, so the packed boundaries stand.
         logits_layout = _PagedLogitsLayout(None, cu_seqlens)
         target_hidden_states: mx.array | None = None
+        target_aux_hidden_states: tuple[mx.array, ...] = ()
         pooling_hidden_states: mx.array | None = None
         intermediate_hidden: mx.array | None = None
         intermediate_only = False
@@ -1299,6 +1304,7 @@ class MetalModelRunner:
                     )
                     logits = target_output.logits
                     target_hidden_states = target_output.hidden_states
+                    target_aux_hidden_states = target_output.aux_hidden_states
                     del target_output
         finally:
             clear_context()
@@ -1322,6 +1328,7 @@ class MetalModelRunner:
             forward_outputs = [logits]
             if target_hidden_states is not None:
                 forward_outputs.append(target_hidden_states)
+            forward_outputs.extend(target_aux_hidden_states)
             self._submit_paged_forward_outputs(*forward_outputs)
 
         # `cu_seqlens` keeps describing the packed hidden states, which the
@@ -1334,6 +1341,7 @@ class MetalModelRunner:
             scheduler_output=scheduler_output,
             logits=logits,
             target_hidden_states=target_hidden_states,
+            target_aux_hidden_states=target_aux_hidden_states,
             pooling_hidden_states=pooling_hidden_states,
             cu_seqlens=cu_seqlens,
             logits_cu_seqlens=logits_layout.cu_seqlens,
@@ -1446,6 +1454,7 @@ class MetalModelRunner:
         scheduler_output = paged_state.scheduler_output
         logits = paged_state.logits
         target_hidden_states = paged_state.target_hidden_states
+        target_aux_hidden_states = paged_state.target_aux_hidden_states
         pooling_hidden_states = paged_state.pooling_hidden_states
         cu_seqlens = paged_state.cu_seqlens
         # Everything indexing `logits` uses these; `cu_seqlens` stays the packed
@@ -1511,11 +1520,11 @@ class MetalModelRunner:
 
         # ---- wait for MLX forward to complete ----
         # Only force logits here when something before sampling consumes them
-        # eagerly: the Gemma4 MTP drafter (target_hidden_states) or the
+        # eagerly: the MTP/EAGLE3 drafter (final/auxiliary states) or the
         # structured-output bitmask. Otherwise the sampler's own eval pulls the
         # forward through, so a separate wait here is a redundant per-step sync.
-        if target_hidden_states is not None:
-            mx.eval(logits, target_hidden_states)
+        if target_hidden_states is not None or target_aux_hidden_states:
+            mx.eval(logits, target_hidden_states, target_aux_hidden_states)
         elif grammar_output is not None:
             mx.eval(logits)
 
@@ -1701,6 +1710,7 @@ class MetalModelRunner:
         num_speculative_tokens = scheduler_output.num_spec_tokens_to_schedule
         draft_ctx = ProposeContext(
             target_hidden_states=target_hidden_states,
+            target_aux_hidden_states=target_aux_hidden_states,
             decode_reqs=decode_reqs,
             decode_segments=decode_segments,
             decode_token_ids=decode_token_ids,

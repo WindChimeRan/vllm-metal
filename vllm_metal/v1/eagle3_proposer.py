@@ -152,8 +152,8 @@ class Eagle3Proposer(DraftModelProposer):
     def needs_target_hidden_states(
         self, decode_segments: Any, *, has_final_prefill: bool
     ) -> bool:
-        # Intermediate prefill and K=0 must populate the same cache as decode.
-        return True
+        # EAGLE3 consumes auxiliary states, not the target's final hidden state.
+        return False
 
     def _plan(
         self,
@@ -315,8 +315,10 @@ class Eagle3Proposer(DraftModelProposer):
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         self.release_requests(ctx.finished_req_ids)
         self._prune_finished(ctx.request_states)
-        assert ctx.target_hidden_states is not None
-        fused = self._model.combine_hidden_states(ctx.target_hidden_states)
+        assert ctx.target_aux_hidden_states
+        fused = self._model.combine_hidden_states(
+            mx.concatenate(ctx.target_aux_hidden_states, axis=-1)
+        )
         plans = self._plans(ctx, fused)
         if not plans:
             return None

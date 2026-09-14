@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MLX EAGLE3 heads for full-attention Qwen3 and Llama targets.
+"""MLX EAGLE3 heads with Llama-style draft attention and MLPs.
 
 The checkpoint describes the draft architecture independently of the target.
 Red Hat's Qwen3 heads, for example, use a Llama layer without Q/K norms.
@@ -45,20 +45,13 @@ class Eagle3Config:
             raise NotImplementedError(
                 "Metal EAGLE3 does not support fc_norm checkpoints"
             )
-        if target.get("model_type") not in ("llama", "qwen3"):
-            raise NotImplementedError(
-                "Metal EAGLE3 targets must be Llama or dense Qwen3"
-            )
-        if target.get("sliding_window") or any(
-            kind != "full_attention" for kind in target.get("layer_types", [])
-        ):
-            raise NotImplementedError("Metal EAGLE3 requires full-attention targets")
         num_layers = int(target["num_hidden_layers"])
         ids = tuple(
             config.get("eagle_aux_hidden_state_layer_ids")
+            or config.get("eagle_config", {}).get("eagle_aux_hidden_state_layer_ids")
             or (2, num_layers // 2, num_layers - 3)
         )
-        if len(ids) != 3 or not all(0 < i < num_layers for i in ids):
+        if len(ids) != 3 or not all(0 <= i <= num_layers for i in ids):
             raise ValueError(f"Invalid EAGLE3 target hidden-state indices: {ids}")
         target_hidden = int(config.get("target_hidden_size") or layer.hidden_size)
         if (target_hidden, layer.vocab_size) != (

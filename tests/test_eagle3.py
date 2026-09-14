@@ -185,7 +185,10 @@ def _prefill(proposer, requests, *, k=3, states=None, finished=()):
         states[req_id] = SimpleNamespace(token_ids=prompt, sampling_params=params)
     return proposer.propose(
         ProposeContext(
-            target_hidden_states=mx.concatenate(feature_rows),
+            target_hidden_states=None,
+            target_aux_hidden_states=tuple(
+                mx.split(mx.concatenate(feature_rows), 3, axis=-1)
+            ),
             decode_reqs=[],
             decode_segments=[],
             decode_token_ids=[],
@@ -334,7 +337,8 @@ def test_verification_rebuilds_kv_from_actual_target_features(accepted):
     )
     result = proposer.propose(
         ProposeContext(
-            target_hidden_states=verified_features,
+            target_hidden_states=None,
+            target_aux_hidden_states=tuple(mx.split(verified_features, 3, axis=-1)),
             decode_reqs=[("a", state)],
             decode_segments=[segment],
             decode_token_ids=[output],
@@ -462,7 +466,8 @@ def test_preempted_request_replays_output_history_beyond_original_prompt():
     )
     result = proposer.propose(
         ProposeContext(
-            target_hidden_states=features[16:32],
+            target_hidden_states=None,
+            target_aux_hidden_states=tuple(mx.split(features[16:32], 3, axis=-1)),
             decode_reqs=[],
             decode_segments=[],
             decode_token_ids=[],

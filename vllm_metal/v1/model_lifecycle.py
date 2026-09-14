@@ -559,9 +559,10 @@ class ModelLifecycle:
         runner.kv_cache_dtype = request.target_dtype
         runner._gemma4_mtp_assistant = gemma4_mtp_assistant
         runner._eagle3_model = None
-        self._model_adapter.eagle3_aux_layers = ()
+        runner._target_aux_capture = None
         spec = runner.vllm_config.speculative_config
         if spec is not None and spec.method == "eagle3":
+            from vllm_metal.v1.aux_hidden_states import AuxHiddenStateCapture
             from vllm_metal.v1.eagle3 import Eagle3Model
 
             if runner._is_vlm or runner.vllm_config.lora_config is not None:
@@ -581,8 +582,9 @@ class ModelLifecycle:
                     runner.model
                 ).model.embed_tokens,
             )
-            self._model_adapter.eagle3_aux_layers = (
-                runner._eagle3_model.config.aux_layer_ids
+            runner._target_aux_capture = AuxHiddenStateCapture(
+                self._model_adapter.text_model(runner.model),
+                runner._eagle3_model.config.aux_layer_ids,
             )
 
     def _extract_model_args(self, model: Any, is_vlm: bool) -> dict[str, Any]:
