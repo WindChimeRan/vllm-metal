@@ -64,7 +64,6 @@ jobs:
               r'^  sha256 ".*"$': f'  sha256 "{plugin_sha}"',
               r'^    url ".*"$': f'    url "{core_url}"',
               r'^    sha256 ".*"$': f'    sha256 "{core_sha}"',
-              r'^    vllm_wheel = buildpath/".*"$': f'    vllm_wheel = buildpath/"{core_name}"',
           }
           for pattern, replacement in replacements.items():
               text, count = re.subn(pattern, lambda _: replacement, text, flags=re.MULTILINE)

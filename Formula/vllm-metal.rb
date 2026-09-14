@@ -1,3 +1,5 @@
+require "uri"
+
 class VllmMetal < Formula
   desc "LLM inference server for Apple Silicon using vLLM"
   homepage "https://github.com/vllm-project/vllm-metal"
@@ -29,7 +31,8 @@ class VllmMetal < Formula
     # Restore the wheel filename: Homebrew's cached download has a hash prefix
     # that pip cannot parse. Resolve both wheels together, including the
     # plugin's Git-pinned mlx-lm dependency and exact MLX version.
-    vllm_wheel = buildpath/"vllm-0.29.0+cpu-cp312-cp312-macosx_11_0_arm64.whl"
+    wheel_name = File.basename(URI.parse(resource("vllm").url).path)
+    vllm_wheel = buildpath/URI::DEFAULT_PARSER.unescape(wheel_name)
     cp resource("vllm").cached_download, vllm_wheel
     system libexec/"bin/pip", "install", vllm_wheel,
            buildpath/"vllm_metal-#{version}-cp312-cp312-macosx_15_0_arm64.whl"
