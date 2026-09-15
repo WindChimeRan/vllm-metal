@@ -63,8 +63,7 @@ scripts/lint.sh
 Mirrors the `test` job in CI: wheel validation, Metal platform checks, and the non-slow pytest suite. Model parity runs separately in the [daily and requested workflow](tools.md#scheduled-and-requested-ci):
 
 This needs Xcode with macOS SDK 26.2 or newer and its Metal
-compiler component (`xcodebuild -downloadComponent MetalToolchain`). CI installs
-the component explicitly.
+compiler component (`xcodebuild -downloadComponent MetalToolchain`).
 
 ```bash
 scripts/test.sh
