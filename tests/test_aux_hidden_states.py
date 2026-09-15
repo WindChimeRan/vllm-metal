@@ -9,7 +9,7 @@ import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models import gemma4, gemma4_text, llama, qwen3
 
-from vllm_metal.v1.aux_hidden_states import AuxHiddenStateCapture
+from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
 from vllm_metal.v1.model_adapter import DefaultModelAdapter
 
 

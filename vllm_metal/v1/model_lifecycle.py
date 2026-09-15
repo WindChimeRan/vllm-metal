@@ -562,7 +562,7 @@ class ModelLifecycle:
         runner._target_aux_capture = None
         spec = runner.vllm_config.speculative_config
         if spec is not None and spec.method == "eagle3":
-            from vllm_metal.v1.aux_hidden_states import AuxHiddenStateCapture
+            from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
             from vllm_metal.v1.eagle3 import Eagle3Model
 
             if runner._is_vlm or runner.vllm_config.lora_config is not None:

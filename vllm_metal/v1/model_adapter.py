@@ -15,7 +15,7 @@ if TYPE_CHECKING:
 
     from vllm_metal.distributed import PipelineGroup
     from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
-    from vllm_metal.v1.aux_hidden_states import AuxHiddenStateCapture
+    from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
 
 logger = init_logger(__name__)
 

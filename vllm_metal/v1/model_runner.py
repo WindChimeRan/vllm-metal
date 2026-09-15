@@ -63,7 +63,7 @@ from vllm_metal.distributed import (
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.multimodal import merge_multimodal_embeddings
 from vllm_metal.multimodal.feature_spec import MultiModalFeatureSpec
-from vllm_metal.v1.aux_hidden_states import AuxHiddenStateCapture
+from vllm_metal.patches.aux_hidden_states import AuxHiddenStateCapture
 from vllm_metal.v1.cache_policy import ModelCachePolicy
 from vllm_metal.v1.decode_pipeline import (
     PENDING_TOKEN_PLACEHOLDER,
