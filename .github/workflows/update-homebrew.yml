@@ -38,7 +38,9 @@ jobs:
               return json.loads(subprocess.check_output(["gh", "api", path]))
 
           def wheel(release, name):
-              asset = next(a for a in release["assets"] if a["name"] == name)
+              asset = next((a for a in release["assets"] if a["name"] == name), None)
+              if asset is None:
+                  raise ValueError(f"Release {release['tag_name']} is missing expected wheel asset: {name}")
               digest = asset.get("digest") or ""
               if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
                   raise ValueError(f"Missing SHA-256 for {name}")
