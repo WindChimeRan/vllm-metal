@@ -54,7 +54,7 @@ Model parity runs separately through [scheduled and requested CI](tools.md#sched
 
 ## Pull requests
 
-- **Model changes:** add a deterministic greedy-decoding test against `mlx_lm`. See the [golden-token generator](../tools/gen_golden_token_ids_for_deterministics.py).
+- **Model changes:** run the [greedy parity tool](tools.md) against the environment's native `mlx-lm`. Report `EXACT` and `TOP_K_MATCH` counts separately and investigate failures.
 - **Performance claims:** include before/after [serving benchmark](https://docs.vllm.ai/en/latest/cli/bench/serve/) results.
 
 Sign off each commit to certify agreement with the [Developer Certificate of

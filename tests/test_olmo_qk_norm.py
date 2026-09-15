@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numeric regression coverage for OLMo 3's full-projection Q/K norms."""
+"""Numeric regression coverage for OLMo 2/3 full-projection Q/K norms."""
 
 import mlx.core as mx
+import pytest
+from mlx_lm.models.olmo2 import Attention as Olmo2Attention
+from mlx_lm.models.olmo2 import ModelArgs as Olmo2Args
 from mlx_lm.models.olmo3 import ModelArgs, Olmo3Attention
 
-from vllm_metal.attention.attention_contracts import (
-    QKNormPlacement,
-    attention_contract_for,
-)
+from vllm_metal.attention.attention_contracts import attention_contract_for
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import prepare_sdpa_qkv
 
@@ -22,25 +22,30 @@ def _context(seq_len: int) -> PagedAttentionContext:
     )
 
 
-def test_olmo3_qk_norm_is_applied_before_splitting_heads() -> None:
-    args = ModelArgs(
-        model_type="olmo3",
-        hidden_size=16,
-        num_hidden_layers=1,
-        intermediate_size=32,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        rms_norm_eps=1e-5,
-        vocab_size=32,
-        max_position_embeddings=64,
-        sliding_window=8,
-        rope_theta=10_000.0,
-        layer_types=["full_attention"],
-        head_dim=4,
-    )
-    attention = Olmo3Attention(args, layer_idx=0)
+@pytest.mark.parametrize("model_type", ["olmo2", "olmo3"])
+def test_olmo_qk_norm_is_applied_before_splitting_heads(model_type: str) -> None:
+    config = {
+        "model_type": model_type,
+        "hidden_size": 16,
+        "num_hidden_layers": 1,
+        "intermediate_size": 32,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-5,
+        "vocab_size": 32,
+        "max_position_embeddings": 64,
+        "rope_theta": 10_000.0,
+        "head_dim": 4,
+    }
+    if model_type == "olmo2":
+        args = Olmo2Args.from_dict(config)
+        attention = Olmo2Attention(args)
+    else:
+        args = ModelArgs.from_dict(
+            {**config, "sliding_window": 8, "layer_types": ["full_attention"]}
+        )
+        attention = Olmo3Attention(args, layer_idx=0)
     contract = attention_contract_for(attention)
-    assert contract.qk_norm_placement is QKNormPlacement.BEFORE_HEAD_SPLIT
 
     attention.q_norm.weight = mx.linspace(0.5, 1.5, 16)
     attention.k_norm.weight = mx.linspace(1.5, 0.5, 8)
@@ -58,8 +63,8 @@ def test_olmo3_qk_norm_is_applied_before_splitting_heads() -> None:
         attention,
         x,
         _context(seq_len=3),
-        attention.num_attention_heads,
-        attention.num_key_value_heads,
+        args.num_attention_heads,
+        args.num_key_value_heads,
         attention_contract=contract,
     )
     mx.eval(queries, keys, expected_q, expected_k)

@@ -10,7 +10,7 @@ class QKNormPlacement(Enum):
 
     BEFORE_ROPE = auto()  # Default: per-head normalization
     AFTER_ROPE = auto()  # Hunyuan: per-head normalization after RoPE
-    BEFORE_HEAD_SPLIT = auto()  # OLMo 3: full-projection normalization
+    BEFORE_HEAD_SPLIT = auto()  # OLMo 2/3: full-projection normalization
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +27,9 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
     "mlx_lm.models.hunyuan_v1_dense": AttentionContract(
         qk_norm_placement=QKNormPlacement.AFTER_ROPE
     ),
+    "mlx_lm.models.olmo2": AttentionContract(
+        qk_norm_placement=QKNormPlacement.BEFORE_HEAD_SPLIT
+    ),
     "mlx_lm.models.olmo3": AttentionContract(
         qk_norm_placement=QKNormPlacement.BEFORE_HEAD_SPLIT
     ),
@@ -41,4 +44,7 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
 
 def attention_contract_for(module: object) -> AttentionContract:
     """Return the model's attention contract or the standard default."""
+    if type(module).__module__ == "mlx_lm.models.granitemoehybrid":
+        # Granite selects RoPE or position-free attention from the checkpoint.
+        return AttentionContract(use_rope=module.rope is not None)
     return _ATTENTION_CONTRACTS.get(type(module).__module__, DEFAULT_ATTENTION_CONTRACT)
