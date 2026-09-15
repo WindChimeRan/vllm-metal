@@ -149,16 +149,16 @@ def test_head_matches_pytorch_gqa_mha_reference(kv_heads, norm_before_residual):
     )
 
 
-def _proposer(model):
+def _proposer(model, *, max_model_len=4096):
     proposer = Eagle3Proposer.build(
         model=model,
         controller=SpeculativeDecodeController(),
-        committed_num_blocks=16,
-        scratch_reserve_blocks=8,
+        num_blocks=16,
+        max_model_len=max_model_len,
         block_size=16,
         dtype=mx.float32,
     )
-    proposer.adopt_committed_group(0)
+    proposer.adopt_committed_group(0, max_model_len)
     return proposer
 
 
@@ -259,6 +259,53 @@ def test_ragged_batch_matches_independent_full_context_drafts(k, kv_heads, monke
     assert get_context() is None
 
 
+@pytest.mark.parametrize("target_end", [29, 30, 32, 35])
+def test_context_limit_bounds_ingest_and_only_suppresses_long_rows(
+    target_end, monkeypatch
+):
+    from vllm_metal.attention.impls import sdpa_wrapper
+
+    native_forward = sdpa_wrapper.sdpa_forward
+    context_ends = []
+
+    def record_forward(inner, x, ctx, *args, **kwargs):
+        context_ends.extend(ctx.context_lens)
+        return native_forward(inner, x, ctx, *args, **kwargs)
+
+    monkeypatch.setattr(sdpa_wrapper, "sdpa_forward", record_forward)
+    model = _model()
+    proposer = _proposer(model, max_model_len=32)
+    short = list(range(8))
+    short_features = mx.random.normal((7, 192))
+    long = list(range(target_end + 1))
+    long_features = mx.random.normal((target_end, 192))
+    result = _prefill(
+        proposer,
+        [
+            ("short", short, short_features, [1], 0, 7),
+            ("long", long, long_features, [2, 3, 4], 0, target_end),
+        ],
+    )
+    # K=3 fits exactly at 29+3=32. Extra physical block slack must never
+    # permit queries beyond the draft model's own context limit.
+    assert result.req_ids == (["short", "long"] if target_end == 29 else ["short"])
+    assert result.draft_token_ids[0] == _plain_drafts(model, short, short_features)
+    assert max(context_ends) == (31 if target_end == 29 else min(target_end, 32))
+
+
+def test_prefill_beyond_shorter_draft_context_skips_forward(monkeypatch):
+    model = _model()
+    proposer = _proposer(model, max_model_len=32)
+    prompt = list(range(40))
+    features = mx.random.normal((39, 192))
+
+    def unexpected_forward(*args):
+        pytest.fail("No draft input remains within the model context limit")
+
+    monkeypatch.setattr(proposer, "_forward", unexpected_forward)
+    assert _prefill(proposer, [("long", prompt, features, [1, 2, 3], 32, 39)]) is None
+
+
 def test_prefix_hit_with_different_next_token_preserves_shared_kv():
     model = _model()
     proposer = _proposer(model)
@@ -338,7 +385,7 @@ def test_verification_rebuilds_kv_from_actual_target_features(accepted):
     proposer = _proposer(model)
     prompt = list(range(32))
     features = mx.random.normal((31, 192))
-    previous = _prefill(proposer, [("a", prompt, features, [1, 2], 0, 31)])
+    previous = _prefill(proposer, [("a", prompt, features, [1, 2, 3], 0, 31)])
     drafts = previous.draft_token_ids[0]
     output = drafts[:accepted] + [79]
     verified_features = mx.random.normal((4, 192))
@@ -382,7 +429,8 @@ def test_finished_id_can_be_reused_without_retaining_old_draft_state():
     proposer = _proposer(model)
     long_prompt = list(range(32))
     _prefill(
-        proposer, [("same-id", long_prompt, mx.random.normal((31, 192)), [1, 2], 0, 31)]
+        proposer,
+        [("same-id", long_prompt, mx.random.normal((31, 192)), [1, 2, 3], 0, 31)],
     )
     prompt = [12, 48, 7, 91, 36, 52, 67, 11]
     features = mx.random.normal((7, 192))
@@ -390,7 +438,6 @@ def test_finished_id_can_be_reused_without_retaining_old_draft_state():
         proposer, [("same-id", prompt, features, [1], 0, 7)], finished=("same-id",)
     )
     assert result.draft_token_ids == [_plain_drafts(model, prompt, features)]
-    assert not proposer._scratch_req_blocks
 
 
 def test_quantized_checkpoint_preserves_packed_weights_and_dense_embeddings(tmp_path):

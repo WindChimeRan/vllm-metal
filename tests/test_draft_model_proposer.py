@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the draft-model proposer's committed/scratch block split.
+"""Tests for the draft-model proposer's scheduler-owned block tables.
 
 A stub draft model returns logits of the right shape, so ingest, drafting,
 and the release path run through ``propose`` without loading any weights.
@@ -28,8 +28,6 @@ from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 BLOCK_SIZE = 16
 COMMITTED_GROUP_INDEX = 0
-COMMITTED_NUM_BLOCKS = 2
-SCRATCH_RESERVE_BLOCKS = 2
 VOCAB_SIZE = 64
 PROMPT_LEN = 20
 
@@ -98,19 +96,17 @@ class _PositionEncodingDraftModel(_StubDraftModel):
 def _proposer(
     model: _StubDraftModel,
     *,
-    committed_num_blocks: int = COMMITTED_NUM_BLOCKS,
-    scratch_reserve_blocks: int = SCRATCH_RESERVE_BLOCKS,
+    max_model_len: int = 4096,
 ) -> DraftModelProposer:
     proposer = DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
-        committed_num_blocks=committed_num_blocks,
-        scratch_reserve_blocks=scratch_reserve_blocks,
+        max_model_len=max_model_len,
         num_layers=1,
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,
     )
-    proposer.adopt_committed_group(COMMITTED_GROUP_INDEX)
+    proposer.adopt_committed_group(COMMITTED_GROUP_INDEX, max_model_len)
     return proposer
 
 
@@ -166,7 +162,9 @@ def _prefills_context(
             req_id=req_id,
             token_ids=list(token_ids),
             sampling_params=SamplingParams(temperature=0.0),
-            block_ids=[[0]],
+            block_ids=[
+                list(range((len(token_ids) + num_speculative_tokens + 15) // 16))
+            ],
             generator=None,
             prompt_len=None,
             start_pos=0,
@@ -183,7 +181,8 @@ def _prefills_context(
         prefill_token_ids=[42] * len(prefill_reqs),
         prefill_result_modes=["final"] * len(prefill_reqs),
         request_states={
-            req_id: _request_state(committed_block_ids=[0]) for req_id, _ in prefills
+            req_id: _request_state(committed_block_ids=[], token_ids=[*token_ids, 42])
+            for req_id, token_ids in prefills
         },
         cu_seqlens=[],
         num_decode_segments=0,
@@ -192,18 +191,12 @@ def _prefills_context(
     )
 
 
-def _drafting_blocks(model: _StubDraftModel, forward_index: int) -> set[int]:
-    (block_ids,) = model.block_tables[forward_index]
-    return set(block_ids)
-
-
 def test_propose_before_adopt_committed_group_raises() -> None:
     model = _StubDraftModel()
     proposer = DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
-        committed_num_blocks=COMMITTED_NUM_BLOCKS,
-        scratch_reserve_blocks=SCRATCH_RESERVE_BLOCKS,
+        max_model_len=4096,
         num_layers=1,
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,
@@ -226,20 +219,54 @@ def test_committed_blocks_come_from_scheduler_assignment() -> None:
     assert used[:2] == [1, 0]
 
 
-def test_lookahead_tail_draws_from_scratch_pool_beyond_committed() -> None:
-    """A request whose committed blocks exactly cover its prompt still needs
-    a scratch block for the speculative lookahead position(s)."""
+@pytest.mark.parametrize("k", [1, 3, 0])
+def test_lookahead_uses_only_scheduler_blocks_at_exact_boundary(k) -> None:
     model = _StubDraftModel()
-    proposer = _proposer(model, committed_num_blocks=1)
-    state = _request_state(committed_block_ids=[0])
+    proposer = _proposer(model)
+    # The sampled token is already in state.token_ids; K=3 writes through
+    # position 31, so a third block would exceed the scheduler's reservation.
+    state = _request_state(committed_block_ids=[7, 2], token_ids=list(range(30)))
     drafts = proposer.propose(
-        _context("r1", state, {"r1": state}, num_speculative_tokens=4)
+        _context("r1", state, {"r1": state}, num_speculative_tokens=k)
     )
+    assert (drafts is not None) == (k > 0)
+    assert all(blocks == [7, 2] for call in model.block_tables for blocks in call)
 
-    assert drafts is not None
-    used = model.block_tables[0][0]
-    assert used[0] == 0  # committed block, scheduler-assigned
-    assert used[1] >= 1  # scratch block, drawn from the offset range
+
+def test_missing_scheduler_lookahead_fails_before_forward() -> None:
+    model = _StubDraftModel()
+    proposer = _proposer(model)
+    state = _request_state(committed_block_ids=[7], token_ids=list(range(16)))
+    with pytest.raises(RuntimeError, match="scheduler supplied 1"):
+        proposer.propose(_context("r1", state, {"r1": state}, num_speculative_tokens=3))
+    assert not model.block_tables
+
+
+@pytest.mark.parametrize(
+    "target_end, expected_drafts", [(29, True), (30, False), (32, False), (35, False)]
+)
+@pytest.mark.parametrize("prefill", [False, True])
+def test_context_limit_suppresses_drafts_but_ingests_valid_prefix(
+    target_end, expected_drafts, prefill
+) -> None:
+    model = _StubDraftModel()
+    proposer = _proposer(model, max_model_len=32)
+    if prefill:
+        ctx = _prefills_context(
+            [("r1", list(range(target_end)))], num_speculative_tokens=3
+        )
+    else:
+        state = _request_state(
+            committed_block_ids=[7, 2, 9], token_ids=list(range(target_end + 1))
+        )
+        ctx = _context("r1", state, {"r1": state}, num_speculative_tokens=3)
+    drafts = proposer.propose(ctx)
+    assert (drafts is not None) == expected_drafts
+    # A non-drafting final prefill need not ingest its sampled token yet.
+    expected_ingest = min(target_end + (not prefill or expected_drafts), 32)
+    assert model.input_lens[0] == expected_ingest
+    assert proposer._draft_seq_lens["r1"] == expected_ingest
+    assert len(model.input_lens) == (3 if expected_drafts else 1)
 
 
 def test_cache_hit_seeds_draft_seq_len_from_scheduler_boundary() -> None:
@@ -316,54 +343,6 @@ def test_intermediate_prefill_chunk_ingests_without_drafting() -> None:
 
     assert drafts is None
     assert len(model.block_tables) == 1
-
-
-def test_release_requests_returns_scratch_blocks_to_the_free_pool() -> None:
-    model = _StubDraftModel()
-    proposer = _proposer(model, committed_num_blocks=1)
-    waiting = _request_state(committed_block_ids=[0])
-    resumed = _request_state(committed_block_ids=[0])
-    request_states = {"waiting": waiting, "resumed": resumed}
-
-    assert (
-        proposer.propose(
-            _context("waiting", waiting, request_states, num_speculative_tokens=4)
-        )
-        is not None
-    )
-    pool = _drafting_blocks(model, 0)
-
-    proposer.release_requests({"waiting"})
-
-    drafts = proposer.propose(
-        _context("resumed", resumed, request_states, num_speculative_tokens=4)
-    )
-
-    assert drafts is not None
-    assert list(drafts.req_ids) == ["resumed"]
-    assert _drafting_blocks(model, 1) == pool
-
-
-def test_scratch_pool_exhaustion_raises() -> None:
-    model = _StubDraftModel()
-    proposer = _proposer(model, committed_num_blocks=1, scratch_reserve_blocks=1)
-    waiting = _request_state(committed_block_ids=[0])
-    resumed = _request_state(committed_block_ids=[0])
-    request_states = {"waiting": waiting, "resumed": resumed}
-
-    assert (
-        proposer.propose(
-            _context("waiting", waiting, request_states, num_speculative_tokens=4)
-        )
-        is not None
-    )
-
-    calls_before = len(model.block_tables)
-    with pytest.raises(RuntimeError, match="scratch pool exhausted"):
-        proposer.propose(
-            _context("resumed", resumed, request_states, num_speculative_tokens=4)
-        )
-    assert len(model.block_tables) == calls_before
 
 
 # -- Speculative-KV reuse (#482 direction 2) --------------------------------
@@ -459,28 +438,18 @@ def test_rejected_draft_reingests_the_full_committed_range() -> None:
     assert model.input_lens[ingest] == 4  # all K+1 newly committed tokens
 
 
-def test_scratch_block_spec_kv_is_not_reused() -> None:
-    """Speculative KV that landed in a scratch block (lookahead crossed a
-    block boundary) must not be skipped past: the scheduler allocated a
-    different physical block for those positions, so the KV is not where
-    the new block table looks."""
+def test_accepted_lookahead_kv_is_reused_across_block_boundary() -> None:
     model = _StubDraftModel()
     proposer = _proposer(model)
-
-    # committed_len 31 with 16-token blocks: lookahead positions 31, 32
-    # land in committed block 1 and scratch block 2 respectively.
     ingest = _draft_two_rounds(
         model,
         proposer,
         first_round_len=31,
-        first_round_blocks=[0, 1],
+        first_round_blocks=[0, 1, 5],
         second_round_tokens=[0, 0, 0, 5],
-        second_round_blocks=[0, 1, 5],  # scheduler's own block 5, not scratch 2
+        second_round_blocks=[0, 1, 5],
     )
-
-    # Position 31 (committed block, matching token) is skipped; position 32
-    # (scratch write) is not: 35 - 32 = 3 tokens re-ingested.
-    assert model.input_lens[ingest] == 3
+    assert model.input_lens[ingest] == 2
 
 
 def test_reallocated_block_spec_kv_is_not_reused() -> None:
@@ -711,3 +680,27 @@ def test_full_attention_draft_accepted() -> None:
         layer_types=["full_attention"] * 4,
     )
     _require_full_attention_draft(cfg_explicit)  # should not raise
+
+
+def test_scheduler_adoption_uses_target_limit_after_auto_fit() -> None:
+    from vllm_metal.v1.cache_policy import ModelCachePolicy
+
+    model = _StubDraftModel()
+    proposer = _proposer(model, max_model_len=4096)
+    runner = SimpleNamespace(
+        _drafter=proposer,
+        _draft_dims=SimpleNamespace(num_layers=1),
+        model_config=SimpleNamespace(max_model_len=32),
+    )
+    config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(layer_names=["draft_layers.0.self_attn"])]
+    )
+    ModelCachePolicy(runner, Mock())._adopt_draft_scheduler_group(config)
+    state = _request_state(token_ids=list(range(31)), committed_block_ids=[0, 1])
+    # The checkpoint's original limit would allow drafting into a third block.
+    # The engine's final limit suppresses lookahead while retaining valid ingest.
+    assert (
+        proposer.propose(_context("r", state, {"r": state}, num_speculative_tokens=3))
+        is None
+    )
+    assert model.input_lens == [31]

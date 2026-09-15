@@ -36,8 +36,7 @@ def _proposer(model, **kwargs) -> DraftModelProposer:
     return DraftModelProposer(
         model=model,
         block_size=BLOCK_SIZE,
-        committed_num_blocks=64,
-        scratch_reserve_blocks=0,
+        max_model_len=32768,
         num_layers=1,
         controller=None,
         extract_logits=lambda logits: logits,

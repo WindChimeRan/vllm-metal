@@ -51,16 +51,15 @@ class Eagle3Proposer(DraftModelProposer):
         *,
         model: Eagle3Model,
         controller: Any,
-        committed_num_blocks: int,
-        scratch_reserve_blocks: int,
+        num_blocks: int,
+        max_model_len: int,
         block_size: int,
         dtype: mx.Dtype,
     ) -> Eagle3Proposer:
         proposer = cls(
             model=model,
             controller=controller,
-            committed_num_blocks=committed_num_blocks,
-            scratch_reserve_blocks=scratch_reserve_blocks,
+            max_model_len=max_model_len,
             block_size=block_size,
             num_layers=1,
             extract_logits=lambda output: output[0],
@@ -70,7 +69,7 @@ class Eagle3Proposer(DraftModelProposer):
             num_layers=1,
             num_kv_heads=attention.n_kv_heads,
             head_dim=attention.head_dim,
-            num_blocks=committed_num_blocks + scratch_reserve_blocks,
+            num_blocks=num_blocks,
             block_size=block_size,
             dtype=dtype,
         )
@@ -93,11 +92,20 @@ class Eagle3Proposer(DraftModelProposer):
         features: mx.array,
         is_drafting: bool,
         k: int,
-    ) -> _EaglePlan:
+    ) -> _EaglePlan | None:
         # Shift tokens, leaving feature positions unchanged as in upstream EAGLE.
         start = target_start
         tokens = tokens[1:]
         assert len(tokens) == features.shape[0]
+        # Apply upstream's input-fit bound per request. Still ingest verified
+        # features within the draft model limit for prefix-cache reuse.
+        is_drafting = (
+            is_drafting and k > 0 and start + len(tokens) + k <= self._max_model_len
+        )
+        count = min(len(tokens), self._max_model_len - start)
+        if count <= 0:
+            return None
+        tokens, features = tokens[:count], features[:count]
         owned = self._ensure_blocks(
             req_id,
             committed_group_block_ids=blocks,
@@ -108,7 +116,7 @@ class Eagle3Proposer(DraftModelProposer):
     def _plans(self, ctx: ProposeContext, fused: mx.array) -> list[_EaglePlan]:
         assert self._committed_group_index is not None
         group = self._committed_group_index
-        plans: list[_EaglePlan] = []
+        plans: list[_EaglePlan | None] = []
         for (req_id, state), segment, output in zip(
             ctx.decode_reqs, ctx.decode_segments, ctx.decode_token_ids, strict=True
         ):
@@ -155,7 +163,7 @@ class Eagle3Proposer(DraftModelProposer):
                 )
             )
 
-        return plans
+        return [plan for plan in plans if plan is not None]
 
     def _forward(self, plans: list[_EaglePlan]) -> tuple[mx.array, mx.array]:
         packed: list[int] = []

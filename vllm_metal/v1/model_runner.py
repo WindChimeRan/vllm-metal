@@ -849,14 +849,6 @@ class MetalModelRunner:
         """One old physical state pool retained during align-cache growth."""
         return self._cache_policy.hybrid_align_growth_bytes_per_block()
 
-    def draft_scratch_reserve_blocks(self) -> int:
-        """Blocks reserved for the draft model's speculative lookahead tail."""
-        return self._cache_policy.draft_scratch_reserve_blocks()
-
-    def draft_scratch_reserve_bytes(self) -> int:
-        """Bytes held out of the KV budget for the draft's scratch tail."""
-        return self._cache_policy.draft_scratch_reserve_bytes()
-
     def profile_run(self) -> int:
         """Measure MLX buffer-cache footprint of one forward pass and cap the allocator.
 
@@ -983,29 +975,22 @@ class MetalModelRunner:
             self._drafter = Eagle3Proposer.build(
                 model=self._eagle3_model,
                 controller=self._spec_decode_controller,
-                committed_num_blocks=num_blocks,
-                scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
+                num_blocks=num_blocks,
+                max_model_len=spec.draft_model_config.max_model_len,
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
             )
         elif spec.uses_draft_model():
             from vllm_metal.v1.draft_model_proposer import DraftModelProposer
 
-            # `num_blocks` is the scheduler-visible committed-KV capacity for
-            # the draft group (see cache_policy._draft_layer_specs); the
-            # physical backend needs `scratch_reserve_blocks` on top of that
-            # for the speculative lookahead tail, which the scheduler never
-            # sees or assigns (see draft_scratch_reserve_blocks). The KV
-            # budget already reserved this many blocks' worth of bytes off
-            # the top (WorkerCachePlanner._paged_attention_plan), so this is
-            # guaranteed to fit.
+            # The scheduler owns both committed and lookahead draft blocks.
             self._drafter = DraftModelProposer.build(
                 speculative_config=spec,
                 parallel_config=self.vllm_config.parallel_config,
                 controller=self._spec_decode_controller,
                 extract_logits=self._model_adapter.extract_logits,
-                committed_num_blocks=num_blocks,
-                scratch_reserve_blocks=self.draft_scratch_reserve_blocks(),
+                num_blocks=num_blocks,
+                max_model_len=spec.draft_model_config.max_model_len,
                 block_size=block_size,
                 dtype=self.kv_cache_dtype,
             )
@@ -2537,10 +2522,7 @@ class MetalModelRunner:
         if resumed_req_ids:
             invalidated.update(resumed_req_ids)
 
-        # A drafter that pins a bounded per-request resource (draft cache blocks)
-        # releases it on the same events as the runtime's recurrent state: a
-        # waiting or preempted request must not keep holding the resource, and a
-        # resumed request re-acquires it during recompute.
+        # Discard draft KV validity tracking before eviction or recompute.
         if invalidated and self._drafter is not None:
             self._drafter.release_requests(invalidated)
 

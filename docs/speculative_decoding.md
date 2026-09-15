@@ -28,6 +28,13 @@ All methods currently have these Metal-specific constraints:
 EAGLE3's reduced output vocabulary is mapped to target token IDs before
 verification. It does not require `use_heterogeneous_vocab`.
 
+EAGLE3 and draft-model decoding use scheduler-allocated KV blocks for both
+committed tokens and speculative lookahead. A request drafts only when its
+current target context plus K fits the effective draft-model context limit.
+Otherwise, it maintains valid draft-cache state within that limit without
+proposing tokens. This decision is per request, so shorter requests in the
+same batch can continue drafting.
+
 ## EAGLE3
 
 The implementation drafts one linear chain and uses the existing greedy target
