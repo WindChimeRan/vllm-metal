@@ -211,7 +211,7 @@ class Eagle3Proposer:
             return None
         normalized, recurrent = self._forward(plans)
         active = [i for i, plan in enumerate(plans) if plan.is_drafting]
-        if not active or ctx.num_speculative_tokens <= 0:
+        if not active:
             mx.eval(*self._kv.key_caches, *self._kv.value_caches)
             return None
         indices = mx.array(active)

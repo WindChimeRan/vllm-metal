@@ -28,12 +28,8 @@ All methods currently have these Metal-specific constraints:
 EAGLE3's reduced output vocabulary is mapped to target token IDs before
 verification. It does not require `use_heterogeneous_vocab`.
 
-EAGLE3 and draft-model decoding use scheduler-allocated KV blocks for both
-committed tokens and speculative lookahead. A request drafts only when its
-current target context plus K fits the effective draft-model context limit.
-Otherwise, it maintains valid draft-cache state within that limit without
-proposing tokens. This decision is per request, so shorter requests in the
-same batch can continue drafting.
+EAGLE3 and draft-model decoding stop proposing tokens for a request when its
+current target context plus K exceeds the effective draft-model context limit.
 
 ## EAGLE3
 
@@ -66,22 +62,6 @@ vllm serve Qwen/Qwen3-8B \
 Original EAGLE checkpoints and Red Hat's speculators format are supported.
 Original checkpoints may omit token embeddings; the loader then uses the
 matching target embedding weights.
-
-Draft inputs are packed by request and use the existing Metal paged-attention
-kernels. The draft head reads its page table directly, without gathering padded
-KV histories. Like upstream EAGLE, target feature at position `t` is paired with
-token `t+1`, with draft KV and RoPE at position `t`. The scheduler reduces prefix
-hits by the final matching block so boundary states are recomputed; there is no
-separate boundary-feature buffer. Verified rows are ingested with actual target
-features even when proposals were accepted. Intermediate prefill chunks and
-steps with zero drafting budget also maintain this cache.
-
-Auxiliary features come from the target's native forward through a temporary,
-instance-local capture bridge. The bridge supports explicit MLX-LM Llama,
-Qwen3, and Gemma4 decoder contracts, including Gemma4's tuple outputs; native
-execution retains embedding scaling, masks, and cache updates. Auxiliary
-features are separate from the final hidden state. This bridge can be removed
-once MLX-LM exposes native auxiliary outputs.
 
 Batch-dependent rounding can change greedy winners. Exact SD-on/off token
 identity is not guaranteed.

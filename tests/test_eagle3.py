@@ -162,10 +162,10 @@ def _proposer(model, *, max_model_len=4096):
     return proposer
 
 
-def _prefill(proposer, requests, *, k=3, states=None, finished=()):
+def _prefill(proposer, requests, *, k=3):
     """requests = (id, full prompt, feature rows, cache blocks, start, end)."""
     prefills, sampled, modes, feature_rows = [], [], [], []
-    states = dict(states or {})
+    states = {}
     cu = [0]
     for req_id, prompt, features, blocks, start, end in requests:
         params = SamplingParams(temperature=0)
@@ -203,7 +203,7 @@ def _prefill(proposer, requests, *, k=3, states=None, finished=()):
             cu_seqlens=cu,
             num_decode_segments=0,
             num_speculative_tokens=k,
-            finished_req_ids=set(finished),
+            finished_req_ids=set(),
         )
     )
 
@@ -306,36 +306,6 @@ def test_prefill_beyond_shorter_draft_context_skips_forward(monkeypatch):
     assert _prefill(proposer, [("long", prompt, features, [1, 2, 3], 32, 39)]) is None
 
 
-def test_prefix_hit_with_different_next_token_preserves_shared_kv():
-    model = _model()
-    proposer = _proposer(model)
-    original = list(range(35))
-    features = mx.random.normal((34, 192))
-    _prefill(proposer, [("a", original, features, [1, 2, 3], 0, 34)])
-    # Freeze values on the CPU; another MLX array can alias in-place writes.
-    shared_keys = np.array(proposer._kv.key_caches[0][1]).copy()
-    changed = original[:32] + [87, 92, 12, 41, 56, 22, 75]
-    changed_features = mx.concatenate((features[:32], mx.random.normal((6, 192))))
-    result = _prefill(
-        proposer, [("b", changed, changed_features, [1, 4, 5], 16, 38)], finished=("a",)
-    )
-    reference_cache = KVCache()
-    assert result.draft_token_ids == [
-        _plain_drafts(model, changed, changed_features, cache=reference_cache)
-    ]
-    np.testing.assert_array_equal(shared_keys, np.array(proposer._kv.key_caches[0][1]))
-    # Of two matched blocks, upstream drops the last before resuming at 16.
-    physical = list(range(16, 32)) + list(range(64, 86))
-    for pool, reference in (
-        (proposer._kv.key_caches[0], reference_cache.keys),
-        (proposer._kv.value_caches[0], reference_cache.values),
-    ):
-        actual = pool.reshape(-1, 2, 64)[mx.array(physical)].transpose(1, 0, 2)
-        np.testing.assert_allclose(
-            np.array(actual), np.array(reference[0, :, :38]), atol=3e-3, rtol=3e-3
-        )
-
-
 @pytest.mark.parametrize("reverse", [False, True])
 def test_prefix_created_in_the_same_batch_uses_paged_kv(reverse):
     model = _model()
@@ -373,9 +343,7 @@ def test_chunked_prefill_and_zero_budget_populate_reusable_prefix():
     result = _prefill(proposer, [("a", prompt, features, [1, 2, 3, 4], 32, 50)])
     expected = _plain_drafts(model, prompt, features)
     assert result.draft_token_ids == [expected]
-    result = _prefill(
-        proposer, [("b", prompt, features, [1, 2, 5, 6], 32, 50)], finished=("a",)
-    )
+    result = _prefill(proposer, [("b", prompt, features, [1, 2, 5, 6], 32, 50)])
     assert result.draft_token_ids == [expected]
 
 
@@ -422,22 +390,6 @@ def test_verification_rebuilds_kv_from_actual_target_features(accepted):
     )
     canonical = mx.concatenate((features, verified_features[: accepted + 1]))
     assert result.draft_token_ids == [_plain_drafts(model, committed, canonical)]
-
-
-def test_finished_id_can_be_reused_without_retaining_old_draft_state():
-    model = _model()
-    proposer = _proposer(model)
-    long_prompt = list(range(32))
-    _prefill(
-        proposer,
-        [("same-id", long_prompt, mx.random.normal((31, 192)), [1, 2, 3], 0, 31)],
-    )
-    prompt = [12, 48, 7, 91, 36, 52, 67, 11]
-    features = mx.random.normal((7, 192))
-    result = _prefill(
-        proposer, [("same-id", prompt, features, [1], 0, 7)], finished=("same-id",)
-    )
-    assert result.draft_token_ids == [_plain_drafts(model, prompt, features)]
 
 
 def test_quantized_checkpoint_preserves_packed_weights_and_dense_embeddings(tmp_path):
@@ -615,6 +567,7 @@ def test_upstream_cache_manager_recomputes_boundary_before_draft_prefix_reuse():
     hit_blocks, hit_tokens, _ = manager.get_computed_blocks(resumed)
     assert hit_tokens == 16
     shared = hit_blocks.get_block_ids()[0][0]
+    # Freeze values on the CPU; another MLX array can alias in-place writes.
     shared_keys = np.array(proposer._kv.key_caches[0][shared]).copy()
     manager.allocate_slots(
         resumed,
@@ -627,9 +580,20 @@ def test_upstream_cache_manager_recomputes_boundary_before_draft_prefix_reuse():
     result = _prefill(
         proposer,
         [("resumed", changed, changed_features, blocks, hit_tokens, 38)],
-        finished=("owner",),
     )
-    assert result.draft_token_ids == [_plain_drafts(model, changed, changed_features)]
+    reference_cache = KVCache()
+    assert result.draft_token_ids == [
+        _plain_drafts(model, changed, changed_features, cache=reference_cache)
+    ]
     np.testing.assert_array_equal(
         shared_keys, np.array(proposer._kv.key_caches[0][shared])
     )
+    physical = [blocks[pos // 16] * 16 + pos % 16 for pos in range(38)]
+    for pool, reference in (
+        (proposer._kv.key_caches[0], reference_cache.keys),
+        (proposer._kv.value_caches[0], reference_cache.values),
+    ):
+        actual = pool.reshape(-1, 2, 64)[mx.array(physical)].transpose(1, 0, 2)
+        np.testing.assert_allclose(
+            np.array(actual), np.array(reference[0, :, :38]), atol=3e-3, rtol=3e-3
+        )

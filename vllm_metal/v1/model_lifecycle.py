@@ -569,10 +569,6 @@ class ModelLifecycle:
                 raise NotImplementedError(
                     "Metal EAGLE3 currently supports text-only targets without LoRA"
                 )
-            if runner.vllm_config.parallel_config.tensor_parallel_size != 1:
-                raise NotImplementedError(
-                    "Metal EAGLE3 currently requires tensor_parallel_size=1"
-                )
             runner._eagle3_model = Eagle3Model.load(
                 spec.model,
                 dict(model_args),
