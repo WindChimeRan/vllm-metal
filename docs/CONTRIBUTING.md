@@ -8,25 +8,25 @@ Thanks for your interest in contributing! This plugin targets **Apple Silicon Ma
 git clone https://github.com/vllm-project/vllm-metal.git
 cd vllm-metal
 
-# Creates ./.venv-vllm-metal/, installs vLLM core + the plugin, and
-# prebuilds the native Metal kernels from your checkout
-./install.sh
-
-# Activate the virtualenv
+./install.sh --editable
 source .venv-vllm-metal/bin/activate
-
-# Install dev dependencies (pytest, ruff, mypy, ...)
-pip install -e ".[dev]"
 ```
+
+Python changes take effect immediately. This installs development dependencies
+and reuses matching native binaries from the latest release, without a compiler.
+The native sources and MLX/nanobind versions must match the wheel; otherwise the
+installer reports the mismatch and asks you to build from source.
 
 ## Editing the Metal kernels
 
-Release wheels ship the native paged-attention extension and its Metal shader
-libraries **prebuilt**, so end users never compile them. To edit the kernels —
-the `.metal` shaders or `paged_ops.cpp` — and run from your local source, set:
+Kernel contributors build the native extension and shaders explicitly:
 
 ```bash
-VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve ...   # or: pytest, your script, etc.
+./install.sh --build
+source .venv-vllm-metal/bin/activate
+
+# Recompile changed kernels on subsequent runs.
+export VLLM_METAL_BUILD_FROM_SOURCE=1
 ```
 
 In this mode the C++ extension is recompiled when its inputs change (the build
@@ -35,11 +35,13 @@ in-process by MLX from the `.metal` source at runtime. There is **no manual
 `.metallib` rebuild step**: edit a kernel, restart the Python process, and the
 change is picked up.
 
-Requirements:
+`--build` needs Xcode with macOS SDK 26.2 or newer, `clang++`, and the Metal
+compiler component. Install the component with
+`xcodebuild -downloadComponent MetalToolchain` if it is missing. The installer
+reports compiler failures without downloading tools automatically.
 
-- **Xcode Command Line Tools** (`xcode-select --install`) — `clang++` rebuilds
-  the `.so`; keep it current enough for the pinned MLX headers.
-- No Metal toolchain needed: MLX compiles the `.metal` shaders in-process.
+After setup, `VLLM_METAL_BUILD_FROM_SOURCE=1` uses `clang++` for the C++ extension
+and MLX for runtime shader compilation.
 
 Without `VLLM_METAL_BUILD_FROM_SOURCE`, the prebuilt artifacts are loaded as-is.
 If you edited a kernel source after building them locally, loading **fails
@@ -59,6 +61,10 @@ scripts/lint.sh
 ## Run CI locally
 
 Mirrors the `test` job in CI: wheel validation, Metal platform checks, and the non-slow pytest suite. Model parity runs separately in the [daily and requested workflow](tools.md#scheduled-and-requested-ci):
+
+This needs Xcode with macOS SDK 26.2 or newer and its Metal
+compiler component (`xcodebuild -downloadComponent MetalToolchain`). CI installs
+the component explicitly.
 
 ```bash
 scripts/test.sh

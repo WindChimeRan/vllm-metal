@@ -9,19 +9,11 @@
 
 > **No compiler required.** The install script below fetches vLLM core and the
 > vllm-metal plugin as prebuilt wheels, so nothing is compiled on your machine.
-> Installing from a source checkout instead builds the native Metal kernels
-> locally and needs a toolchain; see [Contributing](CONTRIBUTING.md).
+> Running `./install.sh` from a checkout installs the same release wheels.
+> Python contributors use `./install.sh --editable`; kernel contributors use
+> `./install.sh --build`. See [Contributing](CONTRIBUTING.md).
 
 `uv` is bootstrapped automatically.
-
-Verify the Python architecture before installing:
-
-```bash
-python3 -c "import platform; print(platform.machine())"
-file "$(which python3)"
-```
-
-The first command should print `arm64`. If it prints `x86_64`, switch to a native arm64 Python and remove `~/.venv-vllm-metal` before reinstalling.
 
 ## Install
 

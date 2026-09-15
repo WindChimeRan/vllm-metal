@@ -1,21 +1,5 @@
 #!/bin/bash
 
-_cleanup_dirs=()
-
-register_cleanup_dir() {
-  _cleanup_dirs+=("$1")
-}
-
-cleanup_tmp_dirs() {
-  local dir
-  if [[ ${#_cleanup_dirs[@]} -eq 0 ]]; then
-    return
-  fi
-  for dir in "${_cleanup_dirs[@]}"; do
-    rm -rf "$dir"
-  done
-}
-
 # Stable uses /releases/latest; dev selects the newest .dev tag.
 fetch_release() {
   local repo_owner="$1"
@@ -87,21 +71,14 @@ fetch_release_vllm_tag() {
   local repo_owner="$1"
   local repo_name="$2"
   local release_tag="$3"
-  local metadata_url legacy_url metadata legacy_install vllm_version
+  local metadata_url metadata
 
   metadata_url="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${release_tag}/.github/vllm-release-tag.commit"
-  if metadata=$(curl -fsL "$metadata_url"); then
-    metadata=$(printf '%s' "$metadata" | tr -d '[:space:]')
-  else
-    # Releases created before this metadata file kept the same pin in install.sh.
-    legacy_url="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/${release_tag}/install.sh"
-    if ! legacy_install=$(curl -fsSL "$legacy_url"); then
-      error "Release ${release_tag} does not declare its compatible vLLM release."
-      return 1
-    fi
-    vllm_version=$(printf '%s\n' "$legacy_install" | sed -n 's/^VLLM_VERSION="\([^"]*\)"/\1/p' | head -n 1)
-    metadata="v${vllm_version}"
+  if ! metadata=$(curl -fsSL "$metadata_url"); then
+    error "Could not read the compatible vLLM release for ${release_tag}."
+    return 1
   fi
+  metadata=$(printf '%s' "$metadata" | tr -d '[:space:]')
 
   if ! validate_vllm_release_tag "$metadata"; then
     error "Release ${release_tag} has invalid vLLM metadata."
@@ -128,44 +105,8 @@ install_vllm() {
   success "Installed vLLM core"
 }
 
-download_and_install_wheel() {
-  local wheel_url="$1"
-  local package_name="$2"
-  local release_tag="$3"
-
-  local wheel_name
-  wheel_name=$(basename "$wheel_url")
-  echo "Release: ${release_tag}"
-  echo "Wheel:   $wheel_name"
-  success "Found release"
-
-  local tmp_dir
-  tmp_dir=$(mktemp -d)
-  register_cleanup_dir "$tmp_dir"
-
-  echo ""
-  echo "Downloading wheel..."
-  local wheel_path="$tmp_dir/$wheel_name"
-
-  if ! curl -fsSL "$wheel_url" -o "$wheel_path"; then
-    error "Failed to download wheel."
-    exit 1
-  fi
-
-  success "Downloaded wheel"
-
-  # Install vllm-metal package
-  if ! uv pip install "$wheel_path"; then
-    error "Failed to install ${package_name}."
-    exit 1
-  fi
-
-  success "Installed ${package_name}"
-}
-
 main() {
   set -eu -o pipefail
-  trap cleanup_tmp_dirs EXIT
 
   local repo_owner="vllm-project"
   local repo_name="vllm-metal"
@@ -173,6 +114,7 @@ main() {
 
   # Override the default dev channel with --stable or VLLM_METAL_CHANNEL.
   local channel="${VLLM_METAL_CHANNEL:-dev}"
+  local mode="wheel"
 
   for arg in "$@"; do
     case "$arg" in
@@ -182,18 +124,29 @@ main() {
       --stable)
         channel="stable"
         ;;
+      --editable|--build)
+        if [[ "$mode" != "wheel" ]]; then
+          echo "Choose either --editable or --build." >&2
+          exit 1
+        fi
+        mode="${arg#--}"
+        ;;
       -h|--help)
         cat <<'EOF'
-Usage: install.sh [--dev | --stable]
+Usage: install.sh [--dev | --stable] [--editable | --build]
 
 Options:
       --dev         Install the latest development build cut from main.
                     This is the default and the currently recommended channel.
       --stable      Install the latest tagged stable release. Stable releases
                     are cut by hand and may lag behind the dev channel.
+      --editable    Install this checkout's Python sources with prebuilt kernels.
+      --build       Install this checkout and compile its native kernels.
   -h, --help        Show this help.
 
 The channel can also be set with VLLM_METAL_CHANNEL=dev|stable.
+The default installs release wheels into ~/.venv-vllm-metal without a compiler.
+Contributor modes use .venv-vllm-metal in the checkout; only --build needs compilers.
 EOF
         exit 0
         ;;
@@ -213,11 +166,10 @@ EOF
       ;;
   esac
 
-  # Source shared library functions
-  # Try local lib.sh first (when running ./install.sh), fall back to remote (when piped from curl)
+  # Load shared helpers from beside this script, or fetch them for curl | bash.
   local local_lib=""
   local script_dir=""
-  if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+  if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-}")" && pwd)"
     local_lib="$script_dir/scripts/lib.sh"
   fi
@@ -250,30 +202,21 @@ EOF
   fi
 
   local venv="$HOME/.venv-vllm-metal"
-  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
-    # Source checkouts read the release tag file, run the editable install,
-    # and build native artifacts relative to the repo root, so anchor the
-    # working directory there instead of the caller's cwd.
-    cd "$script_dir" || exit 1
+  if [[ "$mode" != "wheel" ]]; then
+    if [[ -z "$local_lib" || ! -f "$local_lib" ]]; then
+      error "--${mode} must be run from a source checkout."
+      exit 1
+    fi
+    cd "$script_dir"
     venv="$script_dir/.venv-vllm-metal"
   fi
-
   ensure_venv "$venv"
   if ! require_arm64_python python; then
     exit 1
   fi
 
-  if [[ -n "$local_lib" && -f "$local_lib" ]]; then
-    local vllm_release_tag
-    vllm_release_tag=$(read_vllm_release_tag)
-    install_vllm "$vllm_release_tag"
-
-    # Source checkouts build native artifacts; release installs use the wheel.
-    uv pip install -e .
-    ensure_metal_toolchain
-    build_native_artifacts
-  else
-    local release_data selected release_tag wheel_url vllm_release_tag
+  local release_data selected release_tag wheel_url vllm_release_tag
+  if [[ "$mode" != "build" ]]; then
     release_data=$(fetch_release "$repo_owner" "$repo_name" "$channel")
 
     # extract_wheel_url prints the tag on the first line, the URL on the second.
@@ -291,10 +234,28 @@ EOF
       error "No wheel file found in the latest ${channel} release."
       exit 1
     fi
+  fi
 
+  if [[ "$mode" == "wheel" ]]; then
     vllm_release_tag=$(fetch_release_vllm_tag "$repo_owner" "$repo_name" "$release_tag")
     install_vllm "$vllm_release_tag"
-    download_and_install_wheel "$wheel_url" "$package_name" "$release_tag"
+    echo "Release: ${release_tag}"
+    if ! uv pip install "$wheel_url"; then
+      error "Failed to install ${package_name}."
+      exit 1
+    fi
+  else
+    if [[ "$mode" == "build" ]]; then
+      check_metal_toolchain
+    fi
+    vllm_release_tag=$(read_vllm_release_tag)
+    install_vllm "$vllm_release_tag"
+    install_dev_deps
+    if [[ "$mode" == "editable" ]]; then
+      python scripts/install_prebuilt.py "$wheel_url"
+    else
+      build_native_artifacts
+    fi
   fi
 
   echo ""

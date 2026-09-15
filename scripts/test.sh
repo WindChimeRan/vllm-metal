@@ -9,18 +9,19 @@ main() {
   # shellcheck source=lib.sh disable=SC1091
   source "${script_dir}/lib.sh"
 
-  setup_dev_env
-
   if [ "$(uname)" == "Darwin" ]; then
-    # Export the deployment target in this shell for the wheel build below.
-    ensure_metal_toolchain
-    # install.sh builds the native artifacts before the wheel check below.
-    ./install.sh
+    ./install.sh --build
     # shellcheck source=/dev/null
     source .venv-vllm-metal/bin/activate
+  else
+    setup_dev_env
+  fi
+
+  if [ "$(uname)" == "Darwin" ]; then
+    export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
     # Shift-left the release wheel guard. The pytest run below imports the source
-    # tree, which shadows the installed wheel, so a maturin `include` regression
+    # tree, which shadows the installed wheel, so a package-data regression
     # (artifacts silently dropped from the wheel) would pass CI here and only
     # surface when release.sh runs on main. Build the wheel and assert it bundles
     # the prebuilt artifacts now — the same check release.sh runs before publish.

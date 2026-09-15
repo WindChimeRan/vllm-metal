@@ -103,15 +103,10 @@ get_version() {
   uv run python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
 }
 
-# Ensure `xcrun metal` can actually compile a .metallib.
-#
-# Producing a .metallib needs the Metal toolchain. On Xcode 26+ it is a
-# separate downloadable component; older Xcode bundles it. Rather than guess,
-# trial-compile a trivial shader: if that succeeds the toolchain is already
-# present (no slow download), otherwise download MetalToolchain and re-check.
-ensure_metal_toolchain() {
-  section "Ensuring Metal toolchain"
-  # Keep Maturin/Rust aligned with the native extension's macOS 15 floor.
+# Check the compiler needed for prebuilt .metallib artifacts.
+check_metal_toolchain() {
+  section "Checking Metal toolchain"
+  # Keep native artifacts aligned with the wheel's macOS 15 floor.
   export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
   local tmpdir metal_src metal_lib
@@ -120,17 +115,9 @@ ensure_metal_toolchain() {
   metal_lib="${tmpdir}/probe.metallib"
   printf '[[kernel]] void _t() {}\n' > "${metal_src}"
 
-  if xcrun -sdk macosx metal -o "${metal_lib}" "${metal_src}" &> /dev/null; then
-    success "Metal toolchain present"
-    rm -rf "${tmpdir}"
-    return 0
-  fi
-
-  echo "Metal toolchain not available, downloading via xcodebuild..."
-  xcodebuild -downloadComponent MetalToolchain
-
-  if ! xcrun -sdk macosx metal -o "${metal_lib}" "${metal_src}" &> /dev/null; then
-    error "Metal toolchain still unavailable after download; cannot compile .metallib."
+  if ! xcrun -sdk macosx metal -o "${metal_lib}" "${metal_src}"; then
+    error "Cannot compile Metal libraries. Resolve the compiler error above."
+    echo "If the Metal component is missing, install it with: xcodebuild -downloadComponent MetalToolchain" >&2
     rm -rf "${tmpdir}"
     return 1
   fi
@@ -141,7 +128,7 @@ ensure_metal_toolchain() {
 
 # Build the in-package native artifacts (the _paged_ops*.so and the required
 # precompiled .metallib shader libraries, including NAX) into vllm_metal/metal/
-# so `uv build` can bundle them via the maturin `include` directive.
+# so `uv build` can bundle them as package data.
 #
 # `python` here is the venv interpreter activated by setup_dev_env, so mlx and
 # nanobind are importable.
@@ -157,7 +144,7 @@ build_native_artifacts() {
 
 # Fail unless the freshly built wheel actually bundles the prebuilt native
 # artifacts: the _paged_ops*.so extension, three required metallibs, and NAX.
-# maturin's `include` directive is what pulls these (gitignored)
+# setup.py's package data is what pulls these (gitignored)
 # files in; if that ever regresses, the wheel would install fine but fail at
 # first run with "Prebuilt native extension not found". The expected filenames
 # are read from build.py so this guard never drifts from the runtime loader.
@@ -186,7 +173,7 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
       success "bundled: ${name}"
     else
       error "Wheel ${wheel} is missing native artifact: ${name}"
-      error "maturin [tool.maturin] 'include' likely failed to bundle it."
+      error "Check the native package data in setup.py."
       return 1
     fi
   done <<< "$expected"
@@ -200,7 +187,7 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
   while IFS= read -r native_so; do
     native_name=$(basename "${native_so}")
     case "${native_name}" in
-      "${paged_ops_name}"|_rs.*.so) ;;
+      "${paged_ops_name}") ;;
       *) continue ;;
     esac
     native_count=$((native_count + 1))
@@ -213,7 +200,7 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
     success "${native_name}: macOS ${actual_minos}"
   done < <(find "${unpack_dir}" -type f -name '*.so')
   rm -rf "${unpack_dir}"
-  if [ "${native_count}" -lt 2 ]; then
+  if [ "${native_count}" -lt 1 ]; then
     error "Wheel ${wheel} is missing a required native extension."
     return 1
   fi
