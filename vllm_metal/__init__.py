@@ -91,7 +91,7 @@ def _apply_model_runner_default() -> None:
     os.environ.setdefault("VLLM_USE_V2_MODEL_RUNNER", "0")
 
 
-# Lazy imports to avoid loading vLLM dependencies when just importing the Rust extension
+# Lazy imports keep importing the package independent of vLLM.
 def __getattr__(name):
     """Lazy import module components."""
     if name == "MetalConfig":

@@ -5,11 +5,6 @@ The setup below is for editing vllm-metal itself.
 
 ## Development setup
 
-On an Apple Silicon Mac, install [Rust](https://rustup.rs/) and full
-[Xcode](https://developer.apple.com/xcode/) with macOS SDK 26.2 or newer.
-Select Xcode as the active developer directory. Initial source setup builds
-the Rust and Metal components, including for Python-only contributions.
-
 Fork the repository on GitHub, then clone your fork (replace `YOUR_USERNAME`):
 
 ```bash
@@ -17,28 +12,34 @@ git clone https://github.com/YOUR_USERNAME/vllm-metal.git
 cd vllm-metal
 git remote add upstream https://github.com/vllm-project/vllm-metal.git
 git switch -c my-change
-./install.sh
+./install.sh --editable
 source .venv-vllm-metal/bin/activate
-uv pip install -e ".[dev]"
 ```
 
-`./install.sh` creates the local environment, installs the matching vLLM core
-and editable plugin, and builds the native artifacts. It downloads the Metal
-toolchain if needed. Restart the server after editing Python files.
+Python changes take effect after restarting the process. This installs
+editable Python sources and matching prebuilt native binaries without a compiler.
+The native sources and MLX/nanobind versions must match the release wheel;
+otherwise the installer asks you to build from source.
 
 ## Editing the Metal kernels
 
-When changing `.metal` shaders or `paged_ops.cpp`, enable source builds:
+Kernel contributors build the native extension and shaders explicitly:
 
 ```bash
-VLLM_METAL_BUILD_FROM_SOURCE=1 vllm serve <model>
+./install.sh --build
+source .venv-vllm-metal/bin/activate
+export VLLM_METAL_BUILD_FROM_SOURCE=1
 ```
 
-Restart the process after each edit. This mode rebuilds the C++ extension when
-its inputs change and compiles shaders through MLX; no separate `.metallib`
-build is needed. To refresh the prebuilt artifacts instead, run
-`python -m vllm_metal.metal.build`. Stale local artifacts are rejected when
-source mode is disabled.
+`--build` needs Xcode with macOS SDK 26.2 or newer, `clang++`, and the Metal
+compiler component. If the component is missing, install it with
+`xcodebuild -downloadComponent MetalToolchain`. The installer reports compiler
+errors without downloading tools automatically.
+
+In source mode the C++ extension rebuilds when its inputs change and MLX
+compiles changed shaders in-process. Restart after each kernel edit. To refresh
+the prebuilt artifacts instead, run `python -m vllm_metal.metal.build`.
+Stale local artifacts are rejected when source mode is disabled.
 
 ## Checks
 

@@ -148,7 +148,7 @@ Cargo.lock
 *.air
 
 # Prebuilt native extension artifacts (built at packaging time, bundled into
-# the wheel via [tool.maturin] include; never committed). *.so is covered above.
+# the wheel as package data; never committed). *.so is covered above.
 vllm_metal/metal/*.metallib
 vllm_metal/metal/*.sha256
 

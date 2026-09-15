@@ -42,6 +42,9 @@ jobs:
       with:
         submodules: recursive
 
+    - name: Install Metal compiler for wheel validation
+      run: xcodebuild -downloadComponent MetalToolchain
+
     - name: Test
       run: |
         scripts/test.sh

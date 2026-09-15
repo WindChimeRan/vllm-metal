@@ -45,4 +45,4 @@ vllm-metal supports a growing set of models on Apple Silicon. See the full matri
   source ~/.venv-vllm-metal/bin/activate
   ```
 
-- **Contributing Python or kernel code:** Follow the [source setup](docs/CONTRIBUTING.md#development-setup) for an editable checkout and native build tools.
+- **Contributing Python or kernel code:** Follow the [source setup](docs/CONTRIBUTING.md#development-setup). Python changes use prebuilt kernels; kernel changes need Xcode.
