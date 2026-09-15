@@ -197,9 +197,7 @@ EOF
     exit 1
   fi
 
-  if ! ensure_uv; then
-    exit 1
-  fi
+  ensure_uv
 
   local venv="$HOME/.venv-vllm-metal"
   if [[ "$mode" != "wheel" ]]; then
@@ -211,9 +209,7 @@ EOF
     venv="$script_dir/.venv-vllm-metal"
   fi
   ensure_venv "$venv"
-  if ! require_arm64_python python; then
-    exit 1
-  fi
+  require_arm64_python python
 
   local release_data selected release_tag wheel_url vllm_release_tag
   if [[ "$mode" != "build" ]]; then
