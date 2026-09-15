@@ -166,10 +166,10 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
   fi
 
   local contents name
-  contents=$(unzip -l "$wheel")
+  contents=$(unzip -Z1 "$wheel")
   while IFS= read -r name; do
     [ -z "$name" ] && continue
-    if grep -qF "$name" <<< "$contents"; then
+    if grep -qxF "vllm_metal/metal/$name" <<< "$contents"; then
       success "bundled: ${name}"
     else
       error "Wheel ${wheel} is missing native artifact: ${name}"
@@ -178,32 +178,21 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
     fi
   done <<< "$expected"
 
-  local expected_minos paged_ops_name unpack_dir native_so native_name actual_minos native_count
+  local expected_minos paged_ops_name native_so actual_minos
   expected_minos=$(python -c "from vllm_metal.metal.build import MIN_MACOS_VERSION; print(MIN_MACOS_VERSION)")
   paged_ops_name=$(python -c "from vllm_metal.metal.build import output_path; print(output_path().name)")
-  unpack_dir=$(mktemp -d)
-  unzip -qq "${wheel}" '*.so' -d "${unpack_dir}"
-  native_count=0
-  while IFS= read -r native_so; do
-    native_name=$(basename "${native_so}")
-    case "${native_name}" in
-      "${paged_ops_name}") ;;
-      *) continue ;;
-    esac
-    native_count=$((native_count + 1))
-    actual_minos=$(otool -l "${native_so}" | awk '$1 == "minos" { print $2; exit }')
-    if [ "${actual_minos}" != "${expected_minos}" ]; then
-      error "${native_so} targets macOS ${actual_minos:-unknown}; expected ${expected_minos}."
-      rm -rf "${unpack_dir}"
-      return 1
-    fi
-    success "${native_name}: macOS ${actual_minos}"
-  done < <(find "${unpack_dir}" -type f -name '*.so')
-  rm -rf "${unpack_dir}"
-  if [ "${native_count}" -lt 1 ]; then
-    error "Wheel ${wheel} is missing a required native extension."
+  native_so=$(mktemp)
+  if ! unzip -p "$wheel" "vllm_metal/metal/$paged_ops_name" > "$native_so"; then
+    rm -f "$native_so"
     return 1
   fi
+  actual_minos=$(otool -l "$native_so" | awk '$1 == "minos" { print $2; exit }') || actual_minos=""
+  rm -f "$native_so"
+  if [ "$actual_minos" != "$expected_minos" ]; then
+    error "$paged_ops_name targets macOS ${actual_minos:-unknown}; expected ${expected_minos}."
+    return 1
+  fi
+  success "$paged_ops_name: macOS $actual_minos"
 
   success "Wheel bundles all native artifacts"
 }
