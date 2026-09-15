@@ -182,7 +182,7 @@ class RequestState:
     mrope_position_delta: int | None = None
     # Scheduler-reconciled prefix-cache-hit boundary (the same value used to
     # resume the target's own paged prefill, see `_add_new_requests`).
-    # DraftModelProposer reuses this as the committed-KV group's ingest
+    # DraftModelProposer reuses this as the draft cache's ingest
     # boundary instead of self-tracking it, so a cache hit shared across
     # requests skips re-ingest for the draft's KV too (#482).
     num_computed_tokens: int = 0
@@ -972,7 +972,7 @@ class MetalModelRunner:
 
             if self._eagle3_model is None:
                 raise RuntimeError("EAGLE3 head was not loaded before cache allocation")
-            self._drafter = Eagle3Proposer.build(
+            self._drafter = Eagle3Proposer(
                 model=self._eagle3_model,
                 controller=self._spec_decode_controller,
                 num_blocks=num_blocks,

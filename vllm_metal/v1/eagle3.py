@@ -51,8 +51,8 @@ class Eagle3Config:
             or config.get("eagle_config", {}).get("eagle_aux_hidden_state_layer_ids")
             or (2, num_layers // 2, num_layers - 3)
         )
-        if len(ids) != 3 or not all(0 <= i <= num_layers for i in ids):
-            raise ValueError(f"Invalid EAGLE3 target hidden-state indices: {ids}")
+        if len(ids) != 3:
+            raise ValueError("EAGLE3 requires three target hidden-state indices")
         target_hidden = int(config.get("target_hidden_size") or layer.hidden_size)
         if (target_hidden, layer.vocab_size) != (
             target["hidden_size"],
@@ -214,7 +214,4 @@ class Eagle3Model(nn.Module):
         }
         model.load_weights(list(weights.items()), strict=True)
         mx.eval(model.parameters())
-        mapped = mx.arange(config.draft_vocab_size) + model.d2t
-        if int(mx.min(mapped)) < 0 or int(mx.max(mapped)) >= config.layer.vocab_size:
-            raise ValueError("EAGLE3 d2t contains target IDs outside the vocabulary")
         return model

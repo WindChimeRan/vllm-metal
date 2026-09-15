@@ -12,10 +12,10 @@ import pytest
 
 from vllm_metal.attention.context import get_context
 from vllm_metal.v1.draft_model_proposer import (
-    _DECODE_INGEST_MAX_TOKENS,
     DraftModelProposer,
     _DraftPlan,
 )
+from vllm_metal.v1.proposer import _DECODE_INGEST_MAX_TOKENS
 
 BLOCK_SIZE = 16
 VOCAB = 32

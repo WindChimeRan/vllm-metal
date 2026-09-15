@@ -22,17 +22,13 @@ _Output = TypeVar("_Output")
 
 
 def _tensor_output(output: mx.array) -> mx.array:
-    if not isinstance(output, mx.array):
-        raise TypeError("Decoder hidden-state capture expects an MLX array")
     return output
 
 
 def _gemma_output(output: tuple[mx.array, Any, Any]) -> mx.array:
     # Gemma4's decoder returns (completed hidden state, shared KV, offset).
-    if not isinstance(output, tuple) or len(output) != 3:
-        raise TypeError("Gemma4 decoder capture expects (hidden, shared_kv, offset)")
     hidden, _, _ = output
-    return _tensor_output(hidden)
+    return hidden
 
 
 class _CaptureLayer(nn.Module):
@@ -90,14 +86,10 @@ class AuxHiddenStateCapture:
         # This entire entry point may be compiled: the returned auxiliary
         # arrays then belong to the compiled outputs and remain fresh on replay.
         captured: dict[int, mx.array] = {}
-        seen: set[int] = set()
         originals = {i: self._layers[i] for i in self._extractors}
 
         def observer(index: int, extract: Callable) -> Callable:
             def observe(x: mx.array, output: Any) -> None:
-                if index in seen:
-                    raise RuntimeError("Native forward executed a captured layer twice")
-                seen.add(index)
                 if index == 0 and 0 in self.layer_ids:
                     captured[0] = x
                 if index + 1 in self.layer_ids:

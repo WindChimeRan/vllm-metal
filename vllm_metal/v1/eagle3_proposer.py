@@ -10,7 +10,7 @@ rows are ingested again with actual target features, replacing recurrence state.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
 from vllm.v1.outputs import DraftTokenIds
@@ -18,12 +18,15 @@ from vllm.v1.outputs import DraftTokenIds
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.attention.context import clear_context, prepare_unified
 from vllm_metal.attention.impls.sdpa_wrapper import patch_sdpa_attention
-from vllm_metal.v1.draft_model_proposer import (
-    _DECODE_INGEST_MAX_TOKENS,
-    DraftModelProposer,
-)
 from vllm_metal.v1.eagle3 import Eagle3Model
-from vllm_metal.v1.proposer import ProposeContext
+from vllm_metal.v1.proposer import (
+    _DECODE_INGEST_MAX_TOKENS,
+    ProposeContext,
+    validate_scheduler_blocks,
+)
+
+if TYPE_CHECKING:
+    from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 
 @dataclass
@@ -40,32 +43,26 @@ class _EaglePlan:
         return self.start + len(self.tokens)
 
 
-class Eagle3Proposer(DraftModelProposer):
-    """Reuse draft block ownership, with EAGLE-specific feature reconciliation."""
+class Eagle3Proposer:
+    """Linear EAGLE3 drafting with scheduler-owned KV and no per-request state."""
 
-    _kv: MetalPagedKVCache
-
-    @classmethod
-    def build(
-        cls,
+    def __init__(
+        self,
         *,
         model: Eagle3Model,
-        controller: Any,
+        controller: SpeculativeDecodeController,
         num_blocks: int,
         max_model_len: int,
         block_size: int,
         dtype: mx.Dtype,
-    ) -> Eagle3Proposer:
-        proposer = cls(
-            model=model,
-            controller=controller,
-            max_model_len=max_model_len,
-            block_size=block_size,
-            num_layers=1,
-            extract_logits=lambda output: output[0],
-        )
+    ) -> None:
+        self._model = model
+        self._controller = controller
+        self._max_model_len = max_model_len
+        self._block_size = block_size
+        self._scheduler_group_index: int | None = None
         attention = model.layers[0].self_attn
-        proposer._kv = MetalPagedKVCache(
+        self._kv = MetalPagedKVCache(
             num_layers=1,
             num_kv_heads=attention.n_kv_heads,
             head_dim=attention.head_dim,
@@ -73,8 +70,17 @@ class Eagle3Proposer(DraftModelProposer):
             block_size=block_size,
             dtype=dtype,
         )
-        patch_sdpa_attention(model, proposer._kv, block_size)
-        return proposer
+        patch_sdpa_attention(model, self._kv, block_size)
+
+    def adopt_scheduler_group(
+        self, group_index: int, target_max_model_len: int
+    ) -> None:
+        self._scheduler_group_index = group_index
+        self._max_model_len = min(self._max_model_len, target_max_model_len)
+
+    def release_requests(self, req_ids: set[str]) -> None:
+        # The scheduler owns the cache; this proposer has no per-request state.
+        del req_ids
 
     def needs_target_hidden_states(
         self, decode_segments: Any, *, has_final_prefill: bool
@@ -106,16 +112,17 @@ class Eagle3Proposer(DraftModelProposer):
         if count <= 0:
             return None
         tokens, features = tokens[:count], features[:count]
-        owned = self._ensure_blocks(
+        validate_scheduler_blocks(
             req_id,
-            committed_group_block_ids=blocks,
+            blocks,
+            self._block_size,
             total_positions=start + len(tokens) + (max(k - 1, 0) if is_drafting else 0),
         )
-        return _EaglePlan(req_id, owned, start, tokens, features, is_drafting)
+        return _EaglePlan(req_id, blocks, start, tokens, features, is_drafting)
 
     def _plans(self, ctx: ProposeContext, fused: mx.array) -> list[_EaglePlan]:
-        assert self._committed_group_index is not None
-        group = self._committed_group_index
+        assert self._scheduler_group_index is not None
+        group = self._scheduler_group_index
         plans: list[_EaglePlan | None] = []
         for (req_id, state), segment, output in zip(
             ctx.decode_reqs, ctx.decode_segments, ctx.decode_token_ids, strict=True
@@ -195,8 +202,6 @@ class Eagle3Proposer(DraftModelProposer):
         return normalized[0, indices], recurrent[0, indices]
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
-        self.release_requests(ctx.finished_req_ids)
-        self._prune_finished(ctx.request_states)
         assert ctx.target_aux_hidden_states
         fused = self._model.combine_hidden_states(
             mx.concatenate(ctx.target_aux_hidden_states, axis=-1)

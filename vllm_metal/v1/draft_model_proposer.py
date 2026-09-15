@@ -14,17 +14,17 @@ prefix-cache reuse.
 
 **Why every active row ingests, not just drafting-eligible ones.** The
 scheduler advances a request's ``num_computed_tokens`` and marks the
-committed group's blocks "cached" based on its own per-step bookkeeping,
+draft cache's blocks "cached" based on its own per-step bookkeeping,
 trusting that whatever it scheduled, the worker actually computed -- for
 *every* registered group, uniformly, every step. But
 ``SpeculativeDecodeController.draft_eligible_requests`` intentionally
 excludes non-greedy requests and intermediate prefill chunks from
 *drafting*. If those rows also skipped *ingest*, the scheduler would believe
-their committed-group blocks hold real KV when they never did, and a later,
+their draft cache blocks hold real KV when they never did, and a later,
 unrelated request whose prompt happens to hash-match that prefix could be
 handed those blocks as a "cache hit" -- silent data corruption, not just a
 missed optimization. So ``propose()`` ingests every decode and prefill row
-(chunked or not, greedy or not) to keep the committed group's physical KV
+(chunked or not, greedy or not) to keep the draft cache's physical KV
 in sync with the scheduler within the draft model's context limit, and only
 *drafts* (produces returned token ids and runs extra lookahead steps) for the
 eligible subset. Ingest stops at the draft model's context limit; cached
@@ -43,7 +43,7 @@ keep their identities), that KV is exactly what the ingest would recompute
 -- so the ingest skips it (``_speculative_kv_valid_through``), shrinking the
 steady-state K+1-token ingest to 2 rows on full acceptance. A position is
 skipped only when its committed token equals the recorded drafted token AND
-the scheduler's committed-group block table still maps the position to the
+the scheduler's block table still maps the position to the
 same physical block the speculative write landed in. The last committed
 token is always re-ingested: its logits predict this round's first draft token.
 """
@@ -56,7 +56,6 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 from mlx_lm import load as mlx_lm_load
 from vllm.logger import init_logger
-from vllm.utils.math_utils import cdiv
 from vllm.v1.outputs import DraftTokenIds
 
 from vllm_metal import envs
@@ -69,6 +68,10 @@ from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.metal.constants import PA_WINDOW_MAX_HEAD_SIZE
 from vllm_metal.utils import get_model_download_path
 from vllm_metal.v1.mlx_lm_paths import mlx_lm_compatible_model_path
+from vllm_metal.v1.proposer import (
+    _DECODE_INGEST_MAX_TOKENS,
+    validate_scheduler_blocks,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -104,13 +107,6 @@ class _DraftPlan:
     draft_seq_len: int
     ingest_tokens: list[int]
     is_drafting: bool
-
-
-# Ingests at or below this size are submitted as expanded decode rows instead
-# of a prefill segment (see _ingest_and_draft_first). Covers the steady-state
-# K+1-token ingest for any practical num_speculative_tokens while keeping
-# full-prompt catch-up ingests on the tiled prefill kernel.
-_DECODE_INGEST_MAX_TOKENS = 16
 
 
 class DraftModelProposer:
@@ -159,12 +155,12 @@ class DraftModelProposer:
         # and block table before use, so staleness can only cost performance,
         # never correctness.
         self._spec_kv_writes: dict[str, dict[int, tuple[int, int]]] = {}
-        # Scheduler-owned KV-cache group index for the committed portion.
+        # Scheduler-owned KV-cache group for committed tokens and lookahead.
         # Unknown at construction time -- the physical backend below is
         # built before the scheduler has decided kv_cache_config (see
         # ModelCachePolicy._adopt_draft_scheduler_group) -- so this is set
-        # later via adopt_committed_group().
-        self._committed_group_index: int | None = None
+        # later via adopt_scheduler_group().
+        self._scheduler_group_index: int | None = None
 
     # -- construction --------------------------------------------------------
 
@@ -218,17 +214,17 @@ class DraftModelProposer:
             merge_ingest_windows=dims.head_dim <= PA_WINDOW_MAX_HEAD_SIZE,
         )
 
-    def adopt_committed_group(
+    def adopt_scheduler_group(
         self, group_index: int, target_max_model_len: int
     ) -> None:
-        """Record which scheduler KV-cache group owns the committed portion.
+        """Adopt the scheduler cache group and final target context limit.
 
         Called from ``ModelCachePolicy._adopt_draft_scheduler_group`` once
         ``kv_cache_config`` exists -- after this proposer is built, since the
         physical backend above is sized before the scheduler has decided
         groups.
         """
-        self._committed_group_index = group_index
+        self._scheduler_group_index = group_index
         # The engine may auto-fit the target limit after memory profiling.
         self._max_model_len = min(self._max_model_len, target_max_model_len)
 
@@ -246,10 +242,10 @@ class DraftModelProposer:
 
     def propose(self, ctx: ProposeContext) -> DraftTokenIds | None:
         num_speculative_tokens = ctx.num_speculative_tokens
-        if self._committed_group_index is None:
+        if self._scheduler_group_index is None:
             raise RuntimeError(
                 "DraftModelProposer.propose() called before "
-                "adopt_committed_group() -- initialize_kv_cache() must run "
+                "adopt_scheduler_group() -- initialize_kv_cache() must run "
                 "before the first speculative decode step"
             )
 
@@ -262,7 +258,7 @@ class DraftModelProposer:
         # token per row, used below only for drafting rows.
         first_tokens = self._ingest_and_draft_first(plans, self._offset_caches)
 
-        # The committed group now holds KV through committed_len for every
+        # The draft cache now holds KV through committed_len for every
         # row that ingested this step, drafting or not.
         for plan in plans:
             self._draft_seq_lens[plan.req_id] = plan.committed_len
@@ -404,8 +400,8 @@ class DraftModelProposer:
             # accepted decode step); skip rather than emit an empty forward.
             return None
         is_drafting = req_id in drafting_req_ids
-        assert self._committed_group_index is not None
-        committed_group_block_ids = state.block_ids[self._committed_group_index]
+        assert self._scheduler_group_index is not None
+        scheduler_block_ids = state.block_ids[self._scheduler_group_index]
         # Skip the leading accepted drafts whose KV the previous round's
         # lookahead steps already wrote (#482 direction 2); the walk stops at
         # the first position whose recorded token or block no longer matches
@@ -416,21 +412,22 @@ class DraftModelProposer:
             self._speculative_kv_valid_through(
                 req_id,
                 state.token_ids,
-                committed_group_block_ids,
+                scheduler_block_ids,
                 draft_seq_len,
                 committed_len,
             ),
             committed_len - 1,
         )
-        block_ids = self._ensure_blocks(
+        validate_scheduler_blocks(
             req_id,
-            committed_group_block_ids=committed_group_block_ids,
+            scheduler_block_ids,
+            self._block_size,
             total_positions=committed_len
             + (max(num_speculative_tokens - 1, 0) if is_drafting else 0),
         )
         return _DraftPlan(
             req_id=req_id,
-            block_ids=block_ids,
+            block_ids=scheduler_block_ids,
             committed_len=committed_len,
             draft_seq_len=draft_seq_len,
             ingest_tokens=list(state.token_ids[draft_seq_len:committed_len]),
@@ -452,12 +449,14 @@ class DraftModelProposer:
         req_id = prefill.req_id
         committed_len = prefill.start_pos + len(ingest_tokens)
         is_drafting = result_mode != "intermediate" and req_id in drafting_req_ids
-        assert self._committed_group_index is not None
+        assert self._scheduler_group_index is not None
         # The ingest includes the target's sampled token. Producing K drafts
         # then feeds only K-1 more tokens through the draft model.
-        block_ids = self._ensure_blocks(
+        block_ids = prefill.block_ids[self._scheduler_group_index]
+        validate_scheduler_blocks(
             req_id,
-            committed_group_block_ids=prefill.block_ids[self._committed_group_index],
+            block_ids,
+            self._block_size,
             total_positions=committed_len
             + (max(num_speculative_tokens - 1, 0) if is_drafting else 0),
         )
@@ -471,28 +470,11 @@ class DraftModelProposer:
         )
         return plan
 
-    def _ensure_blocks(
-        self,
-        req_id: str,
-        *,
-        committed_group_block_ids: list[int],
-        total_positions: int,
-    ) -> list[int]:
-        """Use the scheduler's allocation for both committed KV and lookahead."""
-        needed_total = cdiv(total_positions, self._block_size)
-        if needed_total > len(committed_group_block_ids):
-            raise RuntimeError(
-                f"Draft KV allocation for request {req_id!r} needs "
-                f"{needed_total} blocks for {total_positions} positions, but the "
-                f"scheduler supplied {len(committed_group_block_ids)}."
-            )
-        return committed_group_block_ids
-
     def _speculative_kv_valid_through(
         self,
         req_id: str,
         token_ids: list[int],
-        committed_group_block_ids: list[int],
+        scheduler_block_ids: list[int],
         draft_seq_len: int,
         committed_len: int,
     ) -> int:
@@ -519,8 +501,8 @@ class DraftModelProposer:
             block_id, drafted_token = write
             block_index = position // self._block_size
             if (
-                block_index >= len(committed_group_block_ids)
-                or committed_group_block_ids[block_index] != block_id
+                block_index >= len(scheduler_block_ids)
+                or scheduler_block_ids[block_index] != block_id
                 or token_ids[position] != drafted_token
             ):
                 break

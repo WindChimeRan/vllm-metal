@@ -150,7 +150,7 @@ def test_head_matches_pytorch_gqa_mha_reference(kv_heads, norm_before_residual):
 
 
 def _proposer(model, *, max_model_len=4096):
-    proposer = Eagle3Proposer.build(
+    proposer = Eagle3Proposer(
         model=model,
         controller=SpeculativeDecodeController(),
         num_blocks=16,
@@ -158,7 +158,7 @@ def _proposer(model, *, max_model_len=4096):
         block_size=16,
         dtype=mx.float32,
     )
-    proposer.adopt_committed_group(0, max_model_len)
+    proposer.adopt_scheduler_group(0, max_model_len)
     return proposer
 
 

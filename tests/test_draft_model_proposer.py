@@ -3,7 +3,7 @@
 
 A stub draft model returns logits of the right shape, so ingest, drafting,
 and the release path run through ``propose`` without loading any weights.
-The committed portion of the block table is scheduler-assigned (as it would
+The block table is scheduler-assigned (as it would
 be by a real KVCacheManager for the draft's registered KV-cache group, see
 ``cache_policy.ModelCachePolicy._draft_layer_specs``); these tests simulate
 that assignment directly on ``RequestState.block_ids`` rather than driving a
@@ -27,7 +27,7 @@ from vllm_metal.v1.proposer import ProposeContext
 from vllm_metal.v1.spec_decode import SpeculativeDecodeController
 
 BLOCK_SIZE = 16
-COMMITTED_GROUP_INDEX = 0
+SCHEDULER_GROUP_INDEX = 0
 VOCAB_SIZE = 64
 PROMPT_LEN = 20
 
@@ -106,13 +106,13 @@ def _proposer(
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,
     )
-    proposer.adopt_committed_group(COMMITTED_GROUP_INDEX, max_model_len)
+    proposer.adopt_scheduler_group(SCHEDULER_GROUP_INDEX, max_model_len)
     return proposer
 
 
 def _request_state(
     *,
-    committed_block_ids: list[int],
+    scheduler_block_ids: list[int],
     num_computed_tokens: int = 0,
     sampling_params: SamplingParams | None = None,
     token_ids: list[int] | None = None,
@@ -123,7 +123,7 @@ def _request_state(
         token_ids=list(token_ids),
         prompt_len=len(token_ids),
         sampling_params=sampling_params or SamplingParams(temperature=0.0),
-        block_ids=[list(committed_block_ids)],
+        block_ids=[list(scheduler_block_ids)],
         num_computed_tokens=num_computed_tokens,
     )
 
@@ -181,7 +181,7 @@ def _prefills_context(
         prefill_token_ids=[42] * len(prefill_reqs),
         prefill_result_modes=["final"] * len(prefill_reqs),
         request_states={
-            req_id: _request_state(committed_block_ids=[], token_ids=[*token_ids, 42])
+            req_id: _request_state(scheduler_block_ids=[], token_ids=[*token_ids, 42])
             for req_id, token_ids in prefills
         },
         cu_seqlens=[],
@@ -191,7 +191,7 @@ def _prefills_context(
     )
 
 
-def test_propose_before_adopt_committed_group_raises() -> None:
+def test_propose_before_adopt_scheduler_group_raises() -> None:
     model = _StubDraftModel()
     proposer = DraftModelProposer(
         model=model,
@@ -201,17 +201,17 @@ def test_propose_before_adopt_committed_group_raises() -> None:
         controller=SpeculativeDecodeController(),
         extract_logits=lambda output: output,
     )
-    state = _request_state(committed_block_ids=[0, 1])
-    with pytest.raises(RuntimeError, match="adopt_committed_group"):
+    state = _request_state(scheduler_block_ids=[0, 1])
+    with pytest.raises(RuntimeError, match="adopt_scheduler_group"):
         proposer.propose(_context("r1", state, {"r1": state}))
 
 
-def test_committed_blocks_come_from_scheduler_assignment() -> None:
-    """The committed portion of the block table is exactly what the
+def test_blocks_come_from_scheduler_assignment() -> None:
+    """The block table is exactly what the
     scheduler assigned on RequestState.block_ids, not a proposer-owned pool."""
     model = _StubDraftModel()
     proposer = _proposer(model)
-    state = _request_state(committed_block_ids=[1, 0])  # order matters
+    state = _request_state(scheduler_block_ids=[1, 0])  # order matters
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
 
     assert drafts is not None
@@ -225,7 +225,7 @@ def test_lookahead_uses_only_scheduler_blocks_at_exact_boundary(k) -> None:
     proposer = _proposer(model)
     # The sampled token is already in state.token_ids; K=3 writes through
     # position 31, so a third block would exceed the scheduler's reservation.
-    state = _request_state(committed_block_ids=[7, 2], token_ids=list(range(30)))
+    state = _request_state(scheduler_block_ids=[7, 2], token_ids=list(range(30)))
     drafts = proposer.propose(
         _context("r1", state, {"r1": state}, num_speculative_tokens=k)
     )
@@ -236,7 +236,7 @@ def test_lookahead_uses_only_scheduler_blocks_at_exact_boundary(k) -> None:
 def test_missing_scheduler_lookahead_fails_before_forward() -> None:
     model = _StubDraftModel()
     proposer = _proposer(model)
-    state = _request_state(committed_block_ids=[7], token_ids=list(range(16)))
+    state = _request_state(scheduler_block_ids=[7], token_ids=list(range(16)))
     with pytest.raises(RuntimeError, match="scheduler supplied 1"):
         proposer.propose(_context("r1", state, {"r1": state}, num_speculative_tokens=3))
     assert not model.block_tables
@@ -257,7 +257,7 @@ def test_context_limit_suppresses_drafts_but_ingests_valid_prefix(
         )
     else:
         state = _request_state(
-            committed_block_ids=[7, 2, 9], token_ids=list(range(target_end + 1))
+            scheduler_block_ids=[7, 2, 9], token_ids=list(range(target_end + 1))
         )
         ctx = _context("r1", state, {"r1": state}, num_speculative_tokens=3)
     drafts = proposer.propose(ctx)
@@ -275,7 +275,7 @@ def test_cache_hit_seeds_draft_seq_len_from_scheduler_boundary() -> None:
     model = _StubDraftModel()
     proposer = _proposer(model)
     state = _request_state(
-        committed_block_ids=[0, 1], num_computed_tokens=PROMPT_LEN - 1
+        scheduler_block_ids=[0, 1], num_computed_tokens=PROMPT_LEN - 1
     )
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
 
@@ -286,7 +286,7 @@ def test_cache_hit_seeds_draft_seq_len_from_scheduler_boundary() -> None:
 def test_no_cache_hit_ingests_the_whole_committed_range() -> None:
     model = _StubDraftModel()
     proposer = _proposer(model)
-    state = _request_state(committed_block_ids=[0, 1], num_computed_tokens=0)
+    state = _request_state(scheduler_block_ids=[0, 1], num_computed_tokens=0)
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
 
     assert drafts is not None
@@ -294,13 +294,13 @@ def test_no_cache_hit_ingests_the_whole_committed_range() -> None:
 
 
 def test_non_greedy_request_ingests_but_never_drafts() -> None:
-    """Non-greedy requests must still keep the committed group's KV in sync
+    """Non-greedy requests must still keep the draft cache's committed KV in sync
     (the scheduler advances num_computed_tokens for them regardless), but
     must never receive draft tokens."""
     model = _StubDraftModel()
     proposer = _proposer(model)
     state = _request_state(
-        committed_block_ids=[0, 1], sampling_params=SamplingParams(temperature=1.0)
+        scheduler_block_ids=[0, 1], sampling_params=SamplingParams(temperature=1.0)
     )
     drafts = proposer.propose(_context("r1", state, {"r1": state}))
 
@@ -310,7 +310,7 @@ def test_non_greedy_request_ingests_but_never_drafts() -> None:
 
 def test_intermediate_prefill_chunk_ingests_without_drafting() -> None:
     """An intermediate (not-yet-final) prefill chunk must ingest its
-    scheduled slice so the committed group's KV stays in sync, but must not
+    scheduled slice so the draft cache's committed KV stays in sync, but must not
     produce draft tokens (mirrors non-greedy: keep pace, never draft)."""
     model = _StubDraftModel()
     proposer = _proposer(model)
@@ -324,7 +324,7 @@ def test_intermediate_prefill_chunk_ingests_without_drafting() -> None:
         start_pos=0,
         full_prompt_token_ids=None,
     )
-    state = _request_state(committed_block_ids=[0])
+    state = _request_state(scheduler_block_ids=[0])
     ctx = ProposeContext(
         target_hidden_states=None,
         decode_reqs=[],
@@ -370,7 +370,7 @@ def _draft_two_rounds(
     if first_round_blocks is None:
         first_round_blocks = [0, 1]
     state1 = _request_state(
-        committed_block_ids=first_round_blocks,
+        scheduler_block_ids=first_round_blocks,
         token_ids=list(range(first_round_len)),
     )
     assert (
@@ -386,7 +386,7 @@ def _draft_two_rounds(
     )
     round2_ingest_index = len(model.input_lens)
     state2 = _request_state(
-        committed_block_ids=second_round_blocks,
+        scheduler_block_ids=second_round_blocks,
         token_ids=list(range(first_round_len)) + second_round_tokens,
     )
     assert (
@@ -493,7 +493,7 @@ def test_spec_kv_ledger_cleared_on_release() -> None:
     model = _StubDraftModel()
     proposer = _proposer(model)
 
-    state1 = _request_state(committed_block_ids=[0, 1])
+    state1 = _request_state(scheduler_block_ids=[0, 1])
     assert (
         proposer.propose(
             _context("r1", state1, {"r1": state1}, num_speculative_tokens=3)
@@ -503,7 +503,7 @@ def test_spec_kv_ledger_cleared_on_release() -> None:
     proposer.release_requests({"r1"})
 
     state2 = _request_state(
-        committed_block_ids=[0, 1],
+        scheduler_block_ids=[0, 1],
         num_computed_tokens=PROMPT_LEN,
         token_ids=list(range(PROMPT_LEN)) + [0, 0, 0, 5],
     )
@@ -696,7 +696,7 @@ def test_scheduler_adoption_uses_target_limit_after_auto_fit() -> None:
         kv_cache_groups=[SimpleNamespace(layer_names=["draft_layers.0.self_attn"])]
     )
     ModelCachePolicy(runner, Mock())._adopt_draft_scheduler_group(config)
-    state = _request_state(token_ids=list(range(31)), committed_block_ids=[0, 1])
+    state = _request_state(token_ids=list(range(31)), scheduler_block_ids=[0, 1])
     # The checkpoint's original limit would allow drafting into a third block.
     # The engine's final limit suppresses lookahead while retaining valid ingest.
     assert (

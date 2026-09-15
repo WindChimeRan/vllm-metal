@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 import mlx.core as mx
 import torch
@@ -46,6 +46,8 @@ from vllm_metal.v1.gemma4_mtp import Gemma4MTPTargetMetadata
 from vllm_metal.v1.model_adapter import ModelAdapter
 
 if TYPE_CHECKING:
+    from vllm_metal.v1.draft_model_proposer import DraftModelProposer
+    from vllm_metal.v1.eagle3_proposer import Eagle3Proposer
     from vllm_metal.v1.model_runner import MetalModelRunner
     from vllm_metal.v1.worker import MetalWorker
 
@@ -465,7 +467,7 @@ class ModelCachePolicy:
     def _draft_layer_specs(
         self, *, block_size: int, torch_dtype: torch.dtype
     ) -> dict[str, KVCacheSpec]:
-        """Scheduler-visible spec for the draft model's committed-KV group.
+        """Scheduler-visible spec for the draft model's KV-cache group.
 
         Draft models must be plain transformers (no sliding window / MLA /
         hybrid) -- enforced at startup by ``resolve_draft_dims`` -- so a
@@ -730,7 +732,7 @@ class ModelCachePolicy:
         self._runner.install_paged_attention_runtime(runtime, block_size=block_size)
 
     def _adopt_draft_scheduler_group(self, kv_cache_config: KVCacheConfig) -> None:
-        """Tell the drafter which scheduler KV group owns its committed KV.
+        """Pass the scheduler cache group and final context limit to the drafter.
 
         The draft model's own physical backend is already built by this
         point (``install_drafter``, called from ``determine_available_memory``
@@ -758,15 +760,9 @@ class ModelCachePolicy:
                 "to share one scheduler KV cache group"
             )
 
-        from vllm_metal.v1.draft_model_proposer import DraftModelProposer
-
-        drafter = self._runner._drafter
-        if not isinstance(drafter, DraftModelProposer):
-            raise RuntimeError(
-                "draft KV-cache spec registered but no DraftModelProposer is "
-                f"installed (got {type(drafter).__name__})"
-            )
-        drafter.adopt_committed_group(
+        # Only these two proposers register draft-model KV specs.
+        drafter = cast("DraftModelProposer | Eagle3Proposer", self._runner._drafter)
+        drafter.adopt_scheduler_group(
             group_indices[0], self._runner.model_config.max_model_len
         )
 
