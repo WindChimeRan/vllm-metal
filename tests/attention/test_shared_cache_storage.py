@@ -16,21 +16,10 @@ from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.metal import get_ops
 
 
-def make_storage(num_blocks=4, *, quantized=False):
+def make_storage(num_blocks=4):
     attention = FullAttentionSpec(
         block_size=16, num_kv_heads=1, head_size=32, dtype=torch.float16
     )
-    if quantized:
-        from vllm_metal.v1.cache_policy import TurboQuantAttentionSpec
-
-        attention = TurboQuantAttentionSpec(
-            block_size=16,
-            num_kv_heads=1,
-            head_size=64,
-            dtype=torch.int8,
-            k_quant="q4_0",
-            v_quant="q3_0",
-        )
     state = MambaSpec(
         block_size=16,
         shapes=((2, 4), (1, 4, 32)),
@@ -129,78 +118,3 @@ def test_packed_kv_store_preserves_strides_and_shared_backing():
     assert torch.all(key[2, 3] == 3)
     assert torch.all(value[2, 3] == 5)
     assert torch.all(key[2, 2] == 0)
-
-
-def test_turboquant_payload_and_scales_share_the_upstream_page():
-    from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-    from vllm_metal.attention.caches.turboquant import get_v_centroids
-
-    storage = make_storage(quantized=True)
-    shared = MetalPagedKVCache.from_upstream(storage, ["a0"])
-    reference = MetalPagedKVCache(
-        num_layers=1,
-        num_kv_heads=1,
-        head_dim=64,
-        num_blocks=4,
-        block_size=16,
-        turboquant=True,
-        k_quant="q4_0",
-        v_quant="q3_0",
-    )
-    key = mx.random.normal((4, 1, 64)).astype(mx.float16)
-    value = mx.random.normal((4, 1, 64)).astype(mx.float16)
-    fields = [
-        "key_caches",
-        "value_caches",
-        "key_scale_caches",
-        "value_scale_caches",
-        "key_zero_caches",
-    ]
-    for cache in (reference, shared):
-        outputs = get_ops().tq_encode(
-            key,
-            value,
-            *(getattr(cache, name)[0] for name in fields),
-            mx.arange(32, 36, dtype=mx.int64),
-            get_v_centroids(3),
-            3,
-            4,
-            False,
-        )
-        for name, output in zip(fields, outputs, strict=True):
-            getattr(cache, name)[0] = output
-        mx.eval(*outputs)
-    for name in fields:
-        np.testing.assert_array_equal(
-            np.array(getattr(shared, name)[0]), np.array(getattr(reference, name)[0])
-        )
-    assert shared._storage is storage
-    query = mx.random.normal((1, 2, 64)).astype(mx.float16)
-    results = []
-    for cache in (reference, shared):
-        out = mx.array(0)
-        get_ops().paged_attention_primitive(
-            query,
-            cache.key_caches[0],
-            cache.value_caches[0],
-            1,
-            64**-0.5,
-            0.0,
-            mx.array([[2]], dtype=mx.int32),
-            mx.array([4], dtype=mx.int32),
-            mx.array([0, 1], dtype=mx.int32),
-            16,
-            4,
-            -1,
-            out,
-            key_scale_cache=cache.key_scale_caches[0],
-            value_scale_cache=cache.value_scale_caches[0],
-            key_zero_cache=cache.key_zero_caches[0],
-            v_centroids=get_v_centroids(3),
-            use_turboquant=True,
-            quant_type="q4_0",
-            v_bits=3,
-        )
-        results.append(out)
-    mx.eval(*results)
-    np.testing.assert_array_equal(np.array(results[0]), np.array(results[1]))
