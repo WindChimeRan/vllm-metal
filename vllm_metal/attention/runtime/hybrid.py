@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Paged SDPA and state-family execution for hybrid models.
 
-The family plan supplies layer roles, state geometry, allocation and wrappers.
-The runtime pairs its state cache with paged KV and the none/align lifecycle.
+The family plan supplies layer roles and wrappers. vLLM supplies the shared
+physical allocation and scheduler-owned block IDs for both state and KV.
 """
 
 from __future__ import annotations
@@ -15,7 +15,8 @@ import mlx.nn as nn
 from vllm.logger import init_logger
 
 from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
-from vllm_metal.attention.caches.protocol import PagedStateCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
+from vllm_metal.attention.caches.storage import KVCacheStorage
 from vllm_metal.attention.context import PagedAttentionContext
 from vllm_metal.attention.impls.sdpa import is_sdpa
 from vllm_metal.attention.impls.sdpa_wrapper import (
@@ -24,8 +25,7 @@ from vllm_metal.attention.impls.sdpa_wrapper import (
 from vllm_metal.attention.patching import DEFAULT_ATTN_ATTR_NAMES, walk_and_wrap
 from vllm_metal.attention.runtime.base import PagedAttentionRuntimeBase
 from vllm_metal.attention.runtime.hybrid_plan import HybridRuntimePlan
-from vllm_metal.attention.state import AlignStateManager, RequestStateManager
-from vllm_metal.pytorch_backend.tensor_bridge import TORCH_TO_MLX_DTYPE
+from vllm_metal.attention.state import AlignStateManager
 
 logger = init_logger(__name__)
 
@@ -75,98 +75,59 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
 
         self._cache = None
         self._state_cache: PagedStateCache | None = None
-        self._state_manager: RequestStateManager | AlignStateManager | None = None
+        self._state_manager: AlignStateManager | None = None
         self._scheduler_group_indices = (0,)
         self._group_block_sizes = (block_size,)
 
-    def initialize(self, num_blocks: int) -> None:
-        self._cache = MetalPagedKVCache(
-            num_layers=self._hybrid_plan.layers.num_attention,
-            num_kv_heads=self._num_kv_heads,
-            head_dim=self._head_dim,
-            num_blocks=num_blocks,
-            block_size=self._block_size,
-            dtype=self._dtype,
-            turboquant=self._turboquant,
-            k_quant=self._k_quant,
-            v_quant=self._v_quant,
+    def initialize_from_config(self, config) -> None:
+        """Use the upstream allocation for both KV and recurrent state."""
+        self.storage = KVCacheStorage(config)
+        layer_plan = self._hybrid_plan.layers
+        attention_names = [
+            f"layers.{i}.self_attn" for i in layer_plan.attention_indices
+        ]
+        state_names = [
+            f"layers.{i}.{self._hybrid_plan.family.layer_name}"
+            for i in layer_plan.state_indices
+        ]
+        self._cache = MetalPagedKVCache.from_upstream(
+            self.storage, attention_names, dtype=self._dtype
         )
-
-        # Align-mode slabs are addressed directly by scheduler block id; any
-        # of the pool's blocks can become a mamba state block (the block pool
-        # is fungible across cache groups), so the id space is
-        # [0, num_blocks).  The paged plan charges every block for its state
-        # bytes (admission worst case), but the pool materializes lazily by
-        # high-water block id — vLLM's BlockPool hands out low ids first, so
-        # resident state memory tracks the live + cached set instead of
-        # wiring the whole worst case up front. Start empty so the scheduler's
-        # shared tensor layout is adopted before any physical pool exists.
-        # None mode keeps one slab per resident request and grows on demand.
-        align = self._mamba_cache_mode == "align"
-        state_slots = num_blocks if align else self._max_num_seqs
-        self._state_cache = self._hybrid_plan.family.create_state_cache(
-            geometry=self._hybrid_plan.geometry,
-            num_layers=self._hybrid_plan.layers.num_state,
-            max_seqs=state_slots,
-            initial_seqs=0,
-            dtypes=tuple(
-                TORCH_TO_MLX_DTYPE[dtype] for dtype in self._hybrid_plan.state_dtypes
-            ),
+        self._scheduler_group_indices = tuple(
+            i
+            for i, group in enumerate(config.kv_cache_groups)
+            if any(name in attention_names for name in group.layer_names)
         )
-        self._state_manager = (
-            AlignStateManager(self._state_cache, self._block_size)
-            if align
-            else RequestStateManager(self._state_cache)
+        self._group_block_sizes = tuple(
+            config.kv_cache_groups[i].kv_cache_spec.block_size
+            for i in self._scheduler_group_indices
         )
-
+        self._state_group_indices = tuple(
+            i
+            for i, group in enumerate(config.kv_cache_groups)
+            if any(name in state_names for name in group.layer_names)
+        )
+        group_ordinals = [
+            next(
+                ordinal
+                for ordinal, group_id in enumerate(self._state_group_indices)
+                if name in config.kv_cache_groups[group_id].layer_names
+            )
+            for name in state_names
+        ]
+        self._state_cache = PagedStateCache(
+            self.storage.state_views(state_names), group_ordinals
+        )
+        state_spec = config.kv_cache_groups[self._state_group_indices[0]].kv_cache_spec
+        self._state_manager = AlignStateManager(
+            self._state_cache,
+            state_spec.block_size,
+        )
         logger.info(
-            "Hybrid cache initialized: %d SDPA layers (%d blocks), "
-            "%d %s layers (%d/%d state slots allocated, mamba_cache_mode=%s)",
-            self._hybrid_plan.layers.num_attention,
-            num_blocks,
-            self._hybrid_plan.layers.num_state,
-            self._hybrid_plan.family.label,
-            self._state_cache.allocated_seqs,
-            self._state_cache.max_seqs,
-            self._mamba_cache_mode,
+            "Hybrid shared cache: %d blocks, %.2f GiB backing for KV and state",
+            config.num_blocks,
+            self.storage.nbytes / (1 << 30),
         )
-
-    def adopt_scheduler_group(
-        self,
-        group_index: int,
-        block_size: int,
-        *,
-        state_group_indices: tuple[int, ...] = (),
-        layer_group_ordinals: list[int] | None = None,
-        layer_pool_ordinals: list[int] | None = None,
-    ) -> None:
-        """Select the vLLM scheduler groups backing this runtime.
-
-        ``group_index`` is the group owning SDPA KV blocks (kernel block
-        tables); ``state_group_indices`` are the mamba cache groups whose
-        block ids key the operator state slabs;
-        ``layer_group_ordinals[cache_idx]`` records which of those groups
-        each state layer belongs to (the engine stripes same-spec layers
-        across several groups) and ``layer_pool_ordinals[cache_idx]`` which
-        physical state pool it shares (one pool per within-group position,
-        following the ``kv_cache_tensors`` byte addresses).
-        """
-        self._require_initialized("adopt_scheduler_group")
-        if block_size != self._block_size:
-            raise NotImplementedError(
-                "hybrid paged attention requires the SDPA scheduler group "
-                f"block size to stay {self._block_size}, got {block_size}"
-            )
-        self._scheduler_group_indices = (group_index,)
-        self._group_block_sizes = (block_size,)
-        self._state_group_indices = tuple(state_group_indices)
-        if layer_group_ordinals is not None:
-            pool_ordinals = (
-                layer_pool_ordinals
-                if layer_pool_ordinals is not None
-                else list(range(len(layer_group_ordinals)))
-            )
-            self.state_cache.set_layer_layout(layer_group_ordinals, pool_ordinals)
 
     def kv_scheduler_group_indices(self) -> tuple[int, ...]:
         """Return scheduler KV groups consumed by SDPA layers."""
@@ -231,7 +192,7 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         return self._state_cache
 
     @property
-    def state_manager(self) -> RequestStateManager | AlignStateManager:
+    def state_manager(self) -> AlignStateManager:
         if self._state_manager is None:
             raise RuntimeError("state_manager accessed before initialize()")
         return self._state_manager
@@ -239,11 +200,14 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
     def needs_step_context(self) -> bool:
         return True
 
+    def zero_blocks(self, block_ids: Sequence[int]) -> None:
+        self.state_cache.apply_pending_states()
+        super().zero_blocks(block_ids)
+
     def copy_blocks(self, block_copies: Sequence[tuple[int, int]]) -> None:
         """Apply scheduler CoW copies to SDPA KV and align-mode state."""
-        self.kv_cache.copy_blocks(block_copies)
-        if self._mamba_cache_mode == "align":
-            self.state_cache.copy_blocks(block_copies)
+        self.state_cache.apply_pending_states()
+        self.storage.copy_blocks(block_copies)
 
     def populate_step_context(
         self,
@@ -261,6 +225,8 @@ class HybridPagedAttentionRuntime(PagedAttentionRuntimeBase):
         )
 
     def extend_forward_eval_outputs(self, outputs: list[mx.array]) -> None:
+        self.storage.depend(outputs)
+        outputs.append(self.storage.buffer)
         self.state_manager.extend_forward_eval_outputs(outputs)
 
     def release_requests(self, req_ids: set[str]) -> None:

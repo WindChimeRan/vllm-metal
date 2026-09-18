@@ -10,7 +10,7 @@ from typing import Any, ClassVar
 import mlx.core as mx
 
 import vllm_metal.envs as envs
-from vllm_metal.attention.caches.gdn_cache import GDNPagedStateCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 from vllm_metal.metal import _read_v2_metal_source
 
 _GDN_CONV1D_V2_SOURCE = _read_v2_metal_source("gdn_conv1d_silu_decode.metal")
@@ -31,7 +31,7 @@ class GDNRecurrentRequest:
     v: mx.array
     g: mx.array
     beta: mx.array
-    state_cache: GDNPagedStateCache
+    state_cache: PagedStateCache
     cache_idx: int
     slot_ids: list[int]
     output_dtype: mx.Dtype
@@ -216,18 +216,31 @@ class GDNLazyKernels:
                 return None
         except AttributeError:
             return None
-        return mx.fast.metal_kernel(
+        kernel = mx.fast.metal_kernel(
             name=name,
             input_names=input_names,
             output_names=output_names,
             source=source,
+            ensure_row_contiguous=False,
         )
+
+        def run(*, inputs, **kwargs):
+            inputs = [
+                mx.contiguous(value)
+                if isinstance(value, mx.array)
+                and key not in ("state_in", "conv_state_in")
+                else value
+                for key, value in zip(input_names, inputs, strict=True)
+            ]
+            return kernel(inputs=inputs, **kwargs)
+
+        return run
 
     def try_conv_decode(
         self,
         mixed_qkv: mx.array,
         inner: Any,
-        state_cache: GDNPagedStateCache,
+        state_cache: PagedStateCache,
         cache_idx: int,
         slot_ids: list[int],
     ) -> mx.array | None:
@@ -286,7 +299,7 @@ class GDNLazyKernels:
         self,
         mixed_qkv: mx.array,
         inner: Any,
-        state_cache: GDNPagedStateCache,
+        state_cache: PagedStateCache,
         cache_idx: int,
         slot_ids: list[int],
         cu_seqlens: list[int],

@@ -69,6 +69,11 @@ class PagedAttentionRuntimeBase:
         """Apply scheduler copy-on-write operations to the primary cache."""
         self._require_initialized("copy_blocks").copy_blocks(block_copies)
 
+    def zero_blocks(self, block_ids: Sequence[int]) -> None:
+        """Prepare scheduler-allocated pages when storage is shared by groups."""
+        if hasattr(self, "storage"):
+            self.storage.zero_blocks(block_ids)
+
     def needs_step_context(self) -> bool:
         """Return whether this runtime attaches request-ordered step metadata."""
         return False

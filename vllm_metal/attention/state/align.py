@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Align-mode state lifecycle (hybrid prefix caching).
+"""Scheduler-owned operator-state lifecycle for none and align modes.
 
 With ``mamba_cache_mode="align"`` the scheduler's mamba cache groups carry a
 position-indexed block table per request, exactly like upstream: the state
 slab for a request is the block covering its last token, and prefix caching
 checkpoints a slab whenever a scheduler step ends on a block boundary.  The
 state pool is therefore indexed directly by scheduler block id (one slab id
-per pool block, materialized lazily to the high-water block id), and this
+per pool block in the shared allocation), and this
 manager owns the two per-step motions
 upstream runs in ``preprocess_state`` (vllm's Triton
 ``preprocess_mamba_align_fused_kernel`` + pre-copy):
@@ -33,7 +33,7 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
-from vllm_metal.attention.caches.protocol import PagedStateCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 
 if TYPE_CHECKING:
     from vllm_metal.attention.context import PagedAttentionContext
@@ -64,8 +64,8 @@ class AlignStateManager:
         ``state_block_ids[i][g]`` is request *i*'s block-id row for mamba
         group *g* (position-indexed); ``step_positions[i]`` is its
         ``(num_computed, num_scheduled)`` for this step.  Both arguments are
-        optional only so the state managers share one signature; align mode
-        cannot plan without them.
+        required by this runtime. None mode uses the same lifecycle with one
+        state block covering the request.
         """
         if state_block_ids is None or step_positions is None:
             raise RuntimeError(
@@ -83,22 +83,6 @@ class AlignStateManager:
         # The lazy kernels' deferred compact updates are keyed by slab id;
         # slabs can move between steps here, so drain them before planning.
         self._state_cache.apply_pending_states()
-
-        # Lazily grow the pool to the highest block id this step touches
-        # (geometric, capped at the pool size the plan budgeted).  BlockPool
-        # allocates low ids first, so the high-water mark tracks the live +
-        # cached set rather than the worst case.
-        high_water = 0
-        for tables in state_block_ids:
-            for row in tables:
-                if row:
-                    high_water = max(high_water, max(row) + 1)
-        if high_water > self._state_cache.allocated_seqs:
-            target = min(
-                self._state_cache.max_seqs,
-                max(high_water, 2 * self._state_cache.allocated_seqs),
-            )
-            self._state_cache.ensure_capacity(target)
 
         group_mappings: list[list[int]] = []
         for group in range(num_groups):

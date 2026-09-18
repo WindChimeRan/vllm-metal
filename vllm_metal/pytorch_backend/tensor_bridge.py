@@ -75,10 +75,10 @@ def _is_safe_for_mps(array: mx.array) -> bool:
     return _get_tensor_size_bytes(array) < _MPS_SAFE_SIZE_BYTES
 
 
-def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
+def torch_to_mlx(tensor: torch.Tensor, *, copy: bool | None = None) -> mx.array:
     """Convert PyTorch tensor to MLX array.
 
-    Uses numpy as an intermediate to enable zero-copy on unified memory.
+    Imports through DLPack. ``copy=False`` requires shared storage.
 
     Args:
         tensor: PyTorch tensor (can be on any device)
@@ -86,17 +86,11 @@ def torch_to_mlx(tensor: torch.Tensor) -> mx.array:
     Returns:
         MLX array with the same data
     """
-    # Move to CPU if on MPS for numpy conversion
-    if tensor.device.type != "cpu":
+    if tensor.device.type == "mps":
+        torch.mps.synchronize()
+    elif tensor.device.type != "cpu":
         tensor = tensor.cpu()
-
-    tensor = tensor.detach()
-
-    # Note: numpy does not support bfloat16.
-    if tensor.dtype == torch.bfloat16:
-        return mx.array(tensor)
-
-    return mx.array(tensor.numpy())
+    return mx.from_dlpack(tensor.detach(), copy=copy)
 
 
 def mlx_to_torch(

@@ -13,13 +13,12 @@ from dataclasses import dataclass
 from math import prod
 from typing import Any, Literal, Protocol, TypeAlias
 
-import mlx.core as mx
 import mlx.nn as nn
 import torch
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import MambaSpec
 
-from vllm_metal.attention.caches.protocol import PagedStateCache
+from vllm_metal.attention.caches.state_cache import PagedStateCache
 
 LayerRole: TypeAlias = Literal["attention", "state", "stateless"]
 
@@ -132,20 +131,6 @@ class ConvStateGeometry:
 StateGeometry: TypeAlias = RecurrentStateGeometry | ConvStateGeometry
 
 
-class StateCacheFactory(Protocol):
-    """Allocate a family's state pools using its resolved geometry."""
-
-    def __call__(
-        self,
-        *,
-        geometry: StateGeometry,
-        num_layers: int,
-        max_seqs: int,
-        initial_seqs: int,
-        dtypes: tuple[mx.Dtype, ...],
-    ) -> PagedStateCache: ...
-
-
 @dataclass(frozen=True, slots=True)
 class StateFamilySpec:
     """Per-family implementation: how state layers are detected and wrapped."""
@@ -156,7 +141,6 @@ class StateFamilySpec:
     mamba_type: MambaAttentionBackendEnum
     supported_cache_modes: tuple[str, ...]
     layer_name: str
-    create_state_cache: StateCacheFactory
 
 
 @dataclass(frozen=True, slots=True)
