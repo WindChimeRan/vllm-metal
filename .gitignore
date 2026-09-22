@@ -140,9 +140,6 @@ cython_debug/
 .DS_Store
 Thumbs.db
 
-# Rust build artifacts
-Cargo.lock
-
 # Metal specific
 *.metallib
 *.air

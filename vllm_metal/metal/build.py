@@ -29,9 +29,8 @@ _MLX_PATCH = _THIS_DIR / "mlx_patch.cpp"
 _BUILD = _THIS_DIR / "build.py"
 _CONSTANTS = _THIS_DIR / "constants.py"
 _EXT_SUFFIX = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
-# The built extension lives inside the package directory so packaging
-# (maturin ``include``) bundles it into the wheel and the runtime loads it
-# without ever invoking clang++ on the end-user machine.
+# The built extension lives inside the package so the wheel can include it.
+# Runtime loads the prebuilt artifact without invoking clang++ on the user's Mac.
 _OUT = _THIS_DIR / f"_paged_ops{_EXT_SUFFIX}"
 
 

@@ -42,7 +42,6 @@ def _make_paged_runner(num_layers: int = 2) -> mr.MetalModelRunner:
             dtype=mx.float32,
         ),
         _paged_block_size=4,
-        _rust_state_manager=None,
         num_layers=num_layers,
     )
 
