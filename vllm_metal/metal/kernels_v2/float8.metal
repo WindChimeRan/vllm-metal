@@ -3,7 +3,6 @@ using namespace metal;
 
 // Helpers ------------------------------------------------------------
 static inline uint as_bits(float x) { return as_type<uint>(x); }
-static inline float from_bits(uint b) { return as_type<float>(b); }
 
 // -------------------------------------------------------------------
 // FP8 E4M3 (bias = 7)
@@ -29,33 +28,6 @@ inline float fp8_e4m3_to_float(uchar v) {
   // Normalized (including exp=0xF with mantissa 0-6, which are valid numbers)
   const float m = 1.f + float(man) / 8.f;
   float val = ldexp(m, int(exp) - 7);
-  return s ? -val : val;
-}
-
-// -------------------------------------------------------------------
-// FP8 E5M2 (bias = 15)
-// -------------------------------------------------------------------
-inline float fp8_e5m2_to_float(uchar v) {
-  const uint s = v >> 7;
-  const uint exp = (v >> 2) & 0x1F;
-  const uint man = v & 0x3;
-
-  if (exp == 0) {
-    if (man == 0)
-      return s ? -0.f : 0.f;
-    const float m = float(man) / 4.f;
-    float val = ldexp(m, 1 - 15); // 2^(1-bias) = 2^-14
-    return s ? -val : val;
-  }
-
-  if (exp == 0x1F) {
-    if (man != 0)
-      return NAN;
-    return s ? -INFINITY : INFINITY;
-  }
-
-  const float m = 1.f + float(man) / 4.f;
-  float val = ldexp(m, int(exp) - 15);
   return s ? -val : val;
 }
 
@@ -143,7 +115,4 @@ inline uchar float_to_fp8_e4m3(float f) {
   }
 
   return result;
-}
-inline uchar float_to_fp8_e5m2(float f) {
-  return detail::fp32_to_fp8<5, 2, 15>(f);
 }
