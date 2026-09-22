@@ -51,9 +51,6 @@ jobs:
         RELEASE_REF: ${{ github.ref_name }}
         RELEASE_VERSION: ${{ inputs.version }}
 
-    - name: Install Metal compiler for wheel build
-      run: xcodebuild -downloadComponent MetalToolchain
-
     - name: Build and Release
       run: |
         if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
