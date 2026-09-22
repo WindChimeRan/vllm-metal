@@ -90,7 +90,7 @@ main() {
   setup_dev_env
 
   # Package all native artifacts before building the wheel.
-  ensure_metal_toolchain
+  check_metal_toolchain
   build_native_artifacts
 
   local version prerelease=0
