@@ -5,10 +5,10 @@ The setup below is for editing vllm-metal itself.
 
 ## Development setup
 
-On an Apple Silicon Mac, install [Rust](https://rustup.rs/) and full
+On an Apple Silicon Mac, install full
 [Xcode](https://developer.apple.com/xcode/) with macOS SDK 26.2 or newer.
 Select Xcode as the active developer directory. Initial source setup builds
-the Rust and Metal components, including for Python-only contributions.
+native Metal artifacts, including for Python-only contributions.
 
 Fork the repository on GitHub, then clone your fork (replace `YOUR_USERNAME`):
 

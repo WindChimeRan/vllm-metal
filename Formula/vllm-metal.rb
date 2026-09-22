@@ -71,7 +71,6 @@ class VllmMetal < Formula
     system libexec/"bin/python", "-c", <<~PYTHON
       import importlib.metadata
       import mlx.core as mx
-      import vllm_metal._rs
       from vllm.platforms import current_platform
       from vllm_metal.metal import get_ops
       from vllm_metal.platform import MetalPlatform

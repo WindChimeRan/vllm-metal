@@ -20,7 +20,7 @@ main() {
     source .venv-vllm-metal/bin/activate
 
     # Shift-left the release wheel guard. The pytest run below imports the source
-    # tree, which shadows the installed wheel, so a maturin `include` regression
+    # tree, which shadows the installed wheel, so a package-data regression
     # (artifacts silently dropped from the wheel) would pass CI here and only
     # surface when release.sh runs on main. Build the wheel and assert it bundles
     # the prebuilt artifacts now — the same check release.sh runs before publish.

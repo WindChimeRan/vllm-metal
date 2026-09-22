@@ -109,13 +109,13 @@ main() {
   echo "Channel: $channel"
   echo "Building version: $version"
 
-  # Stamp the ephemeral checkout; maturin reads [project].version.
+  # Stamp the ephemeral checkout; the build backend reads [project].version.
   sed -i '' -E "s/^version = .*/version = \"${version}\"/" pyproject.toml
 
   section "Building wheel"
   uv build
 
-  # Abort before publishing if maturin omitted a native artifact.
+  # Abort before publishing if the wheel omitted a native artifact.
   local wheels=(dist/*.whl)
   if [ ! -f "${wheels[0]}" ]; then
     error "No wheel found in dist/ after uv build."

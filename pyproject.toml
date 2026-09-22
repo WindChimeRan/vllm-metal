@@ -1,28 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
 [build-system]
-requires = ["maturin>=1.4,<2.0"]
-build-backend = "maturin"
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-metal"
 version = "0.29.0"
 description = "vLLM hardware plugin for Apple Silicon - unifies MLX and PyTorch under a single lowering path"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 requires-python = ">=3.12,<3.14"
 authors = [
     {name = "vLLM Community"}
 ]
-keywords = ["vllm", "metal", "mlx", "apple", "silicon", "mps", "llm", "inference", "rust"]
+keywords = ["vllm", "metal", "mlx", "apple", "silicon", "mps", "llm", "inference"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS :: MacOS X",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
-    "Programming Language :: Rust",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
@@ -105,21 +103,11 @@ metal = "vllm_metal:register"
 [project.entry-points."vllm.general_plugins"]
 gguf_metal = "vllm_metal.gguf.vllm_integration:register"
 
-# Maturin configuration for mixed Rust/Python project
-[tool.maturin]
-# Build both the Rust extension and include Python source
-features = ["pyo3/extension-module"]
-# Include Python package in the wheel
-python-source = "."
-# Module name matches the Rust crate name
-module-name = "vllm_metal._rs"
-# Strip symbols for smaller binary
-strip = true
-# Bundle the prebuilt Metal artifacts into the wheel. These are gitignored
-# (*.so / *.metallib) so maturin's default git-tracked file walk skips them;
-# listing them explicitly ships the prebuilt native extension at packaging
-# time so the end-user machine never invokes clang++ at runtime.
-include = ["vllm_metal/metal/*.metallib", "vllm_metal/metal/_paged_ops*.so"]
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["vllm_metal*"]
 
 [tool.ruff]
 line-length = 88

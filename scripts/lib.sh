@@ -111,7 +111,7 @@ get_version() {
 # present (no slow download), otherwise download MetalToolchain and re-check.
 ensure_metal_toolchain() {
   section "Ensuring Metal toolchain"
-  # Keep Maturin/Rust aligned with the native extension's macOS 15 floor.
+  # Keep native artifacts aligned with the wheel's macOS 15 floor.
   export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-15.0}"
 
   local tmpdir metal_src metal_lib
@@ -141,7 +141,7 @@ ensure_metal_toolchain() {
 
 # Build the in-package native artifacts (the _paged_ops*.so and the required
 # precompiled .metallib shader libraries, including NAX) into vllm_metal/metal/
-# so `uv build` can bundle them via the maturin `include` directive.
+# so `uv build` can bundle them as package data.
 #
 # `python` here is the venv interpreter activated by setup_dev_env, so mlx and
 # nanobind are importable.
@@ -157,7 +157,7 @@ build_native_artifacts() {
 
 # Fail unless the freshly built wheel actually bundles the prebuilt native
 # artifacts: the _paged_ops*.so extension, three required metallibs, and NAX.
-# maturin's `include` directive is what pulls these (gitignored)
+# setup.py's package data is what pulls these (gitignored)
 # files in; if that ever regresses, the wheel would install fine but fail at
 # first run with "Prebuilt native extension not found". The expected filenames
 # are read from build.py so this guard never drifts from the runtime loader.
@@ -186,7 +186,7 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
       success "bundled: ${name}"
     else
       error "Wheel ${wheel} is missing native artifact: ${name}"
-      error "maturin [tool.maturin] 'include' likely failed to bundle it."
+      error "Check the native package data in setup.py."
       return 1
     fi
   done <<< "$expected"
@@ -200,7 +200,7 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
   while IFS= read -r native_so; do
     native_name=$(basename "${native_so}")
     case "${native_name}" in
-      "${paged_ops_name}"|_rs.*.so) ;;
+      "${paged_ops_name}") ;;
       *) continue ;;
     esac
     native_count=$((native_count + 1))
@@ -213,7 +213,7 @@ for _name in (*METALLIB_NAMES, NAX_METALLIB_NAME):
     success "${native_name}: macOS ${actual_minos}"
   done < <(find "${unpack_dir}" -type f -name '*.so')
   rm -rf "${unpack_dir}"
-  if [ "${native_count}" -lt 2 ]; then
+  if [ "${native_count}" -lt 1 ]; then
     error "Wheel ${wheel} is missing a required native extension."
     return 1
   fi
