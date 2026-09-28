@@ -138,3 +138,90 @@ def test_seeded_sampling_is_independent_of_batch_order():
     )
     assert second.tolist() == first[order].tolist()
     assert first[1].item() == logits[1].argmax().item()
+
+
+@pytest.mark.parametrize("model_type", ["hunyuan_v1_dense", "olmo2"])
+def test_upstream_qk_norm_semantics(model_type, tmp_path, monkeypatch):
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from vllm import LLM, envs
+
+    envs.disable_envs_cache()
+    monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_USE_HW_AGNOSTIC", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    torch.manual_seed(17)
+    config = AutoConfig.for_model(
+        model_type,
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=512,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        bos_token_id=1,
+        eos_token_id=2,
+        pad_token_id=0,
+        **({"head_dim": 128} if model_type == "hunyuan_v1_dense" else {}),
+    )
+    reference = AutoModelForCausalLM.from_config(
+        config, dtype=torch.float16, attn_implementation="eager"
+    ).eval()
+    norm_count = 0
+    with torch.no_grad():
+        for name, weight in reference.named_parameters():
+            if name.endswith(
+                (
+                    "query_layernorm.weight",
+                    "key_layernorm.weight",
+                    "q_norm.weight",
+                    "k_norm.weight",
+                )
+            ):
+                norm_count += 1
+                # Uniform scales can hide an incorrect norm/RoPE order.
+                weight.copy_(torch.linspace(0.5, 1.75, weight.numel()).view_as(weight))
+    assert norm_count == 4
+    reference.save_pretrained(tmp_path)
+    prompt = [3 + i % 29 for i in range(35)]
+    expected_ids, expected_scores = [], []
+    with torch.inference_mode():
+        for _ in range(3):
+            logits = (
+                reference(torch.tensor([prompt + expected_ids]), use_cache=False)
+                .logits[0, -1]
+                .float()
+            )
+            expected_ids.append(logits.argmax().item())
+            expected_scores.append(logits.log_softmax(-1))
+    del reference
+    llm = LLM(
+        model=str(tmp_path),
+        model_impl="transformers",
+        dtype="float16",
+        skip_tokenizer_init=True,
+        max_model_len=64,
+        max_num_batched_tokens=16,
+        max_num_seqs=2,
+        kv_cache_memory_bytes=8 << 20,
+        max_logprobs=64,
+        enable_prefix_caching=True,
+    )
+    try:
+        params = SamplingParams(
+            temperature=0, max_tokens=3, ignore_eos=True, logprobs=-1
+        )
+        for cached_tokens in (0, 32):  # Cold prefill, then two cached blocks.
+            result = llm.generate(
+                [{"prompt_token_ids": prompt}], params, use_tqdm=False
+            )[0]
+            assert result.num_cached_tokens == cached_tokens
+            output = result.outputs[0]
+            assert output.token_ids == expected_ids
+            for actual, expected in zip(output.logprobs, expected_scores, strict=True):
+                scores = torch.tensor([actual[i].logprob for i in range(64)])
+                torch.testing.assert_close(scores, expected, atol=0.01, rtol=0.002)
+    finally:
+        llm.llm_engine.engine_core.shutdown()
+        envs.disable_envs_cache()

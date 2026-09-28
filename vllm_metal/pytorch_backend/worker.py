@@ -48,8 +48,8 @@ def configure_mps(config):
     model = config.model_config
     hf = model.hf_text_config
     if (
-        hf.model_type != "qwen3"
-        or hf.head_dim != 128
+        hf.model_type not in {"qwen3", "hunyuan_v1_dense", "olmo2"}
+        or model.get_head_size() != 128
         or model.quantization is not None
         or model.runner_type != "generate"
         or model.dtype not in (torch.float16, torch.bfloat16)
@@ -61,7 +61,8 @@ def configure_mps(config):
         or config.additional_config.get("turboquant", False)
     ):
         raise NotImplementedError(
-            "Experimental MPS requires unquantized Qwen3, fp16/bf16, "
+            "Experimental MPS requires unquantized Qwen3, Hunyuan Dense V1 or "
+            "OLMo2 with 128-dimensional heads, fp16/bf16, "
             "one GPU, and no LoRA/speculative decoding/KV transfer."
         )
     if config.cache_config.block_size not in (None, 16):

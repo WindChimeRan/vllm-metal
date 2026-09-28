@@ -85,7 +85,8 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
             or kv_sharing_target_layer_name is not None
         ):
             raise NotImplementedError(
-                "Experimental MPS attention supports dense Qwen3 only"
+                "Experimental MPS supports full causal attention with "
+                "128-dimensional heads"
             )
         self.num_heads = num_heads
         self.head_size = head_size
