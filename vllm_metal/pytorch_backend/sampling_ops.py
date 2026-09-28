@@ -1,10 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""MPS operation adapters used by the upstream MRV2 sampler."""
+"""PyTorch fallbacks for MRV2's Triton-only sampling operations.
+
+The Sampler, request state, processor order and top-k/top-p stay in vLLM.
+MRV2's other device operations have no MPS dispatch in vLLM 0.30, so their
+packed-state interfaces are adapted here. Random selection and repetition
+penalties use shared vLLM PyTorch helpers; request/position RNG stays local.
+"""
 
 from types import SimpleNamespace
 
 import torch
+from vllm._custom_ops import apply_repetition_penalties
 from vllm.utils.math_utils import next_power_of_2
+from vllm.v1.sample.ops.topk_topp_sampler import sample_with_exponential_noise
 
 from vllm_metal.pytorch_backend.runtime import TensorKernel, cpu_mirror
 
@@ -53,8 +61,10 @@ def gumbel_sample(
     temp = temperature[expanded_idx_mapping.long()]
     if apply_temperature:
         scores = scores / torch.where(temp == 0, 1, temp).unsqueeze(1)
-    scores = torch.where((temp != 0).unsqueeze(1), scores - noise.log(), scores)
-    return scores.argmax(dim=-1)
+    sampled = sample_with_exponential_noise(scores.softmax(-1), noise)
+    if bool((temps == 0).any()):
+        sampled = torch.where(temp == 0, logits.argmax(dim=-1), sampled)
+    return sampled
 
 
 def apply_logit_bias(
@@ -147,10 +157,9 @@ def apply_penalties(
         (prompt_bin_mask[slots[:, None], vocab // 32] >> (vocab % 32)) & 1
     ).bool()
     counts = output_bin_counts[slots]
-    seen = prompt_seen | (counts > 0)
-    repeat = repetition_penalty[slots, None]
-    penalized = torch.where(logits > 0, logits / repeat, logits * repeat)
-    logits.copy_(torch.where(seen, penalized, logits))
+    apply_repetition_penalties(
+        logits, prompt_seen, counts > 0, repetition_penalty[slots]
+    )
     logits.sub_(counts * frequency_penalty[slots, None])
     logits.sub_((counts > 0) * presence_penalty[slots, None])
 

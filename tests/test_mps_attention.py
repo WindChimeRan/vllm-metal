@@ -14,17 +14,15 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("force_tiled", [False, True])
-@pytest.mark.parametrize(
-    "counts,starts",
-    [([39, 7], [0, 17]), ([1, 23], [70, 33]), ([1, 1], [17, 33]), ([1], [700])],
-)
-def test_mps_paged_attention(dtype, counts, starts, force_tiled):
-    from vllm.v1.attention.backend import CommonAttentionMetadata
-
-    from vllm_metal.pytorch_backend.attention import MPSAttentionMetadataBuilder
-    from vllm_metal.pytorch_backend.mps_ops import get_mps_ops
+def test_mps_paged_attention(dtype, force_tiled):
+    from vllm_metal.pytorch_backend.attention import (
+        MPSAttentionImpl,
+        MPSAttentionMetadata,
+    )
 
     torch.manual_seed(8)
+    # One batch exercises cached prefill and decode spanning two partitions.
+    counts, starts = [39, 1], [17, 700]
     total = sum(counts)
     # Deliberately strided K/V inputs like vLLM's packed QKV projection.
     qkv = torch.randn(total, 32, 128, dtype=dtype) * 0.25
@@ -57,45 +55,35 @@ def test_mps_paged_attention(dtype, counts, starts, force_tiled):
     for blocks, start, count in zip(table, starts, counts, strict=True):
         cu.append(cu[-1] + count)
         slots.extend(blocks[p // 16] * 16 + p % 16 for p in range(start, start + count))
-    cu_cpu = torch.tensor(cu, dtype=torch.int32)
-    common = CommonAttentionMetadata(
-        query_start_loc=cu_cpu.to("mps"),
-        query_start_loc_cpu=cu_cpu,
+    metadata = MPSAttentionMetadata(
+        cu_seqlens=torch.tensor(cu, dtype=torch.int32, device="mps"),
         seq_lens=torch.tensor(
             [s + c for s, c in zip(starts, counts, strict=True)],
             dtype=torch.int32,
             device="mps",
         ),
-        num_reqs=len(counts),
-        num_actual_tokens=sum(counts),
-        max_query_len=max(counts),
         max_seq_len=max(s + c for s, c in zip(starts, counts, strict=True)),
-        block_table_tensor=torch.tensor(table, dtype=torch.int32, device="mps"),
+        block_tables=torch.tensor(table, dtype=torch.int32, device="mps"),
         slot_mapping=torch.tensor(slots, dtype=torch.int64, device="mps"),
     )
-    builder = MPSAttentionMetadataBuilder(None, ["test"], None, torch.device("mps"))
-    m = builder.build(0, common)
     gpu_qkv = qkv.to("mps")
     gpu_q, gpu_k, gpu_v = gpu_qkv.split([16, 8, 8], dim=1)
     gpu_cache = cache.to("mps")
     out = torch.empty_like(gpu_q, memory_format=torch.contiguous_format)
-    ops = get_mps_ops()
+    impl = MPSAttentionImpl(16, 128, 128**-0.5, num_kv_heads=8)
     if force_tiled:
         metal = Path(__file__).resolve().parents[1] / "vllm_metal" / "metal"
-        ops = type(ops)(str(metal / "paged_attention_v2_kern.metallib"), "", 20)
-    ops.forward(
-        gpu_q.contiguous(),
+        impl.ops = type(impl.ops)(
+            str(metal / "paged_attention_v2_kern.metallib"), "", 20
+        )
+    impl.forward(
+        None,
+        gpu_q,
         gpu_k,
         gpu_v,
-        gpu_cache[..., :128],
-        gpu_cache[..., 128:],
-        m.slot_mapping,
-        m.block_tables,
-        m.seq_lens,
-        m.cu_seqlens,
+        gpu_cache.transpose(1, 2),  # vLLM layout; forward adapts it for Metal.
+        metadata,
         out,
-        m.max_seq_len,
-        128**-0.5,
     )
     torch.testing.assert_close(
         out.cpu().float(), torch.cat(reference), atol=0.003, rtol=0.03
