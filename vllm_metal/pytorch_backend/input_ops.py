@@ -55,8 +55,21 @@ def combine_sampled_and_draft_tokens(
     num_logits,
     num_new_sampled_tokens=1,
 ):
-    if drafts.shape[1] or num_new_sampled_tokens != 1:
-        raise NotImplementedError("MPS draft-token input kernels are not implemented")
+    if drafts.shape[1]:
+        from vllm_metal.pytorch_backend.speculative_ops import combine_tokens
+
+        return combine_tokens(
+            ids,
+            mapping,
+            last,
+            cu,
+            lengths,
+            prefill,
+            drafts,
+            cu_logits,
+            num_logits,
+            num_new_sampled_tokens,
+        )
     indices = (cu[1:] - 1).long()
     slots = mapping.long()
     ids[indices] = torch.where(
@@ -79,8 +92,6 @@ def get_num_sampled_and_rejected(count, lengths, cu_logits, mapping, prefill):
 def post_update(
     mapping, computed, last, bins, tokens, count, rejected, cu, all_ids, total
 ):
-    if tokens.shape[1] != 1:
-        raise NotImplementedError("MPS speculative writeback is not implemented")
     valid_rows = cpu_mirror(mapping).numpy() >= 0
     if not valid_rows.all():
         keep = torch.tensor(valid_rows.nonzero()[0], device=mapping.device)
@@ -96,18 +107,23 @@ def post_update(
     slots = slots.clamp_min(0)
     active = valid & (count > 0)
     old_total = total[slots].long()
-    ids = tokens[:, 0]
+    ids = tokens.gather(1, (count.long() - 1).clamp_min(0)[:, None]).flatten()
     # A request has at most one row in the ordinary decode batch.
     last[slots, 0] = torch.where(active, ids, last[slots, 0])
-    write_pos = old_total.clamp_max(all_ids.shape[1] - 1)
-    all_ids[slots, write_pos] = torch.where(
-        active, ids.to(all_ids.dtype), all_ids[slots, write_pos]
-    )
+    for i in range(tokens.shape[1]):
+        write_pos = (old_total + i).clamp_max(all_ids.shape[1] - 1)
+        all_ids[slots, write_pos] = torch.where(
+            valid & (count > i),
+            tokens[:, i].to(all_ids.dtype),
+            all_ids[slots, write_pos],
+        )
+        if bins is not None:
+            bins[slots, tokens[:, i].clamp_min(0)] += (valid & (count > i)).to(
+                bins.dtype
+            )
     total[slots] = (old_total + torch.where(active, count, 0)).to(total.dtype)
     delta = -rejected if cu is None else cu[1:] - cu[:-1] - rejected
     computed[slots] += torch.where(valid, delta, 0).to(computed.dtype)
-    if bins is not None:
-        bins[slots, ids] += active.to(bins.dtype)
 
 
 def post_update_num_computed_tokens(mapping, computed, cu):

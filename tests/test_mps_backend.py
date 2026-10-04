@@ -3,6 +3,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -245,3 +246,81 @@ def test_rope_matches_upstream(dtype, rows, heads, kv_heads, head_size, gapped_h
     actual = apply_rope(positions, q, k, cache, head_size)
     for got, want in zip(actual, expected, strict=True):
         torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("logprobs", [None, 5])
+@pytest.mark.parametrize("chunk_rows", [4, 1024])
+def test_speculative_verification_preserves_ragged_requests(
+    state, monkeypatch, logprobs, chunk_rows
+):
+    """Exercise upstream gather, verification and logprobs with reordered slots."""
+    from vllm.sampling_params import SamplingParams
+    from vllm.v1.worker.gpu.sample.sampler import Sampler
+    from vllm.v1.worker.gpu.spec_decode import rejection_sampler
+
+    from vllm_metal.platform import MetalPlatform
+
+    monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+    MetalPlatform.register_triton_kernel_overrides()
+    monkeypatch.setattr(rejection_sampler, "get_max_chunk_logits", lambda _: chunk_rows)
+    sampler = Sampler(
+        SimpleNamespace(reasoning_config=None), 4, 64, torch.device("mps"), state
+    )
+    state.prefill_len.np[:] = 10
+    state.prefill_len.copy_to_uva()
+    for slot in range(4):
+        sampler.add_request(slot, SamplingParams(temperature=0, logprobs=logprobs))
+    sampler.apply_staged_writes()
+    verifier = rejection_sampler.RejectionSampler(
+        sampler,
+        SimpleNamespace(
+            num_speculative_tokens=3,
+            enable_adaptive_verification=False,
+            rejection_sample_method="standard",
+        ),
+        torch.device("mps"),
+    )
+    widths = np.array([4, 4, 3, 1], dtype=np.int32)
+    cu_np = np.array([0, 4, 8, 11, 12], dtype=np.int32)
+    slots_np = np.array([3, 0, 2, 1])
+
+    def to_device(values):
+        return torch.tensor(values, device="mps", dtype=torch.int32)
+
+    batch = SimpleNamespace(
+        num_reqs=4,
+        input_ids=to_device([0, 1, 2, 3, 0, 5, 9, 7, 0, 2, 3, 0]),
+        positions=to_device([10, 11, 12, 13, 10, 11, 12, 13, 8, 9, 10, 8]),
+        logits_indices=torch.arange(12, device="mps"),
+        idx_mapping=to_device(slots_np),
+        idx_mapping_np=slots_np,
+        expanded_idx_mapping=to_device(np.repeat(slots_np, widths)),
+        expanded_local_pos=to_device([0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 0]),
+        cu_num_logits=to_device(cu_np),
+        cu_num_logits_np=cu_np,
+        seq_lens=to_device([14, 14, 11, 9]),
+        seq_lens_cpu_upper_bound=torch.tensor([14, 14, 11, 9]),
+    )
+    winners = to_device([1, 2, 3, 4, 5, 6, 7, 8, 2, 3, 4, 6]).long()
+    logits = torch.arange(64, device="mps", dtype=torch.float32).repeat(12, 1) / 100
+    logits.scatter_(1, winners[:, None], 10)
+    result = verifier(logits, batch)
+    assert result.num_sampled.tolist() == [4, 2, 1, 0]
+    assert result.num_rejected.tolist() == [0, 2, 2, 0]
+    assert result.sampled_token_ids.tolist() == [
+        [1, 2, 3, 4],
+        [5, 6, -1, -1],
+        [2, -1, -1, -1],
+        [6, -1, -1, -1],
+    ]
+    if logprobs is None:
+        assert result.logprobs_tensors is None
+    else:
+        scores = result.logprobs_tensors
+        kept = torch.tensor([0, 1, 2, 3, 4, 5, 8], device="mps")
+        torch.testing.assert_close(
+            scores.logprob_token_ids[kept, 0], winners[kept].int()
+        )
+        expected = logits.log_softmax(-1).gather(1, winners[:, None])[:, 0]
+        torch.testing.assert_close(scores.logprobs[kept, 0], expected[kept])
+        assert scores.cu_num_generated_tokens == cu_np.tolist()
