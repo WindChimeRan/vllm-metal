@@ -2,7 +2,6 @@
 
 import io
 import json
-import subprocess
 import sys
 import threading
 import urllib.error
@@ -32,7 +31,9 @@ def healthy_server():
             pass
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
     thread.start()
     try:
         yield server
@@ -128,12 +129,11 @@ def test_transcriptions_use_the_served_model(monkeypatch):
 
 
 def test_unrelated_startup_failure_does_not_retry(monkeypatch, capsys):
-    original_popen = subprocess.Popen
     starts = []
 
     def failed_vllm(command):
         starts.append(command)
-        return original_popen([sys.executable, "-c", "raise SystemExit(7)"])
+        return SimpleNamespace(poll=lambda: 7, wait=lambda timeout: 7)
 
     monkeypatch.setattr(smoke.subprocess, "Popen", failed_vllm)
     monkeypatch.setattr(sys, "argv", ["stt-smoke", "--audio", "unused.wav"])

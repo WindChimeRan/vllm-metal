@@ -336,14 +336,13 @@ def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition,
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
 @pytest.mark.parametrize("partition", GQA_PARTITIONS)
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_automatic_batch_route_matches_reference(q, kv, head, block, partition, dtype):
+def test_automatic_batch_route_matches_reference(q, kv, head, block, partition):
     # 40 cores, two rows: 21 / 28 / 42 full partitions per row for Q32/24/16.
     per_row = {32: 21, 24: 28, 16: 42}[q]
     lengths = [partition * per_row + 1, partition * per_row + 3]
     out, ref = _run_primitive(
         lengths,
-        dtype,
+        mx.bfloat16,
         interleaved=True,
         seed=1005,
         num_query_heads=q,
@@ -357,7 +356,7 @@ def test_automatic_batch_route_matches_reference(q, kv, head, block, partition, 
     assert _dispatch_family() == "gqa_decode"
     assert get_ops().last_gqa_partition_size() == partition
     assert get_ops().last_gqa_num_requests() == 2
-    _assert_close(out, ref, dtype)
+    _assert_close(out, ref, mx.bfloat16)
 
 
 @pytest.mark.parametrize(

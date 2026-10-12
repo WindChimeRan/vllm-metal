@@ -45,7 +45,8 @@ main() {
     section "Running tests"
     # Exclude perf/long-running tests by default; run them explicitly via:
     #   pytest -m slow tests/ -v --tb=short
-    pytest -m "not slow" tests/ .github/scripts/test_parity.py -v --tb=short
+    pytest -m "not slow" tests/ .github/scripts/test_parity.py -v --tb=short \
+      --durations=25 --durations-min=0.1
   fi
 }
 
