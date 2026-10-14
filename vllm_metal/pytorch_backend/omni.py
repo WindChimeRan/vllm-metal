@@ -13,11 +13,11 @@ from vllm_metal.pytorch_backend.worker import MPSWorker
 class MPSOmniARModelRunner(MPSModelRunner, OmniARModelRunner):
     def __init__(self, config):
         super().__init__(config)
-        from vllm_metal.pytorch_backend.omni_ops import install as install_ops
-        from vllm_metal.pytorch_backend.omni_sampling import install
+        from vllm_metal.pytorch_backend.models.qwen3_code_predictor import install
+        from vllm_metal.pytorch_backend.omni_logits import install as install_logits
 
-        install_ops()
         install()
+        install_logits()
 
 
 class MPSOmniGenerationModelRunner(MPSModelRunner, OmniGenerationModelRunner):

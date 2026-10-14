@@ -25,7 +25,7 @@ Save generated speech to a WAV file:
 ```bash
 curl http://127.0.0.1:8091/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"input":"Hello, have a wonderful day.","voice":"Ryan","language":"English","response_format":"wav","seed":171}' \
+  -d '{"input":"Hello, have a wonderful day.","voice":"Ryan","language":"English","response_format":"wav"}' \
   --output speech.wav
 ```
 
@@ -34,4 +34,5 @@ For streaming audio, add `"stream": true`, `"stream_format": "audio"`, and
 [Omni Speech API](https://docs.vllm.ai/projects/vllm-omni/en/latest/serving/speech_api/)
 for request formats and examples.
 
-Quantized models and distributed serving are not supported.
+This preview uses greedy decoding for both the talker and code predictor.
+Random sampling, quantized models, and distributed serving are not supported.

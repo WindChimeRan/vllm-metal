@@ -31,6 +31,18 @@ For speech generation, see [Qwen3-TTS on Apple Silicon](qwen3-tts-mps.md).
   Continuous batching and duplex are requirements for the corresponding serving
   features, not optional follow-ups to a single-request implementation.
 
+## Adding Omni models
+
+- Keep model definitions, weight loading, audio processing, and cache algorithms
+  in vllm-omni. Reuse its worker and runner interfaces through `omni.py`.
+- Put model deployment defaults in Omni's `deploy/<model>.yaml` under
+  `platforms: mps`; keep `omni_platform.py` limited to platform capabilities.
+- Put model-family operator registrations in `pytorch_backend/models/`.
+  Follow `qwen3_code_predictor.py`: a small `install()` function, upstream
+  `register_oot` hooks, and shared MPS operations. Register before model loading.
+- Add a shared helper only when another model needs the same behavior. Validate
+  matching-checkpoint parity and real serving at batch sizes 1, 4, and 8.
+
 ## Kernels: choose the existing integration point
 
 Choose the implementation and its upstream hook separately. Our RMSNorm provider

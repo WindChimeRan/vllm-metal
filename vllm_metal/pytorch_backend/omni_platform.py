@@ -27,21 +27,6 @@ class MPSOmniPlatform(OmniPlatform, MetalPlatform):
         return "vllm_omni/deploy"
 
     @classmethod
-    def update_default_deploy_config(cls, model_type, deploy):
-        if model_type != "qwen3_tts":
-            return
-        for stage in deploy.stages:
-            stage.enforce_eager = True
-            stage.async_scheduling = False
-            stage.max_num_seqs = 8
-            if stage.stage_id == 0:
-                stage.engine_extras["dtype"] = "bfloat16"
-                stage.engine_extras.setdefault("additional_config", {})[
-                    "code_predictor_kv_cache"
-                ] = "eager"
-                stage.engine_extras["kv_cache_memory_bytes"] = 512 * 1024 * 1024
-
-    @classmethod
     def get_shared_memory_connector_cls(cls):
         from vllm_metal.pytorch_backend.omni_connector import MetalSharedMemoryConnector
 

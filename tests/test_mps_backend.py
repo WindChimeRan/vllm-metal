@@ -175,35 +175,10 @@ def test_mrope_positions_preserve_ragged_prefill_and_decode():
     ]
 
 
-def test_omni_sampling_seed_survives_batch_reordering():
-    from vllm_metal.pytorch_backend.omni_sampling import gumbel_sample
-
-    logits = torch.randn(3, 1024, device="mps")
-    mapping = torch.tensor([3, 1, 0], device="mps")
-    temperatures = torch.tensor([0.9, 0.9, 0.9, 0.9], device="mps")
-    seeds = torch.tensor([12, 34, 56, 78], device="mps")
-    positions = torch.tensor([27, 13, 42], device="mps")
-    actual = gumbel_sample(logits, mapping, temperatures, seeds, positions, True, False)
-    reordered = gumbel_sample(
-        logits.flip(0),
-        mapping.flip(0),
-        temperatures,
-        seeds,
-        positions.flip(0),
-        True,
-        False,
-    )
-    single = gumbel_sample(
-        logits[1:2], mapping[1:2], temperatures, seeds, positions[1:2], True, False
-    )
-    assert torch.equal(actual.cpu(), reordered.flip(0).cpu())
-    assert torch.equal(actual[1:2].cpu(), single.cpu())
-
-
 def test_omni_repetition_penalty_matches_upstream_torch():
     from vllm.model_executor.layers.utils import apply_penalties as reference
 
-    from vllm_metal.pytorch_backend.omni_sampling import apply_penalties, bincount
+    from vllm_metal.pytorch_backend.omni_logits import apply_penalties, bincount
 
     logits = torch.tensor([[2.0, -3.0, 4.0, -5.0], [-1.0, 2.0, -3.0, 4.0]])
     prompts = torch.tensor([[0, 1], [2, 3]])
@@ -233,31 +208,6 @@ def test_omni_repetition_penalty_matches_upstream_torch():
         counts,
     )
     torch.testing.assert_close(actual.cpu(), expected)
-
-
-@pytest.mark.parametrize("position,blocked", [(3, True), (4, False)])
-def test_omni_min_tokens_suppresses_eos_until_boundary(position, blocked):
-    from vllm_metal.pytorch_backend.omni_sampling import apply_min_tokens
-
-    logits = torch.tensor([[1.0, 2.0, 3.0]], device="mps")
-    zero = torch.tensor([0], device="mps", dtype=torch.int32)
-    empty_ids = torch.zeros(1, 1, device="mps", dtype=torch.int32)
-    apply_min_tokens(
-        logits,
-        zero,
-        torch.tensor([position], device="mps"),
-        zero,
-        empty_ids,
-        zero,
-        empty_ids,
-        torch.zeros(1, 1, device="mps"),
-        torch.tensor([5], device="mps"),
-        torch.tensor([1], device="mps"),
-        zero.bool(),
-        torch.tensor([[2]], device="mps"),
-    )
-    assert bool(torch.isneginf(logits[0, 2]).cpu()) == blocked
-    assert logits[0, :2].cpu().tolist() == [1.0, 2.0]
 
 
 def test_omni_pageable_output_copy_owns_cpu_storage():

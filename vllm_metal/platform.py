@@ -333,12 +333,6 @@ class MetalPlatform(Platform):
         if not isinstance(params, SamplingParams):
             return
 
-        if envs.VLLM_METAL_BACKEND == "mps" and cls._serves_omni:
-            from vllm_metal.pytorch_backend.omni_sampling import validate_request
-
-            validate_request(params)
-            return
-
         unsupported_controls = [
             name
             for name, enabled in (
@@ -354,7 +348,10 @@ class MetalPlatform(Platform):
                     ("temperature", params.temperature != 0),
                     ("presence_penalty", params.presence_penalty != 0),
                     ("frequency_penalty", params.frequency_penalty != 0),
-                    ("repetition_penalty", params.repetition_penalty != 1),
+                    (
+                        "repetition_penalty",
+                        params.repetition_penalty != 1 and not cls._serves_omni,
+                    ),
                     ("allowed_token_ids", bool(params.allowed_token_ids)),
                     ("bad_words", bool(params.bad_words)),
                 )

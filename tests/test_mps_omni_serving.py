@@ -91,7 +91,6 @@ def speech_request(index):
         "task_type": "CustomVoice",
         "voice": "Ryan",
         "language": "English",
-        "seed": 171 + index,
         "max_new_tokens": 128,
         "response_format": "pcm",
         "stream": True,
@@ -125,3 +124,17 @@ async def test_upstream_speech_streams_complete_across_batches(
             assert events[-1] == "speech.audio.done"
 
         await asyncio.gather(*(generate(index) for index in range(concurrency)))
+
+
+async def test_speech_rejects_random_sampling(speech_server):
+    request = speech_request(0)
+    request["extra_params"] = {"temperature": 0.9}
+    async with httpx.AsyncClient(timeout=30, trust_env=False) as client:
+        response = await client.post(f"{speech_server}/v1/audio/speech", json=request)
+    events = [
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    ]
+    assert [event["type"] for event in events] == ["speech.audio.error"]
+    assert "temperature" in events[0]["error"]["message"]
