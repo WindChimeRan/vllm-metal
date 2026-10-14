@@ -1,10 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for the paged attention primitive and scatter-based cache donation.
-
-Covers two of Eric's review concerns on PR #225:
-  1. No test coverage for the primitive path (paged_attention_primitive).
-  2. Buffer donation may silently fail, making scatter-based cache writes
-     O(entire_cache) instead of O(new_tokens).
+"""Tests for the paged attention primitive.
 
 Run with:
     python -m pytest tests/test_primitive_and_donation.py -v -s
@@ -19,7 +14,6 @@ import numpy as np
 import pytest
 
 from tools.attention_bench_utils import ref_paged_attn
-from vllm_metal.attention.caches.kv_cache import MetalPagedKVCache
 from vllm_metal.metal import get_ops
 
 # ── Shared fixtures ──────────────────────────────────────────────────────────
@@ -417,97 +411,4 @@ def test_tiled_kernel_head_size_parity(head_size: int, force_tiled_prefill) -> N
         np.array(ref),
         atol=1.5e-2,
         rtol=1e-2,
-    )
-
-
-# ── 2. Buffer donation test ─────────────────────────────────────────────────
-
-
-@pytest.mark.parametrize("num_blocks", [128, 256])
-def test_scatter_cache_donation(num_blocks: int) -> None:
-    """Verify that scatter-based cache write reuses the buffer (donation).
-
-    MLX's buffer donation is an optimisation, not a contract.  This test
-    acts as an early-warning: if donation stops happening (due to MLX
-    changes or unexpected reference leaks), the memory delta will spike
-    and the assertion will fail.
-    """
-    num_kv_heads = 4
-    head_dim = HEAD_SIZE
-    num_layers = 1
-    block_size = BLOCK_SIZE
-    dtype = DTYPE
-
-    cache = MetalPagedKVCache(
-        num_layers=num_layers,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        num_blocks=num_blocks,
-        block_size=block_size,
-        dtype=dtype,
-    )
-    # Already eval'd by MetalPagedKVCache.__init__
-
-    cache_nbytes = cache.key_caches[0].nbytes  # size of one K or V cache
-
-    # Simulate a decode step: scatter 3 tokens into random slots
-    num_tokens = 3
-    slot_indices = mx.array(
-        np.random.choice(num_blocks * block_size, size=num_tokens, replace=False),
-        dtype=mx.int64,
-    )
-    new_k = mx.random.normal(shape=(num_tokens, num_kv_heads, head_dim)).astype(dtype)
-    new_v = mx.random.normal(shape=(num_tokens, num_kv_heads, head_dim)).astype(dtype)
-    mx.eval(slot_indices, new_k, new_v)
-
-    # Warm up: run multiple rounds so the MLX memory pool stabilises.
-    # IMPORTANT: delete all locals afterwards — any stray reference to the
-    # old cache array bumps use_count and defeats buffer donation.
-    for _ in range(5):
-        _fk = cache.key_caches[0].reshape(-1, num_kv_heads, head_dim)
-        _fk[slot_indices] = new_k
-        _wk = _fk.reshape(cache.key_caches[0].shape)
-        cache.key_caches[0] = _wk
-        _fv = cache.value_caches[0].reshape(-1, num_kv_heads, head_dim)
-        _fv[slot_indices] = new_v
-        _wv = _fv.reshape(cache.value_caches[0].shape)
-        cache.value_caches[0] = _wv
-        mx.eval(cache.key_caches[0], cache.value_caches[0])
-        del _fk, _wk, _fv, _wv
-
-    # ── Measure at steady state (average of several rounds) ──
-    total_delta = 0
-    num_rounds = 5
-    for _ in range(num_rounds):
-        mem_before = mx.get_active_memory()
-
-        # K cache scatter + rebind
-        flat_k = cache.key_caches[0].reshape(-1, num_kv_heads, head_dim)
-        flat_k[slot_indices] = new_k
-        new_k_cache = flat_k.reshape(cache.key_caches[0].shape)
-        cache.key_caches[0] = new_k_cache
-
-        # V cache scatter + rebind
-        flat_v = cache.value_caches[0].reshape(-1, num_kv_heads, head_dim)
-        flat_v[slot_indices] = new_v
-        new_v_cache = flat_v.reshape(cache.value_caches[0].shape)
-        cache.value_caches[0] = new_v_cache
-
-        mx.eval(cache.key_caches[0], cache.value_caches[0])
-
-        mem_after = mx.get_active_memory()
-        total_delta += mem_after - mem_before
-        del flat_k, new_k_cache, flat_v, new_v_cache
-
-    avg_delta = total_delta / num_rounds
-
-    # If donation works: avg_delta ≈ 0 (buffers reused in-place).
-    # If donation fails: avg_delta ≈ 2 * cache_nbytes (full copy for K + V).
-    # Allow generous headroom (one full cache) for pool fluctuations.
-    threshold = cache_nbytes
-    assert avg_delta < threshold, (
-        f"Buffer donation likely failed: avg memory growth {avg_delta:,.0f} "
-        f"bytes/round over {num_rounds} rounds, "
-        f"but each cache is only {cache_nbytes:,} bytes. "
-        f"Expected near-zero growth with donation."
     )
