@@ -2,14 +2,12 @@
 
 Generate speech with the optional vLLM-Omni integration.
 
-> **Development preview:** This draft requires the paired vllm-omni checkout.
-> The published dependency alone is not sufficient yet.
+> **Development preview:** The optional dependency installs a compatible Omni preview.
 
 After the [development setup](CONTRIBUTING.md#development-setup), install:
 
 ```bash
 VLLM_OMNI_TARGET_DEVICE=cpu uv pip install -e '.[omni]' 'torch==2.13.0'
-VLLM_OMNI_TARGET_DEVICE=cpu uv pip install --no-deps -e ../vllm-omni
 ```
 
 Start the server:

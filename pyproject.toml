@@ -69,7 +69,8 @@ dependencies = [
 
 [project.optional-dependencies]
 omni = [
-    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni@2d9909525a8a805ed9c3a56a5287a48687654270",
+    # Preview of Omni PRs #8943, #8946 and #8949; use upstream once merged.
+    "vllm-omni @ git+https://github.com/WindChimeRan/vllm-omni@4bb27684864c2989a8db0c8e3f212a16f20f2357",
 ]
 gguf = [
     # Local GGUF model loading. Keep aligned with upstream vLLM's lower bound
