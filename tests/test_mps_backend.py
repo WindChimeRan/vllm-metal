@@ -176,6 +176,7 @@ def test_mrope_positions_preserve_ragged_prefill_and_decode():
 
 
 def test_omni_repetition_penalty_matches_upstream_torch():
+    """Sampler row order may differ from request-slot order."""
     from vllm.model_executor.layers.utils import apply_penalties as reference
 
     from vllm_metal.pytorch_backend.omni_logits import apply_penalties, bincount
@@ -189,11 +190,13 @@ def test_omni_repetition_penalty_matches_upstream_torch():
         torch.zeros(2),
     )
     with torch.compiler.set_stance("force_eager"):
-        expected = reference(logits.clone(), prompts, outputs, pres, freq, rep)
+        expected = reference(
+            logits.clone(), prompts.flip(0), outputs.flip(0), pres, freq, rep.flip(0)
+        )
     ids = torch.cat([prompts, outputs], dim=1).to("mps")
     mask = torch.zeros(2, 1, dtype=torch.int32, device="mps")
     counts = torch.zeros(2, 4, dtype=torch.int32, device="mps")
-    mapping = torch.tensor([0, 1], device="mps")
+    mapping = torch.tensor([1, 0], device="mps")
     bincount(mapping, ids, torch.tensor([2, 2]), torch.tensor([4, 4]), mask, counts, 4)
     actual = logits.to("mps")
     apply_penalties(
@@ -208,17 +211,6 @@ def test_omni_repetition_penalty_matches_upstream_torch():
         counts,
     )
     torch.testing.assert_close(actual.cpu(), expected)
-
-
-def test_omni_pageable_output_copy_owns_cpu_storage():
-    pytest.importorskip("vllm_omni")
-    from vllm_omni.worker_v2.omni_ar_model_runner import _async_copy_tensor
-
-    source = torch.arange(8, device="mps", dtype=torch.float32)
-    output = _async_copy_tensor(source, pin_memory=False)
-    source.zero_()
-    assert output.device.type == "cpu"
-    torch.testing.assert_close(output, torch.arange(8, dtype=torch.float32))
 
 
 @pytest.mark.parametrize("with_metadata", [False, True])

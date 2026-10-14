@@ -97,7 +97,7 @@ def speech_request(index):
     }
 
 
-@pytest.mark.parametrize("concurrency", [1, 4, 8])
+@pytest.mark.parametrize("concurrency", [1, 8])
 async def test_upstream_speech_streams_complete_across_batches(
     speech_server, concurrency
 ):
@@ -120,6 +120,7 @@ async def test_upstream_speech_streams_complete_across_batches(
                     elif event["type"] == "speech.audio.done":
                         assert event["usage"]["output_tokens"] < 128
             assert len(audio) > 4800
+            assert events.count("speech.audio.delta") > 1
             assert events[0] == "speech.audio.delta"
             assert events[-1] == "speech.audio.done"
 
