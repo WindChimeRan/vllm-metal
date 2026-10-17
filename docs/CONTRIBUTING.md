@@ -74,3 +74,9 @@ Open a pull request against `main` in `vllm-project/vllm-metal`.
 uv pip install -r docs/requirements-docs.txt
 mkdocs serve
 ```
+
+The Mac-memory guide reads `recipes/overlays/` using the
+[upstream recipe format](https://github.com/vllm-project/recipes/blob/main/SCHEMA.md).
+Edit `recipes/featured.yaml` to select and order model variants. Each selected
+variant carries its launch flags and guide text; building the docs needs no
+upstream checkout or network access.

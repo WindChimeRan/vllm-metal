@@ -1,0 +1,44 @@
+meta:
+  date_updated: "2026-10-17"
+  hardware:
+    apple_32gb: supported
+    apple_64gb: supported
+
+variants:
+  mlx_int4:
+    label: MLX 4-bit
+    model_id: mlx-community/Qwen3.5-27B-4bit
+    description: |-
+      Qwen3.5-27B, a larger model, with room for a conversation of about 24,000
+      words.
+    precision: int4
+    # ceil(16,054,266,848 checkpoint bytes / 1e9 * 1.2), not a serving budget.
+    vram_minimum_gb: 20
+    supported_hardware: [apple_32gb, apple_64gb]
+    min_vllm_version: "0.31.0"
+    install:
+      pip:
+        note: Requires Apple Silicon and macOS 15 or later. Install vLLM Metal.
+        command: |
+          curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash
+          source ~/.venv-vllm-metal/bin/activate
+      docker: false
+    supported_frontends: [python]
+    supported_features: []
+    base_args:
+      - --host
+      - "127.0.0.1"
+      - --max-model-len
+      - "32768"
+      - --max-num-batched-tokens
+      - "1024"
+      - --enable-auto-tool-choice
+      - --tool-call-parser
+      - qwen3_coder
+      - --reasoning-parser
+      - qwen3
+    guide: |
+      - The first run downloads 16 GB.
+      - It is slow to read long text. For faster replies, use the 16 GB recipe.
+      - `--max-num-batched-tokens 1024` reads long text in smaller steps, so the
+        model needs less memory. Without it this model does not fit on 32 GB.

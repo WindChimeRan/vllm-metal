@@ -60,6 +60,9 @@ markdown_extensions:
 plugins:
   - search
 
+hooks:
+  - tools/recipe_docs.py
+
 nav:
   - Home: index.md
   - Getting Started:
