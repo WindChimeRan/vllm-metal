@@ -417,22 +417,6 @@ def test_marker_config_survives_pickle() -> None:
     assert restored.get_name() == "gguf"
 
 
-def test_loader_import_without_gguf_names_the_extra(monkeypatch) -> None:
-    """The loader gives an actionable hint if its dependency is missing."""
-    monkeypatch.setitem(sys.modules, "gguf", None)
-    monkeypatch.delitem(sys.modules, "vllm_metal.gguf.loader", raising=False)
-    monkeypatch.delitem(sys.modules, "vllm_metal.gguf.mlx_native", raising=False)
-    monkeypatch.delitem(sys.modules, "vllm_metal.gguf.adapter", raising=False)
-    monkeypatch.delitem(sys.modules, "vllm_metal.gguf.wrappers", raising=False)
-
-    with pytest.raises(ImportError) as exc_info:
-        import vllm_metal.gguf.loader  # noqa: F401
-    assert str(exc_info.value) == (
-        "GGUF support requires the 'gguf' dependency. "
-        "Install it with: pip install 'vllm-metal[gguf]'"
-    )
-
-
 def test_probe_preserves_positional_speculative_config(gguf_file) -> None:
     # The wrap mirrors the upstream signature exactly, so a positionally
     # passed speculative config must round-trip (the official plugin's

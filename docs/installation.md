@@ -2,7 +2,6 @@
 
 Requires Apple Silicon and macOS 15 or later. Both methods install Python 3.12,
 vLLM core, and prebuilt vllm-metal wheels. No compiler is needed.
-GGUF and speech-to-text dependencies are included.
 For an editable checkout, see [Contributing](CONTRIBUTING.md#development-setup).
 
 ## Homebrew

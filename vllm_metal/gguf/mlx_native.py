@@ -25,14 +25,7 @@ from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
-
-try:
-    from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "GGUF support requires the 'gguf' dependency. "
-        "Install it with: pip install 'vllm-metal[gguf]'"
-    ) from exc
+from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
 
 # qtypes that repack into MLX's affine representation, with their bit widths.
 _BITS: dict[GGMLQuantizationType, int] = {

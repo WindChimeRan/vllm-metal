@@ -9,18 +9,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, cast
 
-from huggingface_hub import snapshot_download
-
-try:
-    import gguf
-except ImportError as exc:
-    raise ImportError(
-        "GGUF support requires the 'gguf' dependency. "
-        "Install it with: pip install 'vllm-metal[gguf]'"
-    ) from exc
+import gguf
 import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
+from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
 from mlx_lm.utils import load_config, load_model, load_tokenizer
 

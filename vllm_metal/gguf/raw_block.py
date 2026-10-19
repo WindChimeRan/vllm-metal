@@ -38,14 +38,7 @@ from typing import Any
 
 import mlx.core as mx
 import numpy as np
-
-try:
-    from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "GGUF support requires the 'gguf' dependency. "
-        "Install it with: pip install 'vllm-metal[gguf]'"
-    ) from exc
+from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
 
 # qtypes executed from raw GGUF block bytes by the kernels below (#761).
 _RAW_KERNEL_BITS: dict[GGMLQuantizationType, int] = {

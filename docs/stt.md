@@ -2,21 +2,6 @@
 
 vllm-metal supports OpenAI-compatible Speech-to-Text using Whisper and Qwen3-ASR models, running natively on Apple Silicon via MLX.
 
-## Installation
-
-STT dependencies are included in the [standard installation](installation.md).
-
-### ffmpeg (Optional)
-
-ffmpeg is only needed for non-WAV audio formats (mp3, m4a, flac, etc.):
-
-```bash
-# macOS
-brew install ffmpeg
-
-# Not required for WAV files - librosa handles those directly
-```
-
 ## Quick Start
 
 ```bash
@@ -27,6 +12,8 @@ vllm serve openai/whisper-small --port 8000
 curl -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@recording.wav"
 ```
+
+Some audio formats require FFmpeg (`brew install ffmpeg`).
 
 ## Supported Models
 
