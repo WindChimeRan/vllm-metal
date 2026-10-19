@@ -1177,11 +1177,10 @@ class TestModelLifecycle:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A non-GGUF model (``quantization != "gguf"``) is never routed to the
-        GGUF owner, and the optional ``gguf`` package is never imported.
+        GGUF owner, and the ``gguf`` package is never imported.
 
         Tripwire: block the ``gguf`` package itself (``sys.modules[...] = None``
-        raises on import). A clean generic load proves a default install with no
-        gguf extra is unaffected by the lazy owner import.
+        raises on import). A generic load must leave the GGUF owner unimported.
         """
         fake_model = SimpleNamespace(config=_text_config())
         fake_tokenizer = object()

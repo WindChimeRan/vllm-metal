@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Experimental GGUF support for vllm-metal (MLX-native quantized execution).
 
-Re-exports are lazy: ``vllm_metal.gguf.vllm_integration`` is imported by every
-vLLM run through the ``vllm.general_plugins`` entry point, and a default
-install (no ``gguf`` extra) must not pull the loader's optional ``gguf``
-dependency on that path.
+Re-exports are lazy so the ``vllm.general_plugins`` entry point does not load
+GGUF parsing code for other model formats.
 """
 
 from typing import Any

@@ -41,9 +41,9 @@ import numpy as np
 
 try:
     from gguf import GGML_QUANT_SIZES, GGMLQuantizationType
-except ImportError as exc:  # pragma: no cover - exercised only without the extra
+except ImportError as exc:  # pragma: no cover
     raise ImportError(
-        "GGUF support requires the optional 'gguf' dependency. "
+        "GGUF support requires the 'gguf' dependency. "
         "Install it with: pip install 'vllm-metal[gguf]'"
     ) from exc
 

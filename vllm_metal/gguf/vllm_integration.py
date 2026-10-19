@@ -16,8 +16,7 @@ plugin's own mechanism), which vLLM loads in ``EngineArgs.__post_init__`` and
 again inside the EngineCore/worker subprocesses, so the registration is
 spawn-safe without import-time patching.
 
-This module must stay importable WITHOUT the optional ``gguf`` package: a
-default install loads it on every vLLM run via the entry point.
+Keep GGUF parsing imports lazy: the entry point loads on every vLLM run.
 
 # SCAFFOLDING: remove when vllm-project/vllm-gguf-plugin installs and imports
 # on macOS; then depend on it for this layer (register() already no-ops when
@@ -156,7 +155,7 @@ class GGUFEngineIntegration:
         """Whether ``model`` reads as the plugin's ``repo_id:quant`` syntax.
 
         Mirrors the official plugin's public ``is_remote_gguf`` at the shape
-        level while keeping the optional ``gguf`` package out of this module.
+        level while keeping the ``gguf`` package out of this module.
         """
         return model is not None and RemoteGGUFReference.parse(model) is not None
 

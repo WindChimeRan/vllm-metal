@@ -47,6 +47,10 @@ dependencies = [
     "transformers>=5.10.4,<5.18.0",
     "accelerate>=0.26.0",
     "safetensors>=0.4.0",
+    "gguf>=0.17.0",
+    # Speech-to-text audio processing.
+    "librosa>=0.10.2",
+    "numba>=0.59.0",
     # Imported directly (model download/cache paths); keep aligned with vLLM
     # 0.31.0's lower bound rather than relying on vLLM's transitive install.
     # Unbounded like upstream's own form: vLLM's requirements/common.txt pins
@@ -68,25 +72,17 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gguf = [
-    # Local GGUF model loading. Keep aligned with upstream vLLM's lower bound
-    # unless a Metal-specific path needs a newer API.
-    "gguf>=0.17.0",
-]
-stt = [
-    # Speech-to-text audio processing (Whisper models)
-    "librosa>=0.10.2",
-    "numba>=0.59.0",  # Required by librosa on Python 3.12+
-]
+# Compatibility aliases: GGUF and STT dependencies are included by default.
+gguf = []
+stt = []
 dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=0.21.0",
     "ruff==0.16.0",
     "mypy>=1.19.1",
-    "gguf>=0.17.0",
 ]
 all = [
-    "vllm-metal[gguf,stt,dev]",
+    "vllm-metal[dev]",
 ]
 
 [project.urls]
@@ -101,7 +97,7 @@ metal = "vllm_metal:register"
 # GGUF engine integration (vLLM 0.24 moved in-tree GGUF support to the
 # CUDA/ROCm-only vllm-gguf-plugin; this restores the Metal-consumable layer).
 # Loaded by vLLM in EngineArgs.__post_init__ and in the EngineCore/worker
-# subprocesses; the target module stays importable without the `gguf` extra.
+# subprocesses; GGUF loading stays lazy for other model formats.
 [project.entry-points."vllm.general_plugins"]
 gguf_metal = "vllm_metal.gguf.vllm_integration:register"
 

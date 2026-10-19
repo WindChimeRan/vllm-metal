@@ -15,7 +15,7 @@ try:
     import gguf
 except ImportError as exc:
     raise ImportError(
-        "GGUF support requires the optional 'gguf' dependency. "
+        "GGUF support requires the 'gguf' dependency. "
         "Install it with: pip install 'vllm-metal[gguf]'"
     ) from exc
 import mlx.core as mx

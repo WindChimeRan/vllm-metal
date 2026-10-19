@@ -394,10 +394,7 @@ def test_register_is_idempotent() -> None:
 
 
 def test_integration_imports_without_gguf_package(monkeypatch) -> None:
-    """Default-install tripwire: the entry-point module must import and
-    register with the optional ``gguf`` package absent (vLLM loads it on every
-    run).
-    """
+    """The entry point must register without eagerly importing GGUF parsing."""
     monkeypatch.setitem(sys.modules, "gguf", None)
     monkeypatch.delitem(sys.modules, "vllm_metal.gguf.vllm_integration", raising=False)
     monkeypatch.delitem(sys.modules, "vllm_metal.gguf.source", raising=False)
@@ -421,9 +418,7 @@ def test_marker_config_survives_pickle() -> None:
 
 
 def test_loader_import_without_gguf_names_the_extra(monkeypatch) -> None:
-    """The optional-dep owner gives an actionable hint when the extra is
-    missing (0.24 dropped ``gguf`` from vLLM's own dependencies).
-    """
+    """The loader gives an actionable hint if its dependency is missing."""
     monkeypatch.setitem(sys.modules, "gguf", None)
     monkeypatch.delitem(sys.modules, "vllm_metal.gguf.loader", raising=False)
     monkeypatch.delitem(sys.modules, "vllm_metal.gguf.mlx_native", raising=False)
@@ -433,7 +428,7 @@ def test_loader_import_without_gguf_names_the_extra(monkeypatch) -> None:
     with pytest.raises(ImportError) as exc_info:
         import vllm_metal.gguf.loader  # noqa: F401
     assert str(exc_info.value) == (
-        "GGUF support requires the optional 'gguf' dependency. "
+        "GGUF support requires the 'gguf' dependency. "
         "Install it with: pip install 'vllm-metal[gguf]'"
     )
 
