@@ -14,6 +14,7 @@ vLLM Metal is a plugin that enables vLLM to run on Apple Silicon Macs using MLX 
 ---
 *Latest News* 🔥
 
+- [2026/10] DiffusionGemma now supports Jev-like System 1 decisions on Metal, with median decision latency under 0.2 s on an M5 Pro (`samples: 1`, concurrency 1). See the [structured decisions guide](docs/structured_decisions.md).
 - [2026/10] Sleep mode releases KV cache memory while keeping model weights loaded. Read [Abhigith Neil Abraham's walkthrough](https://abneil.dev/blog/sleep-mode-on-a-mac-with-kv-offloading.html).
 - [2026/10] Run local models with vLLM Metal through [llmman](https://github.com/llmmanorg/llmman). See the [setup recipe](docs/recipes.md#or-with-llmman).
 - [2026/09] [SiliconBench](https://arxiv.org/abs/2609.19169), which evaluates vLLM Metal and other serving engines on speed, memory use, and output fidelity, was accepted at [NeurIPS 2026's Evaluations and Datasets Track](https://neurips.cc/virtual/2026/poster/139658).
