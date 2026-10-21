@@ -18,3 +18,20 @@ jobs:
       - uses: actions/labeler@v7.0.0
         with:
           sync-labels: false
+      - name: Label small PRs
+        uses: actions/github-script@v9.0.0
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo,
+              pull_number: context.issue.number,
+            });
+            const label = 'size/small';
+            const small = pr.additions + pr.deletions <= 50;
+            const labeled = pr.labels.some(({ name }) => name === label);
+            const issue = { ...context.repo, issue_number: pr.number };
+            if (small && !labeled) {
+              await github.rest.issues.addLabels({ ...issue, labels: [label] });
+            } else if (!small && labeled) {
+              await github.rest.issues.removeLabel({ ...issue, name: label });
+            }
