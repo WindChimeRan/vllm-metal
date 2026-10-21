@@ -1,0 +1,47 @@
+ci/build:
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+          - 'scripts/**'
+          - 'Formula/**'
+          - 'pyproject.toml'
+          - 'setup.py'
+          - 'install.sh'
+          - 'vllm_metal/metal/build.py'
+
+kernel:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'vllm_metal/attention/impls/**'
+          - 'vllm_metal/metal/**/*.{metal,cpp,h}'
+
+speculative-decoding:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'vllm_metal/v1/{dflash,dspark,block_draft,draft_}*.py'
+          - 'vllm_metal/v1/*proposer.py'
+          - 'vllm_metal/v1/spec_decode.py'
+          - 'vllm_metal/spec_decode/**'
+          - 'tools/{dflash,dspark,spec_decode,speculative,ngram}*.py'
+          - 'docs/{dflash,dspark,speculative_decoding}.md'
+
+kv-cache:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'vllm_metal/attention/caches/**'
+          - 'vllm_metal/v1/cache_policy.py'
+          - 'vllm_metal/v1/kv_offload/**'
+          - 'docs/kv_offloading.md'
+
+gguf:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'vllm_metal/gguf/**'
+          - 'tools/gguf_*.py'
+          - 'docs/gguf.md'
+
+pytorch-mps:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'vllm_metal/pytorch_backend/**'
+          - 'docs/pytorch-mps.md'
