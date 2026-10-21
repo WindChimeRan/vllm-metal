@@ -2,8 +2,7 @@
 """Temporary Torch replacements for vLLM 0.32 MRv2 input/state kernels on MPS.
 
 Upstream launches Triton kernels without a Torch fallback at these entry points.
-These implementations cover the supported non-speculative path. Replace the
-private bindings in install() as upstream kernel/component hooks become usable
+Replace the private bindings in install() as upstream kernel/component hooks become usable
 (vllm-project/vllm#43048 and #51212). Registration alone does not remove these
 implementations; prefer shared device-neutral fallbacks when they are available.
 """
@@ -108,7 +107,7 @@ def post_update(
     active = valid & (count > 0)
     old_total = total[slots].long()
     ids = tokens.gather(1, (count.long() - 1).clamp_min(0)[:, None]).flatten()
-    # A request has at most one row in the ordinary decode batch.
+    # Each request occupies one output row.
     last[slots, 0] = torch.where(active, ids, last[slots, 0])
     for i in range(tokens.shape[1]):
         write_pos = (old_total + i).clamp_max(all_ids.shape[1] - 1)
@@ -194,7 +193,7 @@ def preprocess_state(self, input_batch, block_tables, kv_cache_config, computed)
 
 
 def postprocess_state(self, idx_mapping, num_sampled, num_computed_tokens=None):
-    # Speculation is rejected at configuration time. The upstream state starts
+    # Hybrid speculation is rejected at configuration time. Upstream starts
     # with the neutral acceptance count (1), including unsampled prefill steps.
     pass
 

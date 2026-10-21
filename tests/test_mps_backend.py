@@ -24,7 +24,8 @@ def state():
 
 
 @pytest.mark.parametrize("num_groups", [1, 2])
-def test_request_slots_and_removed_request_writeback(state, num_groups):
+@pytest.mark.parametrize("num_sampled", [1, 3])
+def test_request_slots_and_removed_request_writeback(state, num_groups, num_sampled):
     tables = BlockTables(
         [16] * num_groups,
         4,
@@ -58,22 +59,25 @@ def test_request_slots_and_removed_request_writeback(state, num_groups):
     state.num_computed_tokens.gpu[0] = 17
     state.total_len.gpu[0] = 18
     state.last_sampled_tokens[0, 0] = 40
+    sampled_ids = list(range(41, 41 + num_sampled))
     post_update(
         torch.tensor([0, -1], dtype=torch.int32, device="mps"),
         state.num_computed_tokens.gpu,
         state.last_sampled_tokens,
         None,
-        torch.tensor([[41], [999]], device="mps"),
-        torch.ones(2, dtype=torch.int32, device="mps"),
+        torch.tensor([sampled_ids, [999] * num_sampled], device="mps"),
+        torch.full((2,), num_sampled, dtype=torch.int32, device="mps"),
         torch.zeros(2, dtype=torch.int32, device="mps"),
-        torch.tensor([0, 1, 2], dtype=torch.int32, device="mps"),
+        torch.tensor(
+            [0, num_sampled, 2 * num_sampled], dtype=torch.int32, device="mps"
+        ),
         state.all_token_ids.gpu,
         state.total_len.gpu,
     )
-    assert state.last_sampled_tokens[0, 0].item() == 41
-    assert state.all_token_ids.gpu[0, 18].item() == 41
-    assert state.total_len.gpu[0].item() == 19
-    assert state.num_computed_tokens.gpu[0].item() == 18
+    assert state.last_sampled_tokens[0, 0].item() == sampled_ids[-1]
+    assert state.all_token_ids.gpu[0, 18 : 18 + num_sampled].tolist() == sampled_ids
+    assert state.total_len.gpu[0].item() == 18 + num_sampled
+    assert state.num_computed_tokens.gpu[0].item() == 17 + num_sampled
 
 
 @pytest.mark.parametrize(
