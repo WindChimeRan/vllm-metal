@@ -61,6 +61,6 @@ Measure speed separately with the [DSpark serving benchmark](https://github.com/
 
 Parity runs daily at 07:17 UTC on `main`. Users with repository write access can also comment `/ci parity` on an open PR once the workflow is on the default branch.
 
-Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on macOS 15 and 26 with Xcode 26.3: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
+Both triggers invoke this same tool for Qwen3-0.6B and Qwen3.5-0.8B on a self-hosted Apple Silicon Mac: 40 shared prompts, 20 output tokens, top-K 5, and HTTP request batch sizes 1/2. CI supplies the checkpoint and environment and collects the tool's results.
 
 The `Parity` check links to job summaries and artifacts containing the native reference, server log, and per-batch results, retained for 14 days. Regular PR CI runs fast tests without starting model servers.
