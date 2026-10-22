@@ -26,7 +26,7 @@ Use a matching EAGLE3 draft with a dense FP16/BF16 text target and greedy reques
 ```bash
 VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
   vllm serve Qwen/Qwen3-8B --dtype bfloat16 \
-  --speculative-config '{"method":"eagle3","model":"RedHatAI/Qwen3-8B-speculator.eagle3","num_speculative_tokens":1,"use_local_argmax_reduction":true}'
+  --speculative-config '{"method":"eagle3","model":"RedHatAI/Qwen3-8B-speculator.eagle3","num_speculative_tokens":3,"use_local_argmax_reduction":true}'
 ```
 
 Output logprobs are supported. Parallel drafting, probabilistic sampling, and
