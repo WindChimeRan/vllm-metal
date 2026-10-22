@@ -255,18 +255,25 @@ def test_rope_matches_upstream(dtype, rows, heads, kv_heads, head_size, gapped_h
 @pytest.mark.parametrize("logprobs", [None, 5])
 @pytest.mark.parametrize("chunk_rows", [4, 1024])
 def test_speculative_verification_preserves_ragged_requests(
-    state, monkeypatch, logprobs, chunk_rows
+    run_in_spawn_process, monkeypatch, logprobs, chunk_rows
 ):
-    """Exercise upstream gather, verification and logprobs with reordered slots."""
+    """Verify fixed logits in a fresh worker, before other kernels are loaded."""
+    monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
+    monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
+    run_in_spawn_process(_check_speculative_verification, logprobs, chunk_rows)
+
+
+def _check_speculative_verification(logprobs, chunk_rows):
     from vllm.sampling_params import SamplingParams
     from vllm.v1.worker.gpu.sample.sampler import Sampler
     from vllm.v1.worker.gpu.spec_decode import rejection_sampler
 
     from vllm_metal.platform import MetalPlatform
 
-    monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
     MetalPlatform.register_triton_kernel_overrides()
-    monkeypatch.setattr(rejection_sampler, "get_max_chunk_logits", lambda _: chunk_rows)
+    install()
+    state = RequestState(4, 64, 16, 0, 64, torch.device("mps"))
+    rejection_sampler.get_max_chunk_logits = lambda _: chunk_rows
     sampler = Sampler(
         SimpleNamespace(reasoning_config=None), 4, 64, torch.device("mps"), state
     )
