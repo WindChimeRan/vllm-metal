@@ -18,7 +18,7 @@ vllm-metal validates these variables when the engine configuration is created an
 | `VLLM_METAL_GDN_LAZY_KERNELS` | `1` | Enable lazy GDN kernels for eligible hybrid batches. Set to `0` to force the eager conv / C++ recurrent fallback path. |
 | `VLLM_METAL_DECODE_PIPELINE` | `1` | One-step-ahead decode sampling pipeline: eligible pure-decode greedy steps defer the sampling sync one step so the next step's graph build and submit overlap the in-flight GPU forward. Greedy output is unchanged. Disabled automatically when speculative decoding is configured. Set to `0` to force the fully synchronous per-step sample path. |
 | `VLLM_METAL_COMPILED_MLP` | `0` | Opt-in compiled stateless-MLP dispatch: decode-shaped MLP/MoE block calls run through an `mx.compile` trace, fusing the per-layer elementwise glue and cutting the per-step op count. Outputs are bitwise identical to the eager dispatch for quantized checkpoints (unquantized fp16 fusion may differ at the ulp level). LoRA serves keep the eager path. Off by default while the dispatch gathers serve mileage; set to `1` to enable. |
-| `VLLM_METAL_NATIVE_SAMPLING` | `0` | Opt-in MLX-native non-greedy sampling with temperature/top-k/top-p/min-p for eligible pure-decode batches. Masks are per row, so a batch may mix greedy and random requests with different top-k/top-p/min-p. Seeds, penalties, logprobs, allowed-token IDs, and bad-word constraints use the torch sampler for the whole batch; `min_p` is also supported there. `min_tokens` and `logit_bias` remain unsupported. Sampled tokens use the MLX RNG keyed from the engine seed, so outputs can differ from torch. Set to `1` to enable. |
+| `VLLM_METAL_NATIVE_SAMPLING` | `1` | MLX-native non-greedy sampling with temperature/top-k/top-p/min-p for eligible pure-decode batches, so they stay in the decode pipeline. Masks are per row, so a batch may mix greedy and random requests with different top-k/top-p/min-p. Seeds, penalties, logprobs, allowed-token IDs, and bad-word constraints use the torch sampler for the whole batch; `min_p` is also supported there. `min_tokens` and `logit_bias` remain unsupported. Sampled tokens use the MLX RNG keyed from the engine seed, so outputs can differ from torch. Set to `0` to sample every non-greedy step with the torch sampler. |
 | `VLLM_METAL_MLA_KERNEL` | `0` | Enable the experimental absorbed-MLA single-pass Metal decode kernel ([RFC #360](https://github.com/vllm-project/vllm-metal/issues/360)). Off by default; the MLA wrapper falls back to the MLX SDPA per-request slow path. Set to `1` to route absorbed-MLA decode through the kernel when the workload matches the instantiated specialization (`kv_lora_rank=512`, `qk_rope_head_dim=64`, `block_size ∈ {16, 32}`, fp16/bf16, decode-only). At startup the engine logs whether decode-only batches take the kernel and, if not, why. |
 | `VLLM_METAL_BUILD_FROM_SOURCE` | `0` | Compile the native `_paged_ops` Metal extension from source at runtime instead of loading the prebuilt artifact shipped in the wheel. For kernel developers / source installs; requires the Xcode command-line tools (`clang++`). Off by default — release wheels ship the `.so` prebuilt. See [Contributing](CONTRIBUTING.md). |
 | `VLLM_METAL_SPEC_VERIFY_WINDOW` | `0` | Enable spec-decode verification window mode ([issue #465](https://github.com/vllm-project/vllm-metal/issues/465)): the K+1 verification rows share each KV block load instead of re-reading the context per row. Off by default; non-hybrid verify windows keep the expanded per-token layout. Outputs are bitwise identical either way; the win is chip- and shape-dependent (measured up to +40% e2e at concurrency 16-32 with 8k contexts on M2/M3 Ultra, and regressions single-stream on M4 Pro and at concurrency 32 on M2 Max). Non-hybrid MLA models and head sizes above 256 use the expanded layout. Hybrid GDN targets force window mode when speculative decoding is configured (their state scan needs one segment per request); hybrid speculation with head sizes above 256 or non-GDN state families is rejected. The same opt-in also merges the `draft_model` proposer's small committed-token ingest into one window per request (head sizes above 256 keep the expanded layout there too); single-stream TPOT is within run-to-run noise of the expanded ingest (0.6B pair, 8k prefix, M4 Pro), and generated tokens are identical. With speculative decoding on, the engine logs at startup which layout the verify windows and the draft model's committed-token ingest use, and why. |
@@ -43,7 +43,16 @@ wins. Outputs are unaffected.
 
 ## Multimodal Serve Modes
 
-- `auto`: use the text-only compatibility path only for checkpoints on the compatibility allowlist — Qwen3.5/Qwen3.6 **FP8** conditional-generation wrappers (their `*_weight_scale_inv` tensors are not sanitized by the mlx_vlm loader), and architectures without a multimodal adapter (the Qwen3.6 and MoE wrappers). Mistral 3 checkpoints with `mistral` or `ministral3` text have no multimodal adapter, so they load their text backbone through mlx_lm. Non-FP8 Qwen3.5 dense checkpoints (official bf16 and MLX-affine quants) keep the native multimodal path. Gemma 4 checkpoints with vision weights, a loadable HF processor and no speculative decoding serve images through the vision sidecar on the mlx_lm text backbone (see [Supported Models](supported_models.md)); otherwise they stay text-only with a logged reason.
+- `auto`: use the native multimodal path where it is supported. Qwen3.5/Qwen3.6
+  **FP8** wrappers use the text backbone because mlx-vlm does not sanitize their
+  `*_weight_scale_inv` tensors. Qwen3.5 MoE, Qwen3.6, compatible Mistral 3, and
+  Muse Glimmer also use the text backbone because they have no multimodal
+  adapter. Non-FP8 Qwen3.5 dense checkpoints keep the native path. GGUF
+  checkpoints use the text-only path because they contain no vision tower.
+  Gemma 4 checkpoints serve images through the vision sidecar when they have
+  vision weights, a loadable HF processor, and no speculative decoding;
+  otherwise they stay text-only with a logged reason. See
+  [Supported Models](supported_models.md).
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 - `text-only`: force the text-only backbone for every multimodal checkpoint, including Gemma 4 (the pre-sidecar behaviour).
 
@@ -91,6 +100,16 @@ yet.
 The paged KV cache budget follows vLLM's standard `--gpu-memory-utilization`
 flag (`gpu_memory_utilization=` for `LLM()`), a fraction in `(0, 1]`. The
 former `VLLM_METAL_MEMORY_FRACTION` override has been removed.
+
+Set `--kv-cache-memory-bytes` (`kv_cache_memory_bytes=` for `LLM()`) to a
+positive byte count to **override** automatic sizing, for example
+`--kv-cache-memory-bytes 2147483648` for 2 GiB. This budgets paged cache storage;
+weights, activations, runtime workspace, and the
+[offload host pool](kv_offloading.md) need additional memory.
+
+Sizes round down to whole blocks. Startup profiling and the memory probe still
+run; an explicit budget that would need shrinking is rejected. The separate
+`--num-gpu-blocks-override` takes precedence over byte-derived block counts.
 
 Models with full and sliding-window attention use grouped KV cache, allowing
 sliding layers to release old blocks. This can improve long-context capacity,
@@ -154,4 +173,4 @@ The budget keeps the full byte count: vLLM chooses its own grouped layout from
 the bytes it is handed. If free memory is merely below the plan, the pool keeps
 its capacity and the shortfall is logged: a plan is a cap, and only the blocks
 requests actually write are ever backed. Set `VLLM_METAL_KV_COMMIT_PROBE=0` to
-skip the touch and trust `--gpu-memory-utilization` alone.
+skip the touch and use the configured cache budget.

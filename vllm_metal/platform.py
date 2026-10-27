@@ -590,11 +590,15 @@ class MetalPlatform(Platform):
                 f"k_quant={config.k_quant}, v_quant={config.v_quant}"
             )
 
+        config.apply_moe_expert_offload(add)
+
         logger.debug("Metal config: %s", config)
 
         backend = envs.VLLM_METAL_BACKEND
         if model_config is not None and model_config.enable_sleep_mode:
             cls._check_sleep_mode_config(vllm_config, backend)
+        if config.moe_expert_cache_bytes:
+            cls._check_moe_expert_offload_config(vllm_config, backend)
 
         # Set worker class for Metal
         if backend == "mps":
@@ -1103,6 +1107,34 @@ class MetalPlatform(Platform):
             f"Metal memory: {total_mem / 1e9:.1f}GB total, "
             f"{available_mem / 1e9:.1f}GB available"
         )
+
+    @classmethod
+    def _check_moe_expert_offload_config(
+        cls, vllm_config: "VllmConfig", backend: str
+    ) -> None:
+        """Expert offloading streams weights into mlx-lm's SwitchGLU layers of
+        one in-process generation model. Features that reshape those layers or
+        split the model are not covered, and the PyTorch MPS runner loads no
+        mlx-lm model.
+        """
+        if backend != "mlx":
+            raise NotImplementedError(
+                "MoE expert offloading is supported on the MLX backend only "
+                f"(VLLM_METAL_BACKEND={backend!r})."
+            )
+        unsupported = None
+        if vllm_config.model_config.runner_type != "generate":
+            unsupported = f"runner type {vllm_config.model_config.runner_type!r}"
+        elif vllm_config.parallel_config.pipeline_parallel_size > 1:
+            unsupported = "pipeline parallelism"
+        elif vllm_config.lora_config is not None:
+            unsupported = "LoRA"
+        elif vllm_config.speculative_config is not None:
+            unsupported = "speculative decoding"
+        if unsupported is not None:
+            raise NotImplementedError(
+                f"MoE expert offloading does not support {unsupported} on Metal."
+            )
 
     @classmethod
     def _check_sleep_mode_config(cls, vllm_config: "VllmConfig", backend: str) -> None:

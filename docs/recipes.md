@@ -26,54 +26,18 @@ quarters of a word.
 
 ## Start the server
 
-=== "16 GB"
+{% for pick in picks %}
+=== "{{ pick.memory_tier_gb }} GB"
 
-    Qwen3.5-9B, with room for a conversation of about 49,000 words.
-
-    ```bash
-    vllm serve mlx-community/Qwen3.5-9B-MLX-4bit \
-      --host 127.0.0.1 --max-model-len 65536 --max-num-batched-tokens 2048 \
-      --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-      --reasoning-parser qwen3
-    ```
-
-    - The first run downloads 6.0 GB.
-    - `--max-num-batched-tokens 2048` reads long text in smaller steps, so the
-      model needs less memory. Without it this model does not fit on 16 GB.
-
-=== "32 GB"
-
-    Qwen3.5-27B, a larger model, with room for a conversation of about 24,000
-    words.
+    {{ pick.description | indent(4) }}
 
     ```bash
-    vllm serve mlx-community/Qwen3.5-27B-4bit \
-      --host 127.0.0.1 --max-model-len 32768 --max-num-batched-tokens 1024 \
-      --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-      --reasoning-parser qwen3
+    {{ pick.command | indent(4) }}
     ```
 
-    - The first run downloads 16 GB.
-    - It is slow to read long text. For faster replies, use the 16 GB recipe.
-    - `--max-num-batched-tokens 1024` reads long text in smaller steps, so the
-      model needs less memory. Without it this model does not fit on 32 GB.
+    {{ pick.guide | indent(4) }}
 
-=== "64 GB"
-
-    Qwen3.5-35B-A3B, with room for many conversations of about 24,000 words
-    at once.
-
-    ```bash
-    vllm serve mlx-community/Qwen3.5-35B-A3B-4bit \
-      --host 127.0.0.1 --max-model-len 32768 \
-      --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-      --reasoning-parser qwen3
-    ```
-
-    - The first run downloads 20 GB.
-    - It is the fastest of the three, because only part of the model runs for
-      each word.
-
+{% endfor %}
 What the options do:
 
 - `--host 127.0.0.1` keeps the server to your Mac. See
@@ -92,33 +56,17 @@ that window open.
 
 Open a second Terminal window with Command-N and paste:
 
-=== "16 GB"
+{% for pick in picks %}
+=== "{{ pick.memory_tier_gb }} GB"
 
     ```bash
-    curl http://127.0.0.1:8000/v1/chat/completions \
+    curl {{ pick.base_url }}/v1/chat/completions \
       -H "Content-Type: application/json" \
-      -d '{"model": "mlx-community/Qwen3.5-9B-MLX-4bit",
+      -d '{"model": {{ pick.model_id | tojson }},
            "messages": [{"role": "user", "content": "What is unified memory?"}]}'
     ```
 
-=== "32 GB"
-
-    ```bash
-    curl http://127.0.0.1:8000/v1/chat/completions \
-      -H "Content-Type: application/json" \
-      -d '{"model": "mlx-community/Qwen3.5-27B-4bit",
-           "messages": [{"role": "user", "content": "What is unified memory?"}]}'
-    ```
-
-=== "64 GB"
-
-    ```bash
-    curl http://127.0.0.1:8000/v1/chat/completions \
-      -H "Content-Type: application/json" \
-      -d '{"model": "mlx-community/Qwen3.5-35B-A3B-4bit",
-           "messages": [{"role": "user", "content": "What is unified memory?"}]}'
-    ```
-
+{% endfor %}
 The answer is the text after `"content"`. Qwen3.5 thinks before it answers,
 which can take a while. To skip the thinking for a faster reply, add
 `"chat_template_kwargs": {"enable_thinking": false}` to the request.
@@ -165,12 +113,15 @@ Read the error just above the last line in Terminal.
 
 [llmman](https://github.com/llmmanorg/llmman) can start the same models. On a
 Mac it uses MLX's own server by default. To use vLLM Metal, run the `source`
-step from [Before you start](#before-you-start), then, for the 16 GB recipe:
+{% set example = picks[0] %}
+step from [Before you start](#before-you-start), then, for the {{ example.memory_tier_gb }} GB recipe:
 
 ```bash
-LLMMAN_SAFETENSORS_ENGINE=vllm LLMMAN_CONTEXT_LENGTH=65536 \
-  LLMMAN_VLLM_ARGS="--max-num-batched-tokens 2048" \
-  llmman run hf.co/mlx-community/Qwen3.5-9B-MLX-4bit
+LLMMAN_SAFETENSORS_ENGINE=vllm LLMMAN_CONTEXT_LENGTH={{ example.context }} \
+{% if example.batch_tokens %}
+  LLMMAN_VLLM_ARGS="--max-num-batched-tokens {{ example.batch_tokens }}" \
+{% endif %}
+  llmman run hf.co/{{ example.model_id }}
 ```
 
 `LLMMAN_CONTEXT_LENGTH` is the same as `--max-model-len` above, and

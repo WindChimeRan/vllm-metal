@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from tools.check_parity import check_parity, compare_results, http_generate, http_result
+from tools.check_parity import (
+    check_parity,
+    compare_results,
+    http_generate,
+    http_result,
+    main,
+)
 from tools.parity_utils import parity_report
 
 
@@ -202,14 +208,18 @@ class TestParityTool:
             gpu_memory_utilization,
             log_path,
             env,
+            additional_config,
+            trust_remote_code,
             speculative_config=None,
         ):
             assert speculative_config == spec
+            assert not trust_remote_code
             assert max_num_seqs == 2
             assert gpu_memory_utilization == 0.65
             assert env["VLLM_METAL_BACKEND"] == backend
             if backend == "mps":
                 assert env["PYTORCH_ENABLE_MPS_FALLBACK"] == "0"
+            assert additional_config is None
             events.append("server started")
             yield "http://localhost/v1"
             events.append("server stopped")
@@ -242,3 +252,61 @@ class TestParityTool:
             "TOP_K_MATCH": 1,
             "FAIL": 0,
         }
+
+    def test_trust_remote_code_reaches_reference_and_server(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        commands = []
+        trusted = []
+        row = {**self._result([2], []), "input_ids": [1]}
+
+        def generate_reference(command, **kwargs):
+            commands.append(command)
+            path = Path(command[command.index("--generate-reference") + 1])
+            path.write_text(json.dumps([row]))
+
+        @contextmanager
+        def server(*args, speculative_config=None):
+            assert speculative_config is None
+            trusted.append(args[-1])
+            yield "http://localhost/v1"
+
+        monkeypatch.setattr("subprocess.run", generate_reference)
+        monkeypatch.setattr("tools.check_parity.serving", server)
+        monkeypatch.setattr("tools.check_parity.http_generate", lambda *args: args[2])
+
+        assert check_parity(
+            str(tmp_path),
+            ["test prompt"],
+            1,
+            batch_sizes=(1,),
+            output_dir=tmp_path,
+            trust_remote_code=True,
+        )
+        assert "--trust-remote-code" in commands[0]
+        assert trusted == [True]
+
+    def test_trust_remote_code_is_rejected_with_speculative_method(
+        self, monkeypatch, capsys
+    ) -> None:
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "check_parity.py",
+                "--model",
+                "target",
+                "--method",
+                "draft_model",
+                "--draft",
+                "draft",
+                "--trust-remote-code",
+            ],
+        )
+
+        with pytest.raises(SystemExit) as exc:
+            main()
+
+        assert exc.value.code == 2
+        assert "--trust-remote-code cannot be combined with --method" in (
+            capsys.readouterr().err
+        )

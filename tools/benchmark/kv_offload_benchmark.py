@@ -87,8 +87,10 @@ DISK_HEADROOM_GB = 15.0
 # the wired KV cache plus the host offload pool, and the host pool is pageable:
 # overcommit it and the machine swaps or dies rather than the server failing
 # cleanly. The pool is budgeted inside --gpu-memory-utilization, so the
-# fraction alone bounds weights, wired cache and pool together.
+# fraction alone bounds weights, wired cache and pool together. 40 GB is sized
+# for a 128 GB Mac and scales down with RAM, or smaller Macs warn at any fraction.
 RAM_HEADROOM_GB = 40.0
+RAM_HEADROOM_REFERENCE_GB = 128.0
 
 # TTFT only means "time to prefill" while the server is not saturated. Firing
 # every request at once measures admission queueing instead, and anything that
@@ -153,7 +155,8 @@ def preflight_memory(args: argparse.Namespace) -> list[str]:
     # The wired cache is sized off the recommended working set, itself about
     # 75% of RAM, so the fraction lands on that rather than on RAM directly.
     projected = ram * 0.75 * args.memory_fraction
-    if projected > ram - RAM_HEADROOM_GB:
+    headroom = RAM_HEADROOM_GB * min(1.0, ram / RAM_HEADROOM_REFERENCE_GB)
+    if projected > ram - headroom:
         warnings.append(
             f"--memory-fraction {args.memory_fraction} projects to "
             f"~{projected:.0f} GB resident on a {ram:.0f} GB machine, host "

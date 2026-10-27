@@ -27,7 +27,7 @@ acc += inp * static_cast<float>(weights[weight_base + state_len]);
 
 // Match nn.silu(nn.Conv1d(...)): round the convolution and sigmoid to T.
 T conv = static_cast<T>(acc);
-auto sigmoid_tail = 1 / (1 + metal::exp(metal::abs(conv)));
+auto sigmoid_tail = 1 / (1 + metal::precise::exp(metal::abs(conv)));
 T sigmoid = (conv < 0) ? sigmoid_tail : 1 - sigmoid_tail;
 output[req_idx * CONV_DIM + c] = conv * sigmoid;
 

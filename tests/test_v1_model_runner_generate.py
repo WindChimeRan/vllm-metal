@@ -258,6 +258,7 @@ class TestV1MetalModelRunnerGenerate:
                 runner_type="generate",
                 logprobs_mode=logprobs_mode,
                 supports_multimodal_inputs=False,
+                seed=0,
             ),
             cache_config=SimpleNamespace(),
             scheduler_config=SimpleNamespace(async_scheduling=False),

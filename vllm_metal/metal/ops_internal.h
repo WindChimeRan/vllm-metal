@@ -83,11 +83,13 @@ using GqaPartitionOffsets = std::array<std::vector<int64_t>, 2>;
 struct GqaDecodeLengthPlan {
   int num_requests = 0;
   int max_length = 0;
+  int64_t total_length = 0;
   std::array<int64_t, 2> full_partitions = {};
   std::shared_ptr<const GqaPartitionOffsets> partition_offsets;
 
   bool operator==(const GqaDecodeLengthPlan& other) const {
     return num_requests == other.num_requests && max_length == other.max_length &&
+        total_length == other.total_length &&
         full_partitions == other.full_partitions &&
         (partition_offsets == other.partition_offsets ||
          (partition_offsets && other.partition_offsets &&
@@ -117,6 +119,7 @@ static GqaDecodeLengthPlan gqa_decode_length_plan(const Lengths& context_lens) {
     if (length <= 0) return {};
     ++plan.num_requests;
     plan.max_length = std::max(plan.max_length, length);
+    plan.total_length += length;
     for (size_t i = 0; i < kGqaPartitionSizes.size(); ++i) {
       plan.full_partitions[i] += length / kGqaPartitionSizes[i];
       if (offsets) {
@@ -141,9 +144,7 @@ int gqa_decode_plan_for_lengths(
     int num_heads, int num_kv_heads, int head_size,
     const GqaDecodeLengthPlan& plan, int gpu_cores, int block_size,
     const std::string& gpu_arch = "", int max_seq_len = 0);
-void init_v2_library(const std::string& v2_src);
 void init_library_path(const std::string& name, const std::string& path);
-void init_nax_library(const std::string& nax_src);
 void init_nax_library_path(const std::string& path);
 std::string dtype_to_metal(Dtype dt);
 array paged_attention_primitive_fn(
@@ -178,11 +179,9 @@ std::tuple<array, array> reshape_and_cache_primitive_fn(
     const array& key, const array& value,
     const array& key_cache, const array& value_cache,
     const array& slot_mapping);
-void init_gdn_library(const std::string& src);
 array gdn_state_scatter_primitive_fn(
     const array& pool, const array& src, const array& dst_ids,
     bool zero = false, bool paged = false);
-void init_mla_library(const std::string& src);
 array mla_paged_attention_primitive_fn(
     const array& q_nope,
     const array& q_pe,

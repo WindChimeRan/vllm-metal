@@ -33,14 +33,6 @@ static void mla_validate_t_dtypes(
 // MLA paged attention (RFC #360)
 // ---------------------------------------------------------------------------
 
-static std::string mla_source_;
-
-void init_mla_library(const std::string& src) {
-  mla_source_ = src;
-  auto& d = metal::device(Device::gpu);
-  d.get_library("paged_mla_kern", [&]() { return mla_source_; });
-}
-
 // Dispatch the MLA paged attention kernel.
 //
 // Buffer slot map (must match kernels_v2/mla.metal):

@@ -5,14 +5,6 @@
 // GDN linear attention — in-place paged state
 // ---------------------------------------------------------------------------
 
-static std::string gdn_source_;
-
-void init_gdn_library(const std::string& src) {
-  gdn_source_ = src;
-  auto& d = metal::device(Device::gpu);
-  d.get_library("gdn_kern", [&]() { return gdn_source_; });
-}
-
 // MLX Scatter/SliceUpdate copy their destination unless it is donatable; GDN
 // pools are aliased across sibling layers, so pool[ids] = rows copies the full
 // pool. mx.fast.metal_kernel allocates fresh outputs, so this Primitive aliases

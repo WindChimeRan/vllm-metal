@@ -15,8 +15,12 @@ import torch
 pytest.importorskip("vllm", reason="vllm not installed")
 
 import vllm.v1.worker.worker_base as worker_base  # noqa: E402
-from vllm.config import CacheConfig, VllmConfig  # noqa: E402
+from vllm.config import AttentionConfig, CacheConfig, VllmConfig  # noqa: E402
 from vllm.v1.attention.backends.utils import resolve_kv_cache_layout  # noqa: E402
+from vllm.v1.core.kv_cache_utils import (  # noqa: E402
+    get_kv_cache_config_from_groups,
+    get_kv_cache_groups,
+)
 from vllm.v1.executor.abstract import UniProcExecutor  # noqa: E402
 from vllm.v1.kv_cache_interface import (  # noqa: E402
     FullAttentionSpec,
@@ -25,9 +29,10 @@ from vllm.v1.kv_cache_interface import (  # noqa: E402
     SlidingWindowSpec,
 )
 
-from tests.stub_runner import make_stub_runner  # noqa: E402
+from tests.stub_runner import make_cache_config, make_stub_runner  # noqa: E402
 from vllm_metal.attention.caches.placement import KV_CACHE_LAYOUT  # noqa: E402
 from vllm_metal.attention.runtime.hybrid import HybridPagedAttentionRuntime
+from vllm_metal.attention.runtime.sdpa import SDPAPagedAttentionRuntime
 from vllm_metal.config import MetalConfig
 from vllm_metal.stt.policy import STT_SCHED_AVAILABLE_BYTES  # noqa: E402
 from vllm_metal.utils import CommitProbe  # noqa: E402
@@ -39,6 +44,10 @@ from vllm_metal.v1.cache_policy import (  # noqa: E402
     WorkerCachePlanner,
     kv_pool_bytes_after_probe,
     kv_swap_tolerance_bytes,
+)
+from vllm_metal.v1.draft_model_proposer import (  # noqa: E402
+    DraftDims,
+    DraftModelProposer,
 )
 from vllm_metal.v1.kv_offload.connector import (  # noqa: E402
     MetalOffloadingConnector,
@@ -247,18 +256,36 @@ class TestWorkerRunnerBoundaryDelegation:
         )
         return worker
 
-    def test_determine_available_memory_layout_budget_mode(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("explicit", "utilization", "expected"),
+        [
+            pytest.param(None, 0.5, 2_900_000_000, id="automatic"),
+            pytest.param(100_000_000, 0.5, 100_000_000, id="below-automatic"),
+            pytest.param(4_000_000_000, 0.5, 4_000_000_000, id="above-automatic"),
+            pytest.param(100_000_000, 0.1, 100_000_000, id="negative-automatic"),
+        ],
+    )
+    def test_layout_budget_uses_explicit_bytes_or_automatic_sizing(
+        self, monkeypatch: pytest.MonkeyPatch, explicit, utilization, expected
     ) -> None:
         worker = self._make_layout_budget_worker(
-            monkeypatch, gpu_memory_utilization=0.5
+            monkeypatch, gpu_memory_utilization=utilization
         )
+        worker.cache_config.kv_cache_memory_bytes = explicit
 
         available = MetalWorker.determine_available_memory(worker)
 
-        # 10 GB * 0.5 - 2 GB weights - 0.1 GB overhead.
-        assert available == 2_900_000_000
+        assert available == expected
         worker.model_runner.profile_run.assert_called_once_with()
+
+    @pytest.mark.parametrize("explicit", [0, -1])
+    def test_explicit_cache_bytes_must_be_positive(self, monkeypatch, explicit):
+        worker = self._make_layout_budget_worker(
+            monkeypatch, gpu_memory_utilization=0.5
+        )
+        worker.cache_config.kv_cache_memory_bytes = explicit
+        with pytest.raises(ValueError, match="kv-cache-memory-bytes must be positive"):
+            MetalWorker.determine_available_memory(worker)
 
     def test_layout_budget_oom_reports_breakdown_and_mitigations(
         self, monkeypatch: pytest.MonkeyPatch
@@ -609,11 +636,24 @@ class TestPagedAttentionPlanDiagnostics:
         worker.get_cache_block_size_bytes = MagicMock(return_value=per_block_bytes)
         return WorkerCachePlanner(worker)
 
-    def test_oom_mitigation_names_gpu_memory_utilization(self, monkeypatch) -> None:
+    @pytest.mark.parametrize(
+        ("explicit", "mitigation"),
+        [
+            (None, "increase --gpu-memory-utilization (currently 0.15)"),
+            (1, "Increase --kv-cache-memory-bytes"),
+        ],
+    )
+    def test_small_budget_error_names_active_setting(
+        self, monkeypatch, explicit, mitigation
+    ) -> None:
         runner = SimpleNamespace(
             is_hybrid=False,
+            scheduler_memory_reporting_mode=lambda: "paged_attention_capacity",
+            profile_run=lambda: 100_000_000,
+            validate_paged_attention_support=lambda: None,
         )
         planner = self._make_planner(runner, gpu_memory_utilization=0.15)
+        planner._worker.cache_config.kv_cache_memory_bytes = explicit
         monkeypatch.setattr(
             WorkerCachePlanner,
             "_metal_limit_bytes",
@@ -625,12 +665,10 @@ class TestPagedAttentionPlanDiagnostics:
             lambda self: 2_000_000_000,
         )
 
-        plan = planner._paged_attention_plan(overhead=100_000_000)
         with pytest.raises(ValueError) as exc_info:
-            planner._validate_paged_attention_plan(plan, require_min_blocks=True)
+            planner.determine_available_memory()
 
-        message = str(exc_info.value)
-        assert "increase --gpu-memory-utilization (currently 0.15)" in message
+        assert mitigation in str(exc_info.value)
 
     def test_non_hybrid_oom_error_omits_gdn_reservation(self, monkeypatch) -> None:
         runner = SimpleNamespace(
@@ -674,6 +712,96 @@ class TestPagedAttentionPlanDiagnostics:
         fraction = WorkerCachePlanner(worker)._memory_fraction()
 
         assert fraction == gpu_mem_util
+
+    @pytest.mark.parametrize(
+        ("override", "expected_blocks"),
+        [(None, 64), (7, 7), (64, 64), (65, None), (0, None), (-1, None)],
+    )
+    @pytest.mark.parametrize("explicit", [False, True])
+    def test_draft_pool_override_through_engine_initialization(
+        self, monkeypatch, override, expected_blocks, explicit
+    ) -> None:
+        runner = make_stub_runner(
+            model=SimpleNamespace(),
+            num_layers=1,
+            num_kv_cache_layers=1,
+            num_kv_heads=1,
+            head_dim=64,
+            kv_cache_dtype=mx.bfloat16,
+            cache_config=make_cache_config(
+                block_size=16,
+                gpu_memory_utilization=0.1 if explicit else 0.5,
+                num_gpu_blocks_override=override,
+            ),
+            profile_run=lambda: 0,
+        )
+        config = runner.vllm_config
+        config.attention_config = AttentionConfig()
+        config.scheduler_config = SimpleNamespace(disable_hybrid_kv_cache_manager=False)
+        config.model_config.is_deepseek_v4 = False
+        config.model_config.max_model_len = 64
+        config.kv_transfer_config = None
+        # Ordinary draft-model speculation still uses count-based SDPA pools.
+        config.speculative_config = SimpleNamespace(
+            method="draft_model", uses_draft_model=lambda: True
+        )
+        runner._draft_dims = DraftDims(1, 1, 64)
+        drafter = DraftModelProposer(
+            model=SimpleNamespace(),
+            block_size=16,
+            max_model_len=runner.model_config.max_model_len,
+            num_layers=1,
+            controller=runner._spec_decode_controller,
+            extract_logits=lambda output: output,
+        )
+        drafter._dims = runner._draft_dims
+        runner._drafter = drafter
+
+        # Only model patching and host observations are stubbed; both target and
+        # draft pools allocate real arrays, and vLLM plans their scheduler groups.
+        def patch_model(backend, model):
+            model.backend = backend
+            return 1
+
+        monkeypatch.setattr(SDPAPagedAttentionRuntime, "patch_model", patch_model)
+        worker = _make_worker(runner)
+        worker.vllm_config = config
+        worker.cache_config = config.cache_config
+        per_block_bytes = worker.get_cache_block_size_bytes()
+        if explicit:
+            # Budget both physical pools, round down the partial block, and
+            # ignore the smaller utilization-derived capacity.
+            worker.cache_config.kv_cache_memory_bytes = 65 * per_block_bytes - 1
+        monkeypatch.setenv("VLLM_METAL_KV_COMMIT_PROBE", "0")
+        monkeypatch.setattr(
+            WorkerCachePlanner, "_metal_limit_bytes", lambda self: 128 * per_block_bytes
+        )
+        monkeypatch.setattr(
+            WorkerCachePlanner, "get_model_memory_usage", lambda self: 0
+        )
+        build_runtime = MagicMock(wraps=runner.build_paged_attention_runtime)
+        monkeypatch.setattr(runner, "build_paged_attention_runtime", build_runtime)
+
+        if expected_blocks is None:
+            with pytest.raises(ValueError, match="num-gpu-blocks-override"):
+                worker.determine_available_memory()
+            build_runtime.assert_not_called()
+            assert runner.paged_attention_runtime is None
+            assert not hasattr(drafter._model, "backend")
+            return
+
+        available_memory = worker.determine_available_memory()
+        groups = get_kv_cache_groups(config, worker.get_kv_cache_spec())
+        kv_config = get_kv_cache_config_from_groups(config, groups, available_memory)
+        worker.initialize_from_config(kv_config)
+
+        assert available_memory == expected_blocks * per_block_bytes
+        assert kv_config.num_blocks == expected_blocks
+        assert isinstance(runner.paged_attention_runtime, SDPAPagedAttentionRuntime)
+        assert runner.paged_attention_runtime.num_blocks() == expected_blocks
+        assert drafter._model.backend.num_blocks() == expected_blocks
+        draft_group = kv_config.kv_cache_groups[drafter._scheduler_group_index]
+        assert "draft_layers.0.self_attn" in draft_group.layer_names
 
 
 class TestHybridPlanGuard:

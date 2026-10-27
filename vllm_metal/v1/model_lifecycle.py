@@ -20,6 +20,7 @@ from vllm_metal.compat import apply_compat_patches, embedding_load_scope
 from vllm_metal.compiled_mlp import CompiledMLPBlocks
 from vllm_metal.config import get_config
 from vllm_metal.gguf.source import GGUFLoadSource
+from vllm_metal.moe_offload import ExpertStore
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
@@ -388,6 +389,13 @@ class ModelLifecycle:
             else AWQQuantLoader.for_model(model_name, revision=revision)
         )
 
+        expert_cache_bytes = get_config().moe_expert_cache_bytes
+        if expert_cache_bytes and (is_gguf or is_vlm or awq_loader is not None):
+            raise NotImplementedError(
+                "MoE expert offloading supports mlx-lm text checkpoints only, "
+                "not GGUF, AWQ, or multimodal models."
+            )
+
         if is_gguf:
             load_label = "GGUF model"
             model, tokenizer = self._load_gguf_text_model(
@@ -417,9 +425,13 @@ class ModelLifecycle:
             model, tokenizer = self._load_mlx_lm_text_model(
                 model_name,
                 tokenizer_config,
-                lazy=lazy_weights,
+                lazy=lazy_weights or bool(expert_cache_bytes),
                 revision=revision,
             )
+            if expert_cache_bytes:
+                self._runner._expert_store = ExpertStore.install(
+                    model, model_name, revision, expert_cache_bytes
+                )
 
         loaded_from = (
             gguf_source.weights_path if gguf_source is not None else model_name

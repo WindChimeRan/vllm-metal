@@ -1,19 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Build shared Metal shader artifacts and both native launchers.
-
-Compiles the Metal ops sources, ``mlx_patch.cpp``, and nanobind into a shared library that dispatches
-Metal shaders through MLX's own command encoder.
-"""
+"""Build shared Metal shader artifacts and both native launchers."""
 
 from __future__ import annotations
 
 import functools
 import hashlib
 import logging
+import os
 import subprocess
 import sysconfig
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 
 from vllm_metal.metal.constants import (
@@ -85,36 +81,25 @@ def metallib_path(name: str) -> Path:
     return _THIS_DIR / f"{name}.metallib"
 
 
-# Stable parts of the metallib compile command (the per-build temp input and
-# output paths are appended in _compile_metallib). One constant so the actual
-# compile and the staleness digest agree on the flags. We mirror the flags MLX
-# uses to build its own shader libraries (share/cmake/MLX/extension.cmake:
-# ``MTLLIB_COMPILE_OPTIONS = -Wall -Wextra -fno-fast-math -Wno-c++17-extensions``;
-# the -W* flags only affect diagnostics). ``-fno-fast-math`` is the
-# numerics-critical one: the metal compiler defaults to fast-math ON, but MLX's
-# runtime ``newLibrary`` sets ``setFastMathEnabled(false)``, so without it the
-# precompiled kernels diverge from the in-process source compile. We deliberately
-# do NOT add ``-O3``: MLX compiles its shaders at the metal default optimization
-# (already enabled), so matching keeps the prebuilt path numerically and
-# behaviourally identical to what users get today.
 MIN_MACOS_VERSION = "15.0"
 NAX_MIN_MACOS_VERSION = "26.2"
-_METALLIB_BASE_FLAGS = ("xcrun", "-sdk", "macosx", "metal", "-fno-fast-math")
-_METALLIB_FLAGS = (
-    *_METALLIB_BASE_FLAGS,
-    f"-mmacosx-version-min={MIN_MACOS_VERSION}",
+# Build inputs consumed by MetalExtension, CMake, and the host compiler.
+_MLX_BUILD_ENV = (
+    "DEBUG",
+    "CMAKE_ARGS",
+    "ARCHFLAGS",
+    "CXX",
+    "CXXFLAGS",
+    "LDFLAGS",
+    "SDKROOT",
+    "DEVELOPER_DIR",
 )
-
 # MPP tensor ops need a 26.2 deployment floor at compile and link time.
 _NAX_MIN_SDK = tuple(int(x) for x in NAX_MIN_MACOS_VERSION.split("."))
-_NAX_METALLIB_FLAGS = (
-    *_METALLIB_BASE_FLAGS,
-    f"-mmacosx-version-min={NAX_MIN_MACOS_VERSION}",
-)
 
 
-def _metallib_flags(name: str) -> tuple[str, ...]:
-    return _NAX_METALLIB_FLAGS if name == NAX_METALLIB_NAME else _METALLIB_FLAGS
+def _metallib_deployment_target(name: str) -> str:
+    return NAX_MIN_MACOS_VERSION if name == NAX_METALLIB_NAME else MIN_MACOS_VERSION
 
 
 def _sdk_supports_nax() -> bool:
@@ -164,50 +149,18 @@ def _metallib_source(name: str) -> str:
 
 
 def _metallib_digest(name: str, source: str) -> str:
-    """Content hash of a metallib: its assembled ``.metal`` source + the compile
-    flags. Editing any concatenated shader changes ``source`` and so the digest."""
+    """Hash the assembled source, deployment target, and MLX build version."""
     h = hashlib.sha256()
-    h.update("\0".join(_metallib_flags(name)).encode())
-    h.update(b"\0")
+    h.update(f"mlx={_package_version('mlx')}\0".encode())
+    h.update(f"deployment_target={_metallib_deployment_target(name)}\0".encode())
     h.update(source.encode())
     return h.hexdigest()
 
 
-def _run_or_raise(cmd: list[str], what: str) -> None:
-    """Log and run a compiler command, raising with both streams on failure."""
-    logger.info("  %s", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"Failed to {what}:\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
-        )
-
-
-def _compile_metallib(name: str, source: str) -> Path:
-    """Compile Metal *source* to ``<name>.metallib`` in the package dir and write
-    its ``.sha256`` staleness stamp."""
-    out = metallib_path(name)
-    tmp = tempfile.NamedTemporaryFile(
-        mode="w", suffix=".metal", delete=False, dir=_THIS_DIR
-    )
-    try:
-        tmp.write(source)
-        tmp.close()
-        _run_or_raise(
-            [*_metallib_flags(name), tmp.name, "-o", str(out)],
-            f"compile Metal library '{name}'",
-        )
-    finally:
-        Path(tmp.name).unlink(missing_ok=True)
-    _stamp_path(out).write_text(_metallib_digest(name, source))
-    _toolchain_path(out).write_text(_metal_toolchain_id())
-    return out
-
-
 def prepare_metallib(name: str, *, build_from_source: bool = False) -> Path:
-    """Resolve one shader artifact without loading either framework's extension."""
+    """Rebuild if requested, then resolve a shared shader artifact."""
     if build_from_source:
-        return _compile_metallib(name, _metallib_source(name))
+        build_metallibs()
     path = metallib_path(name)
     if not path.exists():
         raise RuntimeError(
@@ -228,6 +181,18 @@ def _toolchain_path(artifact: Path) -> Path:
     """Build-only sidecar recording the Metal compiler + SDK an artifact was
     compiled with. Never read at runtime (loading must not invoke ``xcrun``)."""
     return artifact.with_suffix(artifact.suffix + ".toolchain")
+
+
+def _build_config_path(artifact: Path) -> Path:
+    """Build-only configuration record; runtime loading never reads it."""
+    return artifact.with_suffix(artifact.suffix + ".build-config")
+
+
+def _mlx_build_config() -> str:
+    h = hashlib.sha256()
+    for name in _MLX_BUILD_ENV:
+        h.update(f"{name}={os.environ.get(name)!r}\0".encode())
+    return h.hexdigest()
 
 
 @functools.lru_cache(maxsize=1)
@@ -264,13 +229,15 @@ def _read_strict(path: Path) -> str | None:
 
 def _metallib_is_current(name: str, source: str) -> bool:
     """Build-side skip gate: the library exists, its ``.sha256`` stamp matches
-    the assembled source + flags, and it was compiled by the current Metal
-    toolchain. Stricter than the runtime :func:`is_stale` on purpose: an
-    unreadable stamp or toolchain record means rebuild."""
+    the source, deployment target, and MLX version, and its configuration and Metal
+    toolchain match. Stricter than the runtime :func:`is_stale` on purpose:
+    an unreadable build record means rebuild."""
     path = metallib_path(name)
     if not path.is_file():
         return False
     if _read_strict(_stamp_path(path)) != _metallib_digest(name, source):
+        return False
+    if _read_strict(_build_config_path(path)) != _mlx_build_config():
         return False
     toolchain = _metal_toolchain_id()
     return (
@@ -278,160 +245,137 @@ def _metallib_is_current(name: str, source: str) -> bool:
     )
 
 
+def _build_extension(sources: dict[str, str], build_dir: Path) -> None:
+    from mlx.extension import BuildExtension, MetalExtension, MetalLibrary
+    from setuptools import Distribution
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+    libraries = []
+    for name, source in sources.items():
+        path = build_dir / f"{name}.metal"
+        if not path.exists() or path.read_text() != source:
+            path.write_text(source)
+        libraries.append(
+            MetalLibrary(
+                name,
+                sources=[str(path)],
+                deployment_target=_metallib_deployment_target(name),
+            )
+        )
+    extension = MetalExtension(
+        "vllm_metal.metal._paged_ops",
+        sources=[
+            str(_SRC),
+            str(_PAGED_ATTENTION),
+            str(_GDN),
+            str(_MLA),
+            str(_MLX_PATCH),
+            str(_DEVICE_SRC),
+        ],
+        metal_libraries=libraries,
+        define_macros=[
+            ("_METAL_", None),
+            ("ACCELERATE_NEW_LAPACK", None),
+            ("VLLM_METAL_PARTITION_SIZE", str(PARTITION_SIZE)),
+            ("VLLM_METAL_PA_WINDOW_ROWS", str(PA_WINDOW_ROWS)),
+            ("VLLM_METAL_PA_WINDOW_MAX_HEAD", str(PA_WINDOW_MAX_HEAD_SIZE)),
+        ],
+        extra_compile_args={"cxx": ["-O2", "-fvisibility=default"]},
+        extra_link_args=[
+            "SHELL:-framework IOKit",
+            "SHELL:-framework CoreFoundation",
+        ],
+    )
+    command = BuildExtension(
+        Distribution(
+            {
+                "ext_modules": [extension],
+                "packages": ["vllm_metal.metal"],
+                "package_dir": {"vllm_metal.metal": str(_THIS_DIR)},
+            }
+        ),
+        generate_stubs=False,
+    )
+    command.ensure_finalized()
+    command.build_lib = str(build_dir / "lib")
+    command.build_temp = str(build_dir)
+    command.inplace = True
+    command.force = True
+    previous_target = os.environ.get("MACOSX_DEPLOYMENT_TARGET")
+    os.environ["MACOSX_DEPLOYMENT_TARGET"] = MIN_MACOS_VERSION
+    try:
+        command.run()
+    finally:
+        if previous_target is None:
+            os.environ.pop("MACOSX_DEPLOYMENT_TARGET", None)
+        else:
+            os.environ["MACOSX_DEPLOYMENT_TARGET"] = previous_target
+
+
 def build_metallibs() -> list[Path]:
-    """Precompile the required libraries and optional NAX library.
-
-    PACKAGING-only (CI + release.sh): the default runtime path loads these
-    prebuilt libraries, but source mode (``VLLM_METAL_BUILD_FROM_SOURCE=1``)
-    compiles the shaders in-process via MLX, so a source-install dev without
-    the Metal toolchain never reaches this code.
-
-    A library whose prebuilt artifact and ``.sha256`` stamp still match its
-    assembled source is kept as-is, mirroring the incremental gates on the
-    native extensions — so restoring previously built artifacts (CI caches
-    them between runs) skips the ``xcrun metal`` compile entirely.
-    """
-    logger.info("Building Metal shader libraries ...")
-    names = [*METALLIB_NAMES]
+    """Build the MLX launcher and stale shader libraries."""
+    names = METALLIB_NAMES
     if _sdk_supports_nax():
-        names.append(NAX_METALLIB_NAME)
+        names = (*names, NAX_METALLIB_NAME)
     else:
         logger.warning(
             "macOS SDK < %s: skipping %s",
             ".".join(map(str, _NAX_MIN_SDK)),
             NAX_METALLIB_NAME,
         )
-    built = []
-    for name in names:
-        source = _metallib_source(name)
-        if _metallib_is_current(name, source):
-            logger.info("Metal library '%s' is up to date; skipping compile", name)
-            built.append(metallib_path(name))
-        else:
-            built.append(_compile_metallib(name, source))
-    return built
+    sources = {name: _metallib_source(name) for name in names}
+    digests = {
+        metallib_path(name): _metallib_digest(name, source)
+        for name, source in sources.items()
+    }
+    pending_sources = {
+        name: source
+        for name, source in sources.items()
+        if not _metallib_is_current(name, source)
+    }
+    if not pending_sources and not needs_rebuild():
+        return list(digests)
+    if not pending_sources:
+        # MetalExtension requires a library even for C++-only changes.
+        pending_sources["rope_kern"] = sources["rope_kern"]
 
-
-def _find_package_path(name: str) -> Path:
-    """Resolve a Python package's root directory."""
-    import importlib
-
-    mod = importlib.import_module(name)
-    paths = getattr(mod, "__path__", None)
-    if paths:
-        return Path(list(paths)[0])
-    f = getattr(mod, "__file__", None)
-    if f:
-        return Path(f).parent
-    raise RuntimeError(f"Cannot locate package '{name}'")
+    expected_hash = _input_hash()
+    config = _mlx_build_config()
+    toolchain = _metal_toolchain_id()
+    # Failed/partial builds must not retain an older configuration's cache hit.
+    for artifact in (_OUT, *(metallib_path(name) for name in pending_sources)):
+        _build_config_path(artifact).unlink(missing_ok=True)
+    logger.info("Building MLX native extension and Metal shader libraries ...")
+    if toolchain == "unavailable":
+        # Unknown toolchains must not reuse intermediate outputs.
+        with tempfile.TemporaryDirectory(prefix="vllm-metal-mlx-build-") as tmp:
+            _build_extension(pending_sources, Path(tmp))
+    else:
+        _build_extension(
+            pending_sources, _THIS_DIR / "build" / toolchain / config / expected_hash
+        )
+    _HASH.write_text(expected_hash)
+    _MLX_VERSION.write_text(_package_version("mlx") + "\n")
+    _build_config_path(_OUT).write_text(config)
+    for name in pending_sources:
+        path = metallib_path(name)
+        _stamp_path(path).write_text(digests[path])
+        _toolchain_path(path).write_text(toolchain)
+        _build_config_path(path).write_text(config)
+    return list(digests)
 
 
 def _package_version(name: str) -> str:
-    import importlib
+    from importlib.metadata import version
 
-    mod = importlib.import_module(name)
-    return str(getattr(mod, "__version__", ""))
-
-
-@dataclass(frozen=True)
-class _BuildSpec:
-    cmd: list[str]
-    nb_src: Path
-    mlx_lib: Path
-    mlx_include: Path
-    py_include: str
-    mlx_version: str
-    nb_version: str
+    return version(name)
 
 
-def _build_spec() -> _BuildSpec:
-    """Resolve every input that affects the produced .so."""
-    py_include = sysconfig.get_paths()["include"]
-    nb_path = _find_package_path("nanobind")
-    mlx_path = _find_package_path("mlx")
-    mlx_include = mlx_path / "include"
-    mlx_lib = mlx_path / "lib"
-    metal_cpp = mlx_include / "metal_cpp"
-    nb_src = nb_path / "src" / "nb_combined.cpp"
-
-    cmd = [
-        "clang++",
-        "-std=c++17",
-        "-shared",
-        "-fPIC",
-        "-O2",
-        f"-mmacosx-version-min={MIN_MACOS_VERSION}",
-        "-fvisibility=default",
-        f"-I{py_include}",
-        f"-I{nb_path / 'include'}",
-        f"-I{nb_path / 'src'}",
-        f"-I{nb_path / 'ext' / 'robin_map' / 'include'}",
-        f"-I{mlx_include}",
-        f"-I{metal_cpp}",
-        f"-L{mlx_lib}",
-        "-lmlx",
-        "-framework",
-        "Metal",
-        "-framework",
-        "Foundation",
-        # IOKit + CoreFoundation: shared GPU detection in metal_device.cpp queries the
-        # IORegistry. Explicit -framework is load-bearing — "-undefined
-        # dynamic_lookup" below resolves only against already-loaded images,
-        # and nothing else loads IOKit.
-        "-framework",
-        "IOKit",
-        "-framework",
-        "CoreFoundation",
-        # "-lmlx" above validates our MLX symbols at link time and records a
-        # dependency on "@rpath/libmlx.dylib" (libmlx's install name). We add NO
-        # "-Wl,-rpath": baking the build machine's MLX path into a prebuilt wheel
-        # is wrong (it won't exist on the user's machine). So that recorded
-        # dependency is resolved not via an rpath but against an already-resident
-        # libmlx, which dyld matches by install name; "-undefined dynamic_lookup"
-        # resolves any remaining symbols the same way. Both require libmlx to be
-        # loaded first, which metal/__init__.py guarantees by importing mlx.core
-        # before this .so is dlopen'd.
-        "-D_METAL_",
-        "-DNB_DOMAIN=mlx",
-        "-DACCELERATE_NEW_LAPACK",
-        f"-DVLLM_METAL_PARTITION_SIZE={PARTITION_SIZE}",
-        f"-DVLLM_METAL_PA_WINDOW_ROWS={PA_WINDOW_ROWS}",
-        f"-DVLLM_METAL_PA_WINDOW_MAX_HEAD={PA_WINDOW_MAX_HEAD_SIZE}",
-        "-undefined",
-        "dynamic_lookup",
-        str(nb_src),
-        str(_SRC),
-        str(_PAGED_ATTENTION),
-        str(_GDN),
-        str(_MLA),
-        str(_MLX_PATCH),
-        str(_DEVICE_SRC),
-        "-o",
-        str(_OUT),
-    ]
-
-    return _BuildSpec(
-        cmd=cmd,
-        nb_src=nb_src,
-        mlx_lib=mlx_lib,
-        mlx_include=mlx_include,
-        py_include=py_include,
-        mlx_version=_package_version("mlx.core"),
-        nb_version=_package_version("nanobind"),
-    )
-
-
-def _input_hash(spec: _BuildSpec) -> str:
+def _input_hash() -> str:
     h = hashlib.sha256()
-    # Hash the inputs that change the produced .so, but NOT the machine-specific
-    # include/lib paths in spec.cmd: with `-undefined dynamic_lookup` the .so
-    # bakes in no absolute path, so the same sources + MLX/nanobind versions give
-    # an equivalent binary wherever the venv lives (moving it must not flag the
-    # artifact stale). The compile flags and defines (e.g. PARTITION_SIZE) come
-    # from build.py / constants.py, whose contents are hashed in the loop below,
-    # so editing a flag still busts the hash.
-    # Versions catch in-place upgrades where the install path is reused.
-    h.update(f"mlx={spec.mlx_version}\0nb={spec.nb_version}\0".encode())
+    # Paths are excluded so moving an environment does not invalidate artifacts.
+    for name in ("mlx", "nanobind"):
+        h.update(f"{name}={_package_version(name)}\0".encode())
     for p in (
         _SRC,
         _PAGED_ATTENTION,
@@ -444,7 +388,6 @@ def _input_hash(spec: _BuildSpec) -> str:
         _DEVICE_SRC,
         _BUILD,
         _CONSTANTS,
-        spec.nb_src,
     ):
         h.update(p.name.encode())
         h.update(b"\0")
@@ -462,8 +405,10 @@ def needs_rebuild() -> bool:
     if _missing_sentinels():
         return True
     try:
-        spec = _build_spec()
-        return _HASH.read_text().strip() != _input_hash(spec)
+        return (
+            _read_strict(_HASH) != _input_hash()
+            or _read_strict(_build_config_path(_OUT)) != _mlx_build_config()
+        )
     except (OSError, ImportError, RuntimeError):
         return True
 
@@ -503,7 +448,7 @@ def mlx_version_mismatch() -> tuple[str, str] | None:
     built = built_mlx_version()
     if built is None:
         return None
-    installed = _package_version("mlx.core")
+    installed = _package_version("mlx")
     if installed == built:
         return None
     return built, installed
@@ -528,7 +473,7 @@ def stale_artifacts() -> list[Path]:
     if not any(_stamp_path(a).exists() for a in artifacts):
         return []
     try:
-        digests = {_OUT: _input_hash(_build_spec())}
+        digests = {_OUT: _input_hash()}
         for name in all_names:
             digests[metallib_path(name)] = _metallib_digest(
                 name, _metallib_source(name)
@@ -542,30 +487,8 @@ def stale_artifacts() -> list[Path]:
 
 
 def build() -> Path:
-    """JIT-build the native extension, returning the path to the .so.
-
-    Skips the compile when the prebuilt .so is already current (needs_rebuild)."""
-    if not needs_rebuild():
-        return _OUT
-
-    spec = _build_spec()
-    expected_hash = _input_hash(spec)
-    logger.info("Building native paged-attention extension ...")
-
-    for p, label in [
-        (spec.py_include, "Python include"),
-        (spec.mlx_include, "MLX include"),
-        (spec.mlx_lib / "libmlx.dylib", "MLX lib"),
-        (spec.nb_src, "nanobind source"),
-    ]:
-        if not Path(p).exists():
-            raise FileNotFoundError(f"{label} not found: {p}")
-
-    _run_or_raise(spec.cmd, "build paged_ops extension")
-
-    _HASH.write_text(expected_hash)
-    _MLX_VERSION.write_text(spec.mlx_version + "\n")
-    logger.info("Built %s", _OUT)
+    """Build with MetalExtension and return the native launcher's path."""
+    build_metallibs()
     return _OUT
 
 
@@ -639,8 +562,8 @@ def build_mps() -> Path:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    so = build()
-    print(so)
-    for lib in build_metallibs():
+    libraries = build_metallibs()
+    print(output_path())
+    for lib in libraries:
         print(lib)
     print(build_mps())

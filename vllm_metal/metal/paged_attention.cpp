@@ -8,8 +8,6 @@
 // Library caching
 // ---------------------------------------------------------------------------
 
-static std::string v2_paged_attention_source_;
-
 std::atomic<PagedDispatch> g_last_dispatch{PagedDispatch::None};
 std::atomic<int> g_last_gqa_partition{0};
 std::atomic<int> g_last_gqa_requests{0};
@@ -28,10 +26,11 @@ inline void record_paged_dispatch(PagedDispatch family, int gqa_partition = 0,
   g_last_gqa_requests.store(gqa_requests, std::memory_order_relaxed);
 }
 
-// Split only after eight KV partitions amortize the extra dispatch.
-constexpr int kMixedDecodeMinPartitions = 8;
-constexpr int kMixedDecodeMinContext =
-    kMixedDecodeMinPartitions * kPartitionSize;
+// Split a mixed batch's decode rows only when they carry at least this much
+// KV work (the sum of their context lengths). Below it, the extra dispatch
+// costs more than the decode rows' wasted prefill tiles: one 256-token decode
+// row next to a 256-token NAX prefill measured 16% slower split.
+constexpr int64_t kMixedDecodeMinWork = 512;
 
 // Window mode for spec-decode verification (per-token kernel): query rows
 // per threadgroup (2 = the measured register/occupancy sweet spot on Apple
@@ -184,14 +183,6 @@ int gqa_decode_plan_for_lengths(
       ? partition : 0;
 }
 
-void init_v2_library(const std::string& v2_src) {
-  v2_paged_attention_source_ = v2_src;
-  auto& d = metal::device(Device::gpu);
-  d.get_library(
-      "paged_attention_v2_kern",
-      [&]() { return v2_paged_attention_source_; });
-}
-
 // Load a precompiled .metallib instead of compiling its source. Uses MLX's
 // get_library(name, path) overload, which loads the library at `path` and
 // caches it under `name`; a later dispatch's get_library(name) (no path) then
@@ -206,16 +197,8 @@ void init_library_path(const std::string& name, const std::string& path) {
 // NAX (M5 tensor-unit) prefill kernel support
 // ---------------------------------------------------------------------------
 
-static std::string nax_source_;
 bool nax_lib_ready_ = false;   // a NAX library was registered
 bool nax_enabled_ = true;      // test / A-B switch
-
-void init_nax_library(const std::string& nax_src) {
-  nax_source_ = nax_src;
-  auto& d = metal::device(Device::gpu);
-  d.get_library("paged_attention_nax_kern", [&]() { return nax_source_; });
-  nax_lib_ready_ = true;
-}
 
 void init_nax_library_path(const std::string& path) {
   init_library_path("paged_attention_nax_kern", path);
@@ -646,13 +629,21 @@ static PagedAttentionPlan select_paged_attention_route(
   const auto tile_config = has_prefill && !window_batch && !m.use_turboquant
       && dtype_ok ? kernels::select_tile_config(m.head_size) : std::nullopt;
 
-  // Split long ordinary decode rows from NAX or tiled prefill: a one-row
-  // decode sequence would otherwise occupy a whole BQ-row prefill tile with
-  // no KV-length parallelism. Spec verify windows keep their whole-batch route.
+  // Split ordinary decode rows from NAX or tiled prefill: a one-row decode
+  // sequence would otherwise occupy a whole BQ-row prefill tile with no
+  // KV-length parallelism. Gate on total decode work, not context length:
+  // many short rows gain the most from the split
+  // (tools/benchmark/mixed_decode_split_benchmark.py). The decode-prefix
+  // length plan carries the exact sum. Without one, the longest row is a
+  // lower bound on it, so uneven rows are never split on overcounted work.
+  // Spec verify windows keep their whole-batch route.
+  const int64_t decode_work =
+      m.gqa_length_plan.num_requests == m.num_decode_requests
+      ? m.gqa_length_plan.total_length : m.max_decode_context_len;
   const bool split_mixed_batch = m.num_decode_requests > 0
       && m.num_decode_requests < num_seqs
       && m.num_decode_tokens == m.num_decode_requests
-      && m.max_decode_context_len >= kMixedDecodeMinContext
+      && decode_work >= kMixedDecodeMinWork
       && (use_nax || tile_config.has_value());
   PagedAttentionPlan plan;
   plan.total_q_tokens = total_q_tokens;

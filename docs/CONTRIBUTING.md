@@ -74,3 +74,6 @@ Open a pull request against `main` in `vllm-project/vllm-metal`.
 uv pip install -r docs/requirements-docs.txt
 mkdocs serve
 ```
+
+For the Mac-memory guide, edit recipe commands and notes in `recipes/overlays/`.
+Choose and order recommendations in `recipes/featured.yaml`.
