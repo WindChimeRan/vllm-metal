@@ -57,16 +57,6 @@ _SUPPORTED_REMOTE_TAGS = frozenset(
     }
 )
 _CONFIG_ALLOW_PATTERNS = ("config.json", "generation_config.json")
-_TOKENIZER_ALLOW_PATTERNS = (
-    "*.json",
-    "*.py",
-    "tokenizer.model",
-    "*.tiktoken",
-    "tiktoken.model",
-    "*.txt",
-    "*.jsonl",
-    "*.jinja",
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,11 +192,10 @@ class RemoteGGUFReference:
 
 @dataclass(frozen=True, slots=True)
 class GGUFLoadSource:
-    """Local GGUF weights plus companion config/tokenizer sources."""
+    """Local GGUF weights and companion model config."""
 
     weights_path: str
     config_dir: str
-    tokenizer_dir: str
 
     @classmethod
     def from_model_config(
@@ -250,17 +239,9 @@ class GGUFLoadSource:
                 ignore_patterns=ignore_patterns,
                 token=token,
             )
-        tokenizer_dir = cls._resolve_companion_source(
-            model_config.tokenizer or model_config.model,
-            cache_dir=cache_dir,
-            revision=model_config.tokenizer_revision or model_config.revision,
-            token=token,
-            allow_patterns=_TOKENIZER_ALLOW_PATTERNS,
-        )
         return cls(
             weights_path=weights_path,
             config_dir=config_dir,
-            tokenizer_dir=tokenizer_dir,
         )
 
     @staticmethod

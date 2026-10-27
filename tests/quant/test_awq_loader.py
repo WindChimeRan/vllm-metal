@@ -57,7 +57,9 @@ class TestConfigDetection:
         load = Mock(return_value=(nn.Module(), None))
         monkeypatch.setattr("vllm_metal.quant.awq_loader.hf_hub_download", download)
         resolve = Mock(return_value=config_dir)
-        monkeypatch.setattr("vllm_metal.quant.awq_loader.mlx_lm_download", resolve)
+        monkeypatch.setattr(
+            "vllm_metal.quant.awq_loader.resolve_mlx_lm_model_path", resolve
+        )
         monkeypatch.setattr("vllm_metal.quant.awq_loader.mlx_lm_load_model", load)
 
         loader = AWQQuantLoader.for_model("org/model", revision=revision)
@@ -270,7 +272,7 @@ def aligned_load(monkeypatch):
 
     def _aligned_load(model: nn.Module) -> None:
         monkeypatch.setattr(
-            "vllm_metal.quant.awq_loader.mlx_lm_download",
+            "vllm_metal.quant.awq_loader.resolve_mlx_lm_model_path",
             lambda *_, **__: Path("any/path"),
         )
         monkeypatch.setattr(

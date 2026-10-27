@@ -27,7 +27,6 @@ import mlx.core as mx
 import mlx.nn as nn
 from huggingface_hub import hf_hub_download
 from mlx.utils import tree_flatten
-from mlx_lm.utils import _download as mlx_lm_download
 from mlx_lm.utils import load_model as mlx_lm_load_model
 from vllm.logger import init_logger
 
@@ -35,6 +34,7 @@ from vllm_metal.quant.awq_config import (
     UnsupportedQuantizationConfigError,
     normalize_quant_config,
 )
+from vllm_metal.utils import resolve_mlx_lm_model_path
 
 logger = init_logger(__name__)
 
@@ -109,7 +109,7 @@ class AWQQuantLoader:
         the lifecycle resolves via ``_mlx_lm_compatible_model_path``; the
         owner does not duplicate that path discovery.
         """
-        resolved_path = mlx_lm_download(model_path, revision=revision)
+        resolved_path = resolve_mlx_lm_model_path(model_path, revision=revision)
         model, _ = mlx_lm_load_model(
             resolved_path, model_config=self._mlx_lm_model_config
         )

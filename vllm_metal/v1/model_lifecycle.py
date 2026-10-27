@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-from mlx_lm.utils import _download as mlx_lm_download
 from mlx_lm.utils import load_model as mlx_lm_load_model
 from mlx_vlm.utils import get_model_path as mlx_vlm_model_path
 from mlx_vlm.utils import load_model as mlx_vlm_load_model
@@ -30,7 +29,7 @@ from vllm_metal.moe_offload import ExpertStore
 from vllm_metal.multimodal.gemma4 import Gemma4VisionSidecar
 from vllm_metal.quant.awq_loader import AWQQuantLoader
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
-from vllm_metal.utils import get_model_download_path
+from vllm_metal.utils import get_model_download_path, resolve_mlx_lm_model_path
 from vllm_metal.v1.gemma4_mtp import Gemma4MTPAssistantLoader
 from vllm_metal.v1.mlx_lm_paths import (
     mlx_lm_compatible_model_path as _mlx_lm_compatible_model_path,
@@ -472,7 +471,9 @@ class ModelLifecycle:
         revision: str | None = None,
     ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-            model_path = mlx_lm_download(str(compatible_model_name), revision=revision)
+            model_path = resolve_mlx_lm_model_path(
+                str(compatible_model_name), revision=revision
+            )
             model, _ = mlx_lm_load_model(model_path, lazy=lazy)
         return model
 

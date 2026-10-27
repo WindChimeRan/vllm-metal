@@ -133,7 +133,7 @@ def test_draft_load_preserves_revision(monkeypatch, revision):
     load = Mock(return_value=(model, None))
     monkeypatch.setattr(draft_model_proposer, "get_model_download_path", resolve_path)
     download = Mock(return_value="cached-draft")
-    monkeypatch.setattr(draft_model_proposer, "mlx_lm_download", download)
+    monkeypatch.setattr(draft_model_proposer, "resolve_mlx_lm_model_path", download)
     monkeypatch.setattr(draft_model_proposer, "mlx_lm_load_model", load)
 
     assert draft_model_proposer._load_draft_model(config, None) == (model, dims)

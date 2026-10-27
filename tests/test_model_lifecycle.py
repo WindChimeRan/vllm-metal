@@ -243,7 +243,7 @@ class TestModelLifecycle:
         )
         monkeypatch.setattr(model_lifecycle.AWQQuantLoader, "for_model", detect_awq)
         monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", weights_loader)
-        monkeypatch.setattr(model_lifecycle, "mlx_lm_download", download)
+        monkeypatch.setattr(model_lifecycle, "resolve_mlx_lm_model_path", download)
         monkeypatch.setattr(model_lifecycle, "mlx_vlm_load_model", loader)
         monkeypatch.setattr(model_lifecycle, "mlx_vlm_model_path", download)
         lifecycle, runner = _make_lifecycle(
@@ -254,6 +254,9 @@ class TestModelLifecycle:
             )
         )
         runner._is_pooling = backend == "pooling"
+        resolve_path = Mock(return_value="resolved/model")
+        monkeypatch.setattr(model_lifecycle, "get_model_download_path", resolve_path)
+        request = GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
         if backend == "offload":
             monkeypatch.setattr(
                 model_lifecycle,
@@ -262,21 +265,33 @@ class TestModelLifecycle:
             )
             install_experts = Mock(return_value=object())
             monkeypatch.setattr(model_lifecycle.ExpertStore, "install", install_experts)
-        assert lifecycle._load_generation_model("org/model", backend == "vlm") is model
+        assert (
+            lifecycle._load_generation_model(
+                request.model_name,
+                request.is_vlm,
+                model_config=request.model_config,
+                target_dtype=request.target_dtype,
+                lazy_weights=request.lazy_weights,
+            )
+            is model
+        )
+        resolve_path.assert_called_once_with("org/model", revision=revision)
         if backend == "awq":
             loader.assert_called_once_with(
-                "org/model", target_dtype=mx.float16, revision=revision
+                "resolved/model", target_dtype=mx.float16, revision=revision
             )
         else:
-            download.assert_called_once_with("org/model", revision=revision)
+            download.assert_called_once_with("resolved/model", revision=revision)
             (loader if backend == "vlm" else weights_loader).assert_called_once_with(
                 Path("cached-model"), lazy=backend == "offload"
             )
         if backend == "offload":
-            install_experts.assert_called_once_with(model, "org/model", revision, 4096)
+            install_experts.assert_called_once_with(
+                model, "resolved/model", revision, 4096
+            )
             assert runner._expert_store is install_experts.return_value
         if backend != "vlm":
-            detect_awq.assert_called_once_with("org/model", revision=revision)
+            detect_awq.assert_called_once_with("resolved/model", revision=revision)
 
     def test_private_mlx_lm_compatible_model_path_adapts_indexed_custom_shards(
         self, tmp_path: Path
@@ -427,7 +442,7 @@ class TestModelLifecycle:
 
         monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", _fake_load)
         monkeypatch.setattr(
-            model_lifecycle, "mlx_lm_download", lambda name, **_: Path(name)
+            model_lifecycle, "resolve_mlx_lm_model_path", lambda name, **_: Path(name)
         )
         monkeypatch.setattr(
             model_lifecycle,
@@ -629,7 +644,7 @@ class TestModelLifecycle:
         monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
         monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", _load_text)
         monkeypatch.setattr(
-            model_lifecycle, "mlx_lm_download", lambda name, **_: Path(name)
+            model_lifecycle, "resolve_mlx_lm_model_path", lambda name, **_: Path(name)
         )
 
         lifecycle, runner = _make_lifecycle(
@@ -1045,7 +1060,7 @@ class TestModelLifecycle:
         monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
         monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", _fake_mlx_lm_load)
         monkeypatch.setattr(
-            model_lifecycle, "mlx_lm_download", lambda name, **_: Path(name)
+            model_lifecycle, "resolve_mlx_lm_model_path", lambda name, **_: Path(name)
         )
 
         lifecycle, runner = _make_lifecycle()
@@ -1180,7 +1195,7 @@ class TestModelLifecycle:
             lambda *_args, **_kwargs: (fake_model, {}),
         )
         monkeypatch.setattr(
-            model_lifecycle, "mlx_lm_download", lambda name, **_: Path(name)
+            model_lifecycle, "resolve_mlx_lm_model_path", lambda name, **_: Path(name)
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config()  # no quantization -> not gguf

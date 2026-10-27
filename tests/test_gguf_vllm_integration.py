@@ -532,13 +532,12 @@ def test_remote_reference_grammar() -> None:
 
 
 @pytest.mark.parametrize("quant", ["Q8_0", "Q5_0", "Q5_1", "Q2_K", "Q3_K_M"])
-def test_remote_load_source_downloads_one_matching_gguf(
+def test_remote_load_source_downloads_weights_and_config_without_tokenizer(
     tmp_path, monkeypatch, quant: str
 ) -> None:
     weight_snapshot = tmp_path / "weights"
     config_snapshot = tmp_path / "config"
-    tokenizer_snapshot = tmp_path / "tokenizer"
-    for directory in (weight_snapshot, config_snapshot, tokenizer_snapshot):
+    for directory in (weight_snapshot, config_snapshot):
         directory.mkdir()
     (config_snapshot / "config.json").write_text(json.dumps(_TINY_CONFIG))
     gguf_path = weight_snapshot / f"Qwen3-0.6B-{quant}.gguf"
@@ -561,8 +560,6 @@ def test_remote_load_source_downloads_one_matching_gguf(
             return str(weight_snapshot)
         if kwargs["repo_id"] == "Qwen/Qwen3-0.6B":
             return str(config_snapshot)
-        if kwargs["repo_id"] == "Qwen/Qwen3-0.6B-Tokenizer":
-            return str(tokenizer_snapshot)
         raise AssertionError(f"unexpected repo_id={kwargs['repo_id']!r}")
 
     monkeypatch.setattr(
@@ -590,8 +587,7 @@ def test_remote_load_source_downloads_one_matching_gguf(
     assert source is not None
     assert source.weights_path == str(gguf_path)
     assert source.config_dir == str(config_snapshot)
-    assert source.tokenizer_dir == str(tokenizer_snapshot)
-    # The weights repo gets its own revision; the companion repos keep theirs.
+    # The weights repo gets its own revision; the config keeps its requested one.
     assert resolve_calls == [
         (
             "Qwen/Qwen3-0.6B-GGUF",
@@ -610,7 +606,7 @@ def test_remote_load_source_downloads_one_matching_gguf(
             "token": "hf-token",
         }
     ]
-    config_call, weight_call, tokenizer_call = calls
+    config_call, weight_call = calls
     assert weight_call == {
         "repo_id": "Qwen/Qwen3-0.6B-GGUF",
         "cache_dir": str(tmp_path / "cache"),
@@ -624,22 +620,6 @@ def test_remote_load_source_downloads_one_matching_gguf(
         "cache_dir": str(tmp_path / "cache"),
         "allow_patterns": ["config.json", "generation_config.json"],
         "revision": "rev-a",
-        "token": "hf-token",
-    }
-    assert tokenizer_call == {
-        "repo_id": "Qwen/Qwen3-0.6B-Tokenizer",
-        "cache_dir": str(tmp_path / "cache"),
-        "allow_patterns": [
-            "*.json",
-            "*.py",
-            "tokenizer.model",
-            "*.tiktoken",
-            "tiktoken.model",
-            "*.txt",
-            "*.jsonl",
-            "*.jinja",
-        ],
-        "revision": "tok-rev",
         "token": "hf-token",
     }
 
