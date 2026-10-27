@@ -57,7 +57,8 @@ from typing import TYPE_CHECKING, Any
 from weakref import WeakValueDictionary
 
 import mlx.core as mx
-from mlx_lm import load as mlx_lm_load
+from mlx_lm.utils import _download as mlx_lm_download
+from mlx_lm.utils import load_model as mlx_lm_load_model
 from vllm.logger import init_logger
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
@@ -968,8 +969,9 @@ def _load_draft_model(
         draft_model_config.model, revision=draft_model_config.revision
     )
     with mlx_lm_compatible_model_path(model_path) as compatible_path:
-        model, _ = mlx_lm_load(
+        resolved_path = mlx_lm_download(
             str(compatible_path), revision=draft_model_config.revision
         )
+        model, _ = mlx_lm_load_model(resolved_path)
 
     return model, dims

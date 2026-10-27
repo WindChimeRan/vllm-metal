@@ -192,29 +192,27 @@ def _stub_generation_model(
     monkeypatch: pytest.MonkeyPatch,
     *,
     config: object,
-    tokenizer: object | None = None,
     is_vlm: bool = False,
     model: object | None = None,
-) -> tuple[object, object]:
+) -> object:
     fake_model = model or SimpleNamespace(config=config)
-    fake_tokenizer = object() if tokenizer is None else tokenizer
 
     def _load_generation_model(
         self: ModelLifecycle,
         model_name: str,
         actual_is_vlm: bool,
         **_: object,
-    ) -> tuple[object, object]:
+    ) -> object:
         assert model_name == "stub-model"
         assert actual_is_vlm is is_vlm
-        return fake_model, fake_tokenizer
+        return fake_model
 
     monkeypatch.setattr(
         ModelLifecycle,
         "_load_generation_model",
         _load_generation_model,
     )
-    return fake_model, fake_tokenizer
+    return fake_model
 
 
 def _make_lifecycle(
@@ -232,19 +230,22 @@ def _make_lifecycle(
 
 class TestModelLifecycle:
     @pytest.mark.parametrize("revision", [None, "release-tag", "a" * 40])
-    @pytest.mark.parametrize("backend", ["text", "vlm", "awq"])
-    def test_generation_load_preserves_revision(
+    @pytest.mark.parametrize("backend", ["text", "vlm", "awq", "pooling", "offload"])
+    def test_generation_loads_only_weights_at_requested_revision(
         self, monkeypatch: pytest.MonkeyPatch, revision: str | None, backend: str
     ) -> None:
-        model, tokenizer = object(), object()
-        loader = Mock(return_value=(model, tokenizer))
-        awq_loader = SimpleNamespace(load=loader) if backend == "awq" else None
-        detect_awq = Mock(return_value=awq_loader)
+        model = object()
+        loader = Mock(return_value=model)
+        weights_loader = Mock(return_value=(model, {}))
+        download = Mock(return_value=Path("cached-model"))
+        detect_awq = Mock(
+            return_value=SimpleNamespace(load=loader) if backend == "awq" else None
+        )
         monkeypatch.setattr(model_lifecycle.AWQQuantLoader, "for_model", detect_awq)
-        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", loader)
-        monkeypatch.setattr(model_lifecycle, "mlx_vlm_load", loader)
-        resolve_path = Mock(return_value="org/model")
-        monkeypatch.setattr(model_lifecycle, "get_model_download_path", resolve_path)
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", weights_loader)
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_download", download)
+        monkeypatch.setattr(model_lifecycle, "mlx_vlm_load_model", loader)
+        monkeypatch.setattr(model_lifecycle, "mlx_vlm_model_path", download)
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
                 model="org/model",
@@ -252,20 +253,28 @@ class TestModelLifecycle:
                 is_multimodal_model=backend == "vlm",
             )
         )
-        request = GenerationLoadRequest.from_runner(runner, _mode_adapter("native"))
-
-        result = lifecycle._load_generation_model(
-            request.model_name,
-            request.is_vlm,
-            model_config=request.model_config,
-            target_dtype=request.target_dtype,
-        )
-
-        assert result == (model, tokenizer)
-        resolve_path.assert_called_once_with("org/model", revision=revision)
-        loader.assert_called_once()
-        assert loader.call_args.args == ("org/model",)
-        assert loader.call_args.kwargs["revision"] == revision
+        runner._is_pooling = backend == "pooling"
+        if backend == "offload":
+            monkeypatch.setattr(
+                model_lifecycle,
+                "get_config",
+                lambda: SimpleNamespace(moe_expert_cache_bytes=4096),
+            )
+            install_experts = Mock(return_value=object())
+            monkeypatch.setattr(model_lifecycle.ExpertStore, "install", install_experts)
+        assert lifecycle._load_generation_model("org/model", backend == "vlm") is model
+        if backend == "awq":
+            loader.assert_called_once_with(
+                "org/model", target_dtype=mx.float16, revision=revision
+            )
+        else:
+            download.assert_called_once_with("org/model", revision=revision)
+            (loader if backend == "vlm" else weights_loader).assert_called_once_with(
+                Path("cached-model"), lazy=backend == "offload"
+            )
+        if backend == "offload":
+            install_experts.assert_called_once_with(model, "org/model", revision, 4096)
+            assert runner._expert_store is install_experts.return_value
         if backend != "vlm":
             detect_awq.assert_called_once_with("org/model", revision=revision)
 
@@ -359,7 +368,6 @@ class TestModelLifecycle:
         assert request.hf_config is hf_config
         assert request.is_vlm is False
         assert request.target_dtype is not None
-        assert request.tokenizer_config == {"trust_remote_code": True}
         assert calls == [runner.model_config]
 
     def test_effective_multimodal_gguf_is_rejected(self) -> None:
@@ -409,12 +417,18 @@ class TestModelLifecycle:
         captured: dict[str, object] = {}
 
         def _fake_load(
-            path: str, *, tokenizer_config: object, lazy: bool, revision: str | None
+            path: str,
+            *,
+            lazy: bool,
+            revision: str | None = None,
         ) -> tuple[object, object]:
             captured["lazy"] = lazy
             return object(), object()
 
-        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_load)
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", _fake_load)
+        monkeypatch.setattr(
+            model_lifecycle, "mlx_lm_download", lambda name, **_: Path(name)
+        )
         monkeypatch.setattr(
             model_lifecycle,
             "_mlx_lm_compatible_model_path",
@@ -422,9 +436,9 @@ class TestModelLifecycle:
         )
         lifecycle, _ = _make_lifecycle()
 
-        lifecycle._load_mlx_lm_text_model("stub", {}, lazy=True)
+        lifecycle._load_mlx_lm_text_model("stub", lazy=True)
         assert captured["lazy"] is True
-        lifecycle._load_mlx_lm_text_model("stub", {}, lazy=False)
+        lifecycle._load_mlx_lm_text_model("stub", lazy=False)
         assert captured["lazy"] is False
 
     def test_load_uses_adapter_override_for_qwen35_fp8_conditional_generation(
@@ -599,7 +613,6 @@ class TestModelLifecycle:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         text_model = SimpleNamespace(config=_text_config())
-        text_tokenizer = object()
 
         class _StubAWQLoader:
             @classmethod
@@ -609,14 +622,15 @@ class TestModelLifecycle:
         def _load_text(
             _model_name: str,
             *,
-            tokenizer_config: object,
             lazy: bool,
-            revision: str | None,
         ) -> tuple[object, object]:
-            return text_model, text_tokenizer
+            return text_model, {}
 
         monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
-        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _load_text)
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", _load_text)
+        monkeypatch.setattr(
+            model_lifecycle, "mlx_lm_download", lambda name, **_: Path(name)
+        )
 
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config(
@@ -627,7 +641,6 @@ class TestModelLifecycle:
         lifecycle.load()
 
         assert runner.model is text_model
-        assert runner.tokenizer is text_tokenizer
         assert runner._is_vlm is False
 
     def test_load_vlm_pipeline_parallel_uses_mlx_vlm_lazy_loading(
@@ -635,16 +648,16 @@ class TestModelLifecycle:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         vlm_model = _qwen35_vlm_model()
-        vlm_tokenizer = object()
         vlm_lazy: list[bool] = []
 
-        def _load_vlm(
-            _model_name: str, *, lazy: bool, revision: str | None
-        ) -> tuple[object, object]:
+        def _load_vlm(_model_path: Path, *, lazy: bool) -> object:
             vlm_lazy.append(lazy)
-            return vlm_model, vlm_tokenizer
+            return vlm_model
 
-        monkeypatch.setattr(model_lifecycle, "mlx_vlm_load", _load_vlm)
+        monkeypatch.setattr(model_lifecycle, "mlx_vlm_load_model", _load_vlm)
+        monkeypatch.setattr(
+            model_lifecycle, "mlx_vlm_model_path", lambda name, **_: Path(name)
+        )
         monkeypatch.setenv("VLLM_METAL_MULTIMODAL_MODE", "multimodal-native")
         reset_config()
 
@@ -663,7 +676,6 @@ class TestModelLifecycle:
         lifecycle.load()
 
         assert runner.model is vlm_model
-        assert runner.tokenizer is vlm_tokenizer
         assert runner._is_vlm is True
         assert vlm_lazy == [True]
 
@@ -705,18 +717,15 @@ class TestModelLifecycle:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        fake_tokenizer = object()
-        fake_model, _ = _stub_generation_model(
+        fake_model = _stub_generation_model(
             monkeypatch,
             config=_text_config(),
-            tokenizer=fake_tokenizer,
         )
         lifecycle, runner = _make_lifecycle()
 
         lifecycle.load()
 
         assert runner.model is fake_model
-        assert runner.tokenizer is fake_tokenizer
         assert runner.model_args["vocab_size"] == 32000
         assert runner.hidden_size == 4096
         assert runner.kv_cache_dtype is not None
@@ -1002,21 +1011,8 @@ class TestModelLifecycle:
         monkeypatch: pytest.MonkeyPatch,
         is_awq: bool,
     ) -> None:
-        """Pin both sides of the lifecycle dispatch contract introduced
-        by the owner-shape refactor.
-
-        When ``AWQQuantLoader.for_model`` reports an AWQ checkpoint,
-        ``ModelLifecycle._load_generation_model`` delegates the actual
-        load to ``AWQQuantLoader.load`` and never falls back to the
-        generic ``mlx_lm.load``. When it returns ``None`` (non-AWQ),
-        lifecycle uses the generic ``mlx_lm.load`` and never passes
-        ``model_config`` (which is reserved for the AWQ owner's
-        normalized quant config kwargs). AWQ *detection* — not the
-        model-name string or any other heuristic — is what gates the
-        dispatch.
-        """
+        """AWQ uses its owner; ordinary unquantized text loads only the model."""
         fake_model = SimpleNamespace(config=_text_config())
-        fake_tokenizer = object()
         awq_load_calls: list[dict[str, object]] = []
         mlx_lm_load_calls: list[dict[str, object]] = []
 
@@ -1032,32 +1028,30 @@ class TestModelLifecycle:
                 model_path: str,
                 *,
                 target_dtype: object,
-                tokenizer_config: dict[str, object] | None,
                 revision: str | None,
-            ) -> tuple[object, object]:
+            ) -> object:
                 awq_load_calls.append(
                     {
                         "model_path": model_path,
                         "target_dtype": target_dtype,
-                        "tokenizer_config": (
-                            dict(tokenizer_config) if tokenizer_config else None
-                        ),
                     }
                 )
-                return fake_model, fake_tokenizer
+                return fake_model
 
         def _fake_mlx_lm_load(*args: object, **kwargs: object) -> tuple[object, object]:
             mlx_lm_load_calls.append({"args": args, "kwargs": kwargs})
-            return fake_model, fake_tokenizer
+            return fake_model, {}
 
         monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
-        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", _fake_mlx_lm_load)
+        monkeypatch.setattr(
+            model_lifecycle, "mlx_lm_download", lambda name, **_: Path(name)
+        )
 
         lifecycle, runner = _make_lifecycle()
         lifecycle.load()
 
         assert runner.model is fake_model
-        assert runner.tokenizer is fake_tokenizer
 
         if is_awq:
             assert len(awq_load_calls) == 1, (
@@ -1074,7 +1068,6 @@ class TestModelLifecycle:
                 "lifecycle must derive target_dtype from "
                 "runner.model_config.dtype and thread it to the loader"
             )
-            assert call["tokenizer_config"] == {"trust_remote_code": False}
         else:
             assert awq_load_calls == [], (
                 "AWQQuantLoader.load must NOT be called for a non-AWQ checkpoint"
@@ -1095,11 +1088,10 @@ class TestModelLifecycle:
         .gguf) delegates the whole load to ``GGUFModelLoader`` (lazily imported)
         and never calls generic ``mlx_lm.load`` — detection-routed like the AWQ
         branch, no env flag. The lifecycle threads the ``.gguf`` path from
-        ``model_config.model_weights``, the ``--tokenizer`` dir, derived dtype,
-        and tokenizer config to the owner.
+        ``model_config.model_weights``, the config directory, and derived dtype
+        to the owner. The frontend's tokenizer is not a model-loader input.
         """
         fake_model = SimpleNamespace(config=_text_config())
-        fake_tokenizer = object()
         loader_calls: list[dict[str, object]] = []
         mlx_lm_load_calls: list[dict[str, object]] = []
 
@@ -1109,28 +1101,22 @@ class TestModelLifecycle:
                 gguf_path: str,
                 *,
                 config_dir: str,
-                tokenizer_dir: str,
                 target_dtype: object,
-                tokenizer_config: dict[str, object] | None = None,
             ) -> None:
                 loader_calls.append(
                     {
                         "gguf_path": gguf_path,
                         "config_dir": config_dir,
-                        "tokenizer_dir": tokenizer_dir,
                         "target_dtype": target_dtype,
-                        "tokenizer_config": (
-                            dict(tokenizer_config) if tokenizer_config else None
-                        ),
                     }
                 )
 
-            def load(self) -> tuple[object, object]:
-                return fake_model, fake_tokenizer
+            def load(self) -> object:
+                return fake_model
 
         def _fake_mlx_lm_load(*args: object, **kwargs: object) -> tuple[object, object]:
             mlx_lm_load_calls.append({"args": args, "kwargs": kwargs})
-            return fake_model, fake_tokenizer
+            return fake_model, {}
 
         # The owner is imported lazily inside the branch; inject the stub module
         # so the `from vllm_metal.gguf.loader import GGUFModelLoader` resolves to it.
@@ -1139,7 +1125,7 @@ class TestModelLifecycle:
             "vllm_metal.gguf.loader",
             SimpleNamespace(GGUFModelLoader=_StubGGUFLoader),
         )
-        monkeypatch.setattr(model_lifecycle, "mlx_lm_load", _fake_mlx_lm_load)
+        monkeypatch.setattr(model_lifecycle, "mlx_lm_load_model", _fake_mlx_lm_load)
         config_dir = tmp_path / "config"
         tokenizer_dir = tmp_path / "tokenizer"
         config_dir.mkdir()
@@ -1156,7 +1142,6 @@ class TestModelLifecycle:
         lifecycle.load()
 
         assert runner.model is fake_model
-        assert runner.tokenizer is fake_tokenizer
         assert mlx_lm_load_calls == [], (
             "generic mlx_lm.load must NOT be called when the GGUF owner owns "
             "the load path"
@@ -1165,12 +1150,10 @@ class TestModelLifecycle:
         call = loader_calls[0]
         assert call["gguf_path"] == "stub-model.gguf"
         assert call["config_dir"] == str(config_dir)
-        assert call["tokenizer_dir"] == str(tokenizer_dir)
         assert call["target_dtype"] is not None, (
             "lifecycle must derive target_dtype from runner.model_config.dtype "
             "and thread it to the owner"
         )
-        assert call["tokenizer_config"] == {"trust_remote_code": False}
 
     def test_non_gguf_model_does_not_route_or_import_gguf(
         self,
@@ -1183,7 +1166,6 @@ class TestModelLifecycle:
         raises on import). A generic load must leave the GGUF owner unimported.
         """
         fake_model = SimpleNamespace(config=_text_config())
-        fake_tokenizer = object()
 
         class _StubAWQLoader:
             @classmethod
@@ -1194,8 +1176,11 @@ class TestModelLifecycle:
         monkeypatch.setattr(model_lifecycle, "AWQQuantLoader", _StubAWQLoader)
         monkeypatch.setattr(
             model_lifecycle,
-            "mlx_lm_load",
-            lambda *_args, **_kwargs: (fake_model, fake_tokenizer),
+            "mlx_lm_load_model",
+            lambda *_args, **_kwargs: (fake_model, {}),
+        )
+        monkeypatch.setattr(
+            model_lifecycle, "mlx_lm_download", lambda name, **_: Path(name)
         )
         lifecycle, runner = _make_lifecycle(
             model_config=_runner_model_config()  # no quantization -> not gguf
@@ -1206,57 +1191,6 @@ class TestModelLifecycle:
         assert runner.model is fake_model
         assert runner._is_vlm is False
         assert runner.model_args["vocab_size"] == 32000
-
-    def test_gguf_load_threads_config_and_tokenizer_sources(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """GGUF loads keep the config source separate from the tokenizer source."""
-        loader_sources: list[tuple[str, str]] = []
-
-        class _StubGGUFLoader:
-            def __init__(
-                self,
-                gguf_path: str,
-                *,
-                config_dir: str,
-                tokenizer_dir: str,
-                target_dtype: object,
-                tokenizer_config: dict[str, object] | None = None,
-            ) -> None:
-                loader_sources.append((config_dir, tokenizer_dir))
-                self._tokenizer_dir = tokenizer_dir
-
-            def load(self) -> tuple[object, object]:
-                return (
-                    SimpleNamespace(config=_text_config()),
-                    f"tokenizer::{self._tokenizer_dir}",
-                )
-
-        monkeypatch.setitem(
-            sys.modules,
-            "vllm_metal.gguf.loader",
-            SimpleNamespace(GGUFModelLoader=_StubGGUFLoader),
-        )
-
-        def _load_tokenizer_for(tokenizer_dir: str) -> object:
-            lifecycle, runner = _make_lifecycle(
-                model_config=_runner_model_config(
-                    model="/config-dir",
-                    quantization="gguf",
-                    tokenizer=tokenizer_dir,
-                    model_weights="stub-model.gguf",
-                )
-            )
-            lifecycle.load()
-            return runner.tokenizer
-
-        first = _load_tokenizer_for("/dir-a")
-        second = _load_tokenizer_for("/dir-b")
-
-        assert loader_sources == [("/config-dir", "/dir-a"), ("/config-dir", "/dir-b")]
-        assert first == "tokenizer::/dir-a"
-        assert second == "tokenizer::/dir-b"
 
 
 class TestResolveModelDims:

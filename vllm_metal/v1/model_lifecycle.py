@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
-from mlx_lm import load as mlx_lm_load
-from mlx_vlm import load as mlx_vlm_load
+from mlx_lm.utils import _download as mlx_lm_download
+from mlx_lm.utils import load_model as mlx_lm_load_model
+from mlx_vlm.utils import get_model_path as mlx_vlm_model_path
+from mlx_vlm.utils import load_model as mlx_vlm_load_model
 from vllm.logger import init_logger
 
 from vllm_metal.attention.impls.mla import MLA_DEFAULT_QK_ROPE_HEAD_DIM
@@ -84,7 +86,6 @@ class GenerationLoadRequest:
     hf_config: Any
     is_vlm: bool
     target_dtype: Any
-    tokenizer_config: Mapping[str, Any]
     gguf_source: GGUFLoadSource | None
     lazy_weights: bool
     backbone_mode: str = "native"
@@ -160,7 +161,6 @@ class GenerationLoadRequest:
             hf_config=hf_config,
             is_vlm=is_vlm,
             target_dtype=TORCH_TO_MLX_DTYPE[model_config.dtype],
-            tokenizer_config={"trust_remote_code": model_config.trust_remote_code},
             gguf_source=gguf_source,
             lazy_weights=lazy_weights,
             backbone_mode=backbone_mode,
@@ -173,7 +173,6 @@ class LoadedGenerationModel:
     """Loaded generation model plus metadata needed to wire the runner."""
 
     model: Any
-    tokenizer: Any
     model_args: dict[str, Any]
     sidecar: Any | None = None
 
@@ -223,7 +222,6 @@ class ModelLifecycle:
         runner._pooling_backend = build_decoder_pooling_backend(
             runner._forward_model,
             runner.model_config,
-            runner.tokenizer,
         )
 
     def install_decode_dispatch(self) -> None:
@@ -272,18 +270,16 @@ class ModelLifecycle:
     ) -> LoadedGenerationModel:
         if request.backbone_mode == "text_sidecar" and request.is_vlm:
             return self._load_text_sidecar(request)
-        model, tokenizer = self._load_generation_model(
+        model = self._load_generation_model(
             request.model_name,
             request.is_vlm,
             model_config=request.model_config,
             target_dtype=request.target_dtype,
-            tokenizer_config=request.tokenizer_config,
             gguf_source=request.gguf_source,
             lazy_weights=request.lazy_weights,
         )
         return LoadedGenerationModel(
             model=model,
-            tokenizer=tokenizer,
             model_args=self._extract_model_args(model, request.is_vlm),
         )
 
@@ -315,12 +311,11 @@ class ModelLifecycle:
                 "Gemma 4 vision sidecar: bidirectional image attention does not "
                 "support logit softcap or attention sinks"
             )
-        model, tokenizer = self._load_generation_model(
+        model = self._load_generation_model(
             request.model_name,
             False,
             model_config=request.model_config,
             target_dtype=request.target_dtype,
-            tokenizer_config=request.tokenizer_config,
             gguf_source=None,
             lazy_weights=request.lazy_weights,
         )
@@ -335,7 +330,6 @@ class ModelLifecycle:
         sidecar = Gemma4VisionSidecar.load(request.sidecar_checkpoint)
         return LoadedGenerationModel(
             model=model,
-            tokenizer=tokenizer,
             model_args=self._extract_model_args(model, False),
             sidecar=sidecar,
         )
@@ -346,7 +340,6 @@ class ModelLifecycle:
     ) -> None:
         runner = self._runner
         runner.model = loaded_model.model
-        runner.tokenizer = loaded_model.tokenizer
         runner._is_vlm = False
         runner._multimodal_adapter = None
         runner.encoder_cache = None
@@ -362,19 +355,13 @@ class ModelLifecycle:
         *,
         model_config: Any | None = None,
         target_dtype: Any | None = None,
-        tokenizer_config: Mapping[str, Any] | None = None,
         gguf_source: GGUFLoadSource | None = None,
         lazy_weights: bool = False,
-    ) -> tuple[Any, Any]:
+    ) -> Any:
         """Load a text or VLM generation model."""
 
         model_config = (
             self._runner.model_config if model_config is None else model_config
-        )
-        tokenizer_config = (
-            {"trust_remote_code": model_config.trust_remote_code}
-            if tokenizer_config is None
-            else dict(tokenizer_config)
         )
         if not is_vlm and target_dtype is None:
             target_dtype = TORCH_TO_MLX_DTYPE[model_config.dtype]
@@ -402,34 +389,32 @@ class ModelLifecycle:
 
         if is_gguf:
             load_label = "GGUF model"
-            model, tokenizer = self._load_gguf_text_model(
+            model = self._load_gguf_text_model(
                 gguf_source,
                 target_dtype,
-                tokenizer_config,
             )
 
         elif is_vlm:
             load_label = "MLX-VLM model"
-            model, tokenizer = mlx_vlm_load(
-                model_name, lazy=lazy_weights, revision=revision
+            model_path = mlx_vlm_model_path(model_name, revision=revision)
+            model = mlx_vlm_load_model(model_path, lazy=lazy_weights)
+            ensure_lfm2_vl_torch_outputs(
+                getattr(model_config.hf_config, "model_type", None)
             )
-            ensure_lfm2_vl_torch_outputs(tokenizer)
 
         elif awq_loader is not None:
             load_label = "AWQ model"
-            model, tokenizer = self._load_awq_text_model(
+            model = self._load_awq_text_model(
                 model_name,
                 awq_loader,
                 target_dtype,
-                tokenizer_config,
                 revision=revision,
             )
 
         else:
             load_label = "MLX-LM model"
-            model, tokenizer = self._load_mlx_lm_text_model(
+            model = self._load_mlx_lm_text_model(
                 model_name,
-                tokenizer_config,
                 lazy=lazy_weights or bool(expert_cache_bytes),
                 revision=revision,
             )
@@ -447,23 +432,20 @@ class ModelLifecycle:
             time.time() - start_time,
             loaded_from,
         )
-        return model, tokenizer
+        return model
 
     def _load_gguf_text_model(
         self,
         source: GGUFLoadSource,
         target_dtype: Any,
-        tokenizer_config: Mapping[str, Any],
-    ) -> tuple[Any, Any]:
+    ) -> Any:
         """Load a GGUF checkpoint through the optional GGUF owner."""
         from vllm_metal.gguf.loader import GGUFModelLoader
 
         loader = GGUFModelLoader(
             source.weights_path,
             config_dir=source.config_dir,
-            tokenizer_dir=source.tokenizer_dir,
             target_dtype=target_dtype,
-            tokenizer_config=dict(tokenizer_config),
         )
         return loader.load()
 
@@ -472,34 +454,27 @@ class ModelLifecycle:
         model_name: str,
         awq_loader: AWQQuantLoader,
         target_dtype: Any,
-        tokenizer_config: Mapping[str, Any],
         *,
         revision: str | None = None,
-    ) -> tuple[Any, Any]:
+    ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
             return awq_loader.load(
                 str(compatible_model_name),
                 target_dtype=target_dtype,
-                tokenizer_config=tokenizer_config,
                 revision=revision,
             )
 
     def _load_mlx_lm_text_model(
         self,
         model_name: str,
-        tokenizer_config: Mapping[str, Any],
         *,
         lazy: bool = False,
         revision: str | None = None,
-    ) -> tuple[Any, Any]:
+    ) -> Any:
         with _mlx_lm_compatible_model_path(model_name) as compatible_model_name:
-            model, tokenizer = mlx_lm_load(
-                str(compatible_model_name),
-                tokenizer_config=tokenizer_config,
-                lazy=lazy,
-                revision=revision,
-            )
-        return model, tokenizer
+            model_path = mlx_lm_download(str(compatible_model_name), revision=revision)
+            model, _ = mlx_lm_load_model(model_path, lazy=lazy)
+        return model
 
     def _install_generation_model(
         self,
@@ -510,7 +485,6 @@ class ModelLifecycle:
 
         runner = self._runner
         runner.model = loaded_model.model
-        runner.tokenizer = loaded_model.tokenizer
         runner._is_vlm = request.is_vlm
 
         # Adapter state follows the effective VLM mode, not the raw config flag.

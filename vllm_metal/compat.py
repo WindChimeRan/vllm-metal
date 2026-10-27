@@ -949,7 +949,7 @@ def _wrap_model_sanitize(
     return True
 
 
-def ensure_lfm2_vl_torch_outputs(processor: Any) -> None:
+def ensure_lfm2_vl_torch_outputs(model_type: str | None) -> None:
     """Make transformers' LFM2-VL processor honor ``return_tensors="pt"`` again.
 
     Importing ``mlx_vlm.models.lfm2_vl`` rebinds transformers'
@@ -964,13 +964,13 @@ def ensure_lfm2_vl_torch_outputs(processor: Any) -> None:
     Only ``"pt"`` requests are converted. mlx-vlm asks its own processor for
     ``"mlx"``, so its forward path keeps the NumPy image processor it needs.
     """
+    if model_type not in ("lfm2-vl", "lfm2_vl"):
+        return
+
     try:
         from transformers.models.lfm2_vl.processing_lfm2_vl import Lfm2VlProcessor
     except ImportError as exc:
         logger.debug("Skipping the LFM2-VL processor conversion: %s", exc)
-        return
-
-    if not isinstance(processor, Lfm2VlProcessor):
         return
 
     original = Lfm2VlProcessor.__call__

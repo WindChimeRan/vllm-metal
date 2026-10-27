@@ -13,6 +13,7 @@ from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItem
 from vllm_metal.compat import ensure_lfm2_vl_torch_outputs
 from vllm_metal.multimodal import MultiModalFeatureSpec, PlaceholderRange
 from vllm_metal.multimodal.lfm2_vl import Lfm2VlMultimodalAdapter
+from vllm_metal.v1 import model_lifecycle
 
 
 @pytest.fixture
@@ -111,9 +112,23 @@ def processor(monkeypatch):
     return object.__new__(cls)
 
 
+@pytest.mark.parametrize("model_type", ["lfm2-vl", "lfm2_vl"])
 @pytest.mark.parametrize("tensor_type", ["pt", "mlx"])
-def test_processor_preserves_pixels_in_the_requested_format(processor, tensor_type):
-    ensure_lfm2_vl_torch_outputs(processor)
+def test_model_load_preserves_processor_pixels_in_requested_format(
+    processor, tensor_type, model_type, tmp_path, monkeypatch
+):
+    model = object()
+    monkeypatch.setattr(
+        model_lifecycle, "mlx_vlm_model_path", lambda *_, **__: tmp_path
+    )
+    monkeypatch.setattr(model_lifecycle, "mlx_vlm_load_model", lambda *_, **__: model)
+    runner = SimpleNamespace(
+        model_config=SimpleNamespace(
+            revision=None, hf_config=SimpleNamespace(model_type=model_type)
+        )
+    )
+    lifecycle = model_lifecycle.ModelLifecycle(runner, Mock())
+    assert lifecycle._load_generation_model("lfm2-checkpoint", is_vlm=True) is model
     pixels = processor(return_tensors=tensor_type)["pixel_values"]
     if tensor_type == "pt":
         assert isinstance(pixels, torch.Tensor)
@@ -126,11 +141,11 @@ def test_processor_preserves_pixels_in_the_requested_format(processor, tensor_ty
 def test_processor_wrapper_is_installed_once_and_only_for_lfm2(processor):
     cls = type(processor)
     original = cls.__call__
-    ensure_lfm2_vl_torch_outputs(SimpleNamespace())
+    ensure_lfm2_vl_torch_outputs("qwen3_vl")
     assert cls.__call__ is original
 
-    ensure_lfm2_vl_torch_outputs(processor)
+    ensure_lfm2_vl_torch_outputs("lfm2_vl")
     wrapped = cls.__call__
     assert wrapped is not original
-    ensure_lfm2_vl_torch_outputs(processor)
+    ensure_lfm2_vl_torch_outputs("lfm2_vl")
     assert cls.__call__ is wrapped

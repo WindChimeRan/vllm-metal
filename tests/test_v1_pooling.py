@@ -215,6 +215,7 @@ def _pooling_model_config(**overrides):
         "revision": None,
         "tokenizer": "stub-pooling-model",
         "tokenizer_revision": None,
+        "tokenizer_mode": "auto",
         "get_head_size": lambda: 128,
         "is_hybrid": False,
     }
@@ -459,6 +460,34 @@ class TestMetalPoolingCapabilities:
 
         assert runner.supported_worker_tasks() == ("embed",)
 
+    @pytest.mark.parametrize("classify", [False, True])
+    def test_only_reranking_loads_the_configured_tokenizer(self, classify) -> None:
+        config = (_classification_model_config if classify else _pooling_model_config)(
+            tokenizer="custom-tokenizer",
+            tokenizer_revision="tokenizer-revision",
+            trust_remote_code=True,
+        )
+        with patch(
+            "vllm_metal.v1.pooling.backends.decoder.models.qwen3.cached_get_tokenizer",
+            return_value=_ClassifierTokenizer(),
+        ) as load_tokenizer:
+            runner = _make_runner(
+                model=_PoolingModel(_ClassifierSequenceModel()), model_config=config
+            )
+        assert runner.supported_worker_tasks() == (
+            ("classify",) if classify else ("embed",)
+        )
+        if classify:
+            load_tokenizer.assert_called_once_with(
+                "custom-tokenizer",
+                runner_type="pooling",
+                tokenizer_mode="auto",
+                revision="tokenizer-revision",
+                trust_remote_code=True,
+            )
+        else:
+            load_tokenizer.assert_not_called()
+
     def test_supported_worker_tasks_rejects_incompatible_pooling_model(self) -> None:
         runner = make_stub_runner(
             model=object(),
@@ -637,7 +666,6 @@ class TestMetalPoolingCapabilities:
         runner.kv_cache_dtype = None
         loaded = LoadedGenerationModel(
             model=runner.model,
-            tokenizer=runner.tokenizer,
             model_args={},
         )
 
@@ -675,7 +703,6 @@ class TestMetalPoolingCapabilities:
         runner._model_lifecycle = lifecycle
         loaded = LoadedEncoderBackend(
             model=SimpleNamespace(config=SimpleNamespace(vocab_size=16)),
-            tokenizer=object(),
             model_args={"vocab_size": 16},
             pooling_backend=pooling_backend,
         )
@@ -751,8 +778,7 @@ class TestMetalPoolingCapabilities:
                 return_value=str(tmp_path),
             ) as download,
             patch(
-                "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-                "AutoTokenizer.from_pretrained",
+                "transformers.AutoTokenizer.from_pretrained",
                 return_value=object(),
             ) as load_tokenizer,
         ):
@@ -814,11 +840,7 @@ class TestMetalPoolingCapabilities:
         assert download.call_count == 1
         assert download.call_args.kwargs["repo_id"] == "encoder-checkpoint"
         assert download.call_args.kwargs["revision"] == "model-revision"
-        load_tokenizer.assert_called_once_with(
-            "custom-tokenizer",
-            revision="tokenizer-revision",
-            trust_remote_code=True,
-        )
+        load_tokenizer.assert_not_called()
 
     @pytest.mark.parametrize("model_type", ["xlm-roberta", "roberta"])
     @pytest.mark.parametrize(
@@ -850,8 +872,7 @@ class TestMetalPoolingCapabilities:
             dtype=torch_dtype,
         )
         with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=object(),
         ):
             backend = load_encoder_pooling_backend(model_config).pooling_backend
@@ -936,8 +957,7 @@ class TestMetalPoolingCapabilities:
         )
 
         with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=object(),
         ):
             loaded_backend = load_encoder_pooling_backend(model_config)
@@ -970,8 +990,7 @@ class TestMetalPoolingCapabilities:
 
         with (
             patch(
-                "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-                "AutoTokenizer.from_pretrained",
+                "transformers.AutoTokenizer.from_pretrained",
                 return_value=object(),
             ),
             pytest.raises(FileNotFoundError, match="Missing BGE-M3 sparse head"),
@@ -1009,8 +1028,7 @@ class TestMetalPoolingCapabilities:
         )
 
         with patch(
-            "vllm_metal.v1.pooling.backends.encoder.models.xlm_roberta."
-            "AutoTokenizer.from_pretrained",
+            "transformers.AutoTokenizer.from_pretrained",
             return_value=object(),
         ):
             loaded_backend = load_encoder_pooling_backend(model_config)
