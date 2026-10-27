@@ -150,6 +150,10 @@ def compute_slot_mappings(self, mapping, cu, positions, num_tokens_padded, out=N
     out = self.slot_mappings if out is None else out
     offsets, rows = token_rows(cu, positions.numel())
     slots = mapping[rows].long()
+    active = (offsets < cu[-1]) & (slots >= 0)
+    # Mask dummy and padded lanes before indexing, as the Triton load does.
+    slots = torch.where(active, slots, 0)
+    positions = torch.where(active, positions, 0)
     for i, table in enumerate(self.block_tables):
         if not self._slot_mapping_enabled[i]:
             out[i, :padded].fill_(-1)
@@ -157,7 +161,7 @@ def compute_slot_mappings(self, mapping, cu, positions, num_tokens_padded, out=N
         block_size = self.block_sizes[i]
         physical = table.gpu[slots, (positions // block_size).long()]
         values = physical.long() * block_size + positions % block_size
-        out[i, : positions.numel()] = torch.where(offsets < cu[-1], values, -1)
+        out[i, : positions.numel()] = torch.where(active, values, -1)
         out[i, positions.numel() : padded].fill_(-1)
     return out[:, :padded]
 

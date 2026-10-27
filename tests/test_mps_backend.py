@@ -43,10 +43,11 @@ def test_request_slots_and_removed_request_writeback(state, num_groups, num_samp
         [[2, 4], [8, 9], [0, 0]],
         [[6, 7], [12, 13], [0, 0]],
     ][:num_groups]
+    # Dummy rows and unused positions must not index the block table.
     slots = tables.compute_slot_mappings(
-        mapping,
-        torch.tensor([0, 1, 4], dtype=torch.int32, device="mps"),
-        torch.tensor([17, 14, 15, 16], dtype=torch.int64, device="mps"),
+        torch.tensor([0, 3, -1], dtype=torch.int32, device="mps"),
+        torch.tensor([0, 1, 4, 5], dtype=torch.int32, device="mps"),
+        torch.tensor([17, 14, 15, 16, 99999, 99999], dtype=torch.int64, device="mps"),
         num_tokens_padded=8,
     )
     expected_slots = [
