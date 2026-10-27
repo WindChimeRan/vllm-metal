@@ -1649,7 +1649,7 @@ def test_qwen35_mtp_gguf_skips_appended_block_and_preserves_base_logits(tmp_path
     tokens = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
     expected = np.array(_qwen35_source_model(cfg_dir, hf)(tokens))
 
-    model, _ = GGUFModelLoader(
+    model = GGUFModelLoader(
         gguf_path, config_dir=cfg_dir, target_dtype=mx.float32
     ).load()
     logits = np.array(model(tokens))
