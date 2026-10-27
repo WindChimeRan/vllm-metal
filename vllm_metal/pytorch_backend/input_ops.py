@@ -110,16 +110,16 @@ def post_update(
     # Each request occupies one output row.
     last[slots, 0] = torch.where(active, ids, last[slots, 0])
     for i in range(tokens.shape[1]):
-        write_pos = (old_total + i).clamp_max(all_ids.shape[1] - 1)
+        write = valid & (count > i)
+        # Only unused columns get a safe index; real writes must fit the row.
+        write_pos = torch.where(write, old_total + i, 0)
         all_ids[slots, write_pos] = torch.where(
-            valid & (count > i),
+            write,
             tokens[:, i].to(all_ids.dtype),
             all_ids[slots, write_pos],
         )
         if bins is not None:
-            bins[slots, tokens[:, i].clamp_min(0)] += (valid & (count > i)).to(
-                bins.dtype
-            )
+            bins[slots, tokens[:, i].clamp_min(0)] += write.to(bins.dtype)
     total[slots] = (old_total + torch.where(active, count, 0)).to(total.dtype)
     delta = -rejected if cu is None else cu[1:] - cu[:-1] - rejected
     computed[slots] += torch.where(valid, delta, 0).to(computed.dtype)

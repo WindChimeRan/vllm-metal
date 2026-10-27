@@ -24,7 +24,7 @@ def state():
 
 
 @pytest.mark.parametrize("num_groups", [1, 2])
-@pytest.mark.parametrize("num_sampled", [1, 3])
+@pytest.mark.parametrize("num_sampled", [0, 1, 3])
 def test_request_slots_and_removed_request_writeback(state, num_groups, num_sampled):
     tables = BlockTables(
         [16] * num_groups,
@@ -56,16 +56,19 @@ def test_request_slots_and_removed_request_writeback(state, num_groups, num_samp
     assert slots.tolist() == expected_slots[:num_groups]
     # The second request disappears before writeback. Its -1 slot must not
     # alias slot zero and overwrite the surviving request's sampled token.
-    state.num_computed_tokens.gpu[0] = 17
-    state.total_len.gpu[0] = 18
+    start = state.all_token_ids.gpu.shape[1] - num_sampled
+    state.num_computed_tokens.gpu[0] = start - 1
+    state.total_len.gpu[0] = start
     state.last_sampled_tokens[0, 0] = 40
-    sampled_ids = list(range(41, 41 + num_sampled))
+    state.all_token_ids.gpu[0].fill_(7)
+    # Unused output columns may extend beyond the end of a full history row.
+    sampled_ids = [41, 42, 43]
     post_update(
         torch.tensor([0, -1], dtype=torch.int32, device="mps"),
         state.num_computed_tokens.gpu,
         state.last_sampled_tokens,
         None,
-        torch.tensor([sampled_ids, [999] * num_sampled], device="mps"),
+        torch.tensor([sampled_ids, [999] * len(sampled_ids)], device="mps"),
         torch.full((2,), num_sampled, dtype=torch.int32, device="mps"),
         torch.zeros(2, dtype=torch.int32, device="mps"),
         torch.tensor(
@@ -74,10 +77,33 @@ def test_request_slots_and_removed_request_writeback(state, num_groups, num_samp
         state.all_token_ids.gpu,
         state.total_len.gpu,
     )
-    assert state.last_sampled_tokens[0, 0].item() == sampled_ids[-1]
-    assert state.all_token_ids.gpu[0, 18 : 18 + num_sampled].tolist() == sampled_ids
-    assert state.total_len.gpu[0].item() == 18 + num_sampled
-    assert state.num_computed_tokens.gpu[0].item() == 17 + num_sampled
+    expected_last = sampled_ids[num_sampled - 1] if num_sampled else 40
+    assert state.last_sampled_tokens[0, 0].item() == expected_last
+    assert (
+        state.all_token_ids.gpu[0].tolist() == [7] * start + sampled_ids[:num_sampled]
+    )
+    assert state.total_len.gpu[0].item() == start + num_sampled
+    assert state.num_computed_tokens.gpu[0].item() == start - 1 + num_sampled
+
+
+def test_writeback_does_not_clamp_out_of_bounds_tokens():
+    """A broken capacity contract must fail, not overwrite the final token.
+
+    Use CPU tensors so a failed bound does not poison the MPS command buffer.
+    """
+    with pytest.raises(IndexError, match="out of bounds"):
+        post_update(
+            mapping=torch.tensor([0]),
+            computed=torch.tensor([6]),
+            last=torch.tensor([[40]]),
+            bins=None,
+            tokens=torch.tensor([[41, 42, 43]]),
+            count=torch.tensor([3]),
+            rejected=torch.tensor([0]),
+            cu=None,
+            all_ids=torch.zeros((1, 8), dtype=torch.int64),
+            total=torch.tensor([7]),
+        )
 
 
 @pytest.mark.parametrize(
