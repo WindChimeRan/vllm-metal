@@ -43,6 +43,10 @@ def on_page_markdown(markdown, *, page, config, files):
         variant = recipe["variants"][pick["variant"]]
         model_id = variant["model_id"]
         args = variant["base_args"] + variant.get("extra_args", [])
+        for feature in pick["features"]:
+            if feature not in variant["supported_features"]:
+                raise ValueError(f"{pick['recipe']}: unsupported feature {feature}")
+            args += recipe["features"][feature]["hardware_overrides"]["metal"]["args"]
         context = _option(args, "--max-model-len")
         if context is None:
             raise ValueError(f"{pick['recipe']}: missing --max-model-len")
