@@ -46,6 +46,7 @@ import pytest
 pytest.importorskip("gguf")
 
 from mlx_lm import load as mlx_lm_load  # noqa: E402
+from mlx_lm.utils import load_tokenizer  # noqa: E402
 
 from vllm_metal.gguf.loader import GGUFModelLoader  # noqa: E402
 
@@ -352,7 +353,8 @@ def test_gguf_greedy_matches_committed_golden(case: _GoldenCase) -> None:
     gguf_path = _require_path(case.gguf_env)
     tokenizer_dir = _require_path(case.tokenizer_env)
 
-    model, tokenizer = GGUFModelLoader(
+    tokenizer = load_tokenizer(tokenizer_dir)
+    model = GGUFModelLoader(
         gguf_path, config_dir=tokenizer_dir, target_dtype=case.target_dtype
     ).load()
 
@@ -374,7 +376,8 @@ def test_gguf_greedy_matches_dense_reference_prefix(case: _GoldenCase) -> None:
     del dense_model
     mx.clear_cache()
 
-    gguf_model, gguf_tokenizer = GGUFModelLoader(
+    gguf_tokenizer = load_tokenizer(tokenizer_dir)
+    gguf_model = GGUFModelLoader(
         gguf_path, config_dir=tokenizer_dir, target_dtype=case.target_dtype
     ).load()
     gguf_ids = _greedy_token_ids(

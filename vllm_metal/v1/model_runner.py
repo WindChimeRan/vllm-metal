@@ -413,7 +413,6 @@ class MetalModelRunner:
         self._spec_decode_controller = SpeculativeDecodeController()
 
         self.model: Any = None
-        self.tokenizer: Any = None
         self.model_args: dict[str, Any] = {}
         self._is_vlm: bool = False  # Will be set during model loading
         self._is_pooling: bool = (

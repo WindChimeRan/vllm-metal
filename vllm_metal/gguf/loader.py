@@ -15,7 +15,7 @@ import mlx.nn as nn
 import numpy as np
 from huggingface_hub import snapshot_download
 from mlx.utils import tree_flatten
-from mlx_lm.utils import load_config, load_model, load_tokenizer
+from mlx_lm.utils import load_config, load_model
 
 from vllm_metal.gguf.adapter import (
     GGUFLoadError,
@@ -80,9 +80,7 @@ class GGUFModelLoader:
     Args:
         gguf_path: Path to a local ``.gguf`` file.
         config_dir: Companion HF config source that defines the mlx-lm skeleton.
-        tokenizer_dir: Companion tokenizer source. Defaults to ``config_dir``.
         target_dtype: Compute dtype for dequantized embedding rows / activations.
-        tokenizer_config: Extra kwargs forwarded to mlx_lm tokenizer loading.
     """
 
     def __init__(
@@ -90,9 +88,7 @@ class GGUFModelLoader:
         gguf_path: str | Path,
         *,
         config_dir: str | Path,
-        tokenizer_dir: str | Path | None = None,
         target_dtype: mx.Dtype,
-        tokenizer_config: dict[str, Any] | None = None,
     ) -> None:
         self._gguf_path = Path(gguf_path)
         self._config_dir = Path(config_dir)
@@ -103,12 +99,10 @@ class GGUFModelLoader:
                     allow_patterns=list(_CONFIG_ALLOW_PATTERNS),
                 )
             )
-        self._tokenizer_dir = str(tokenizer_dir or config_dir)
         self._target_dtype = target_dtype
-        self._tokenizer_config = dict(tokenizer_config or {})
 
-    def load(self) -> tuple[nn.Module, Any]:
-        """Run the full load workflow and return ``(model, tokenizer)``.
+    def load(self) -> nn.Module:
+        """Load model weights without constructing a tokenizer.
 
         Raises:
             GGUFLoadError: On any unsupported file, arch, qtype, shape mismatch, or
@@ -145,13 +139,7 @@ class GGUFModelLoader:
         )
         self._load_plain_weights(text_model, partition.plain, installed)
 
-        # Build the tokenizer from the companion config directory and return both.
-        tokenizer = load_tokenizer(
-            self._tokenizer_dir,
-            tokenizer_config_extra=self._tokenizer_config,
-            eos_token_ids=config.get("eos_token_id"),
-        )
-        return model, tokenizer
+        return model
 
     def _open_inputs(self) -> tuple[Any, dict[str, Any]]:
         if (

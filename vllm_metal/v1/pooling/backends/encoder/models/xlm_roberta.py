@@ -9,7 +9,6 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_vlm.models.xlm_roberta import Model, ModelConfig
-from transformers import AutoTokenizer
 
 from vllm_metal.tensor_bridge import TORCH_TO_MLX_DTYPE
 from vllm_metal.v1.pooling.backends.encoder.models.loading import (
@@ -82,11 +81,6 @@ def load_xlm_roberta_backend(
     model.load_weights(list(weights.items()), strict=True)
     mx.eval(model.parameters())
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_config.tokenizer,
-        revision=model_config.tokenizer_revision,
-        trust_remote_code=model_config.trust_remote_code,
-    )
     encoder = XLMRobertaEncoderAdapter(model)
     pooling_backend = MetalEncoderPoolingBackend(
         PoolingConfigView(model_config),
@@ -94,7 +88,6 @@ def load_xlm_roberta_backend(
     )
     return LoadedEncoderBackend(
         model=encoder,
-        tokenizer=tokenizer,
         model_args=asdict(args),
         pooling_backend=pooling_backend,
     )
