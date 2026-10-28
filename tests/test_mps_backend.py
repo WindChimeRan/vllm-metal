@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """MPS request mapping, cache sizing and normalization parity."""
 
 from types import SimpleNamespace
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.states import RequestState
 
@@ -24,8 +26,8 @@ def state():
 
 
 @pytest.mark.parametrize("num_groups", [1, 2])
-@pytest.mark.parametrize("num_sampled", [0, 1, 3])
-def test_request_slots_and_removed_request_writeback(state, num_groups, num_sampled):
+def test_request_slots_and_dummy_padding(num_groups):
+    install()
     tables = BlockTables(
         [16] * num_groups,
         4,
@@ -43,18 +45,31 @@ def test_request_slots_and_removed_request_writeback(state, num_groups, num_samp
         [[2, 4], [8, 9], [0, 0]],
         [[6, 7], [12, 13], [0, 0]],
     ][:num_groups]
-    # Dummy rows and unused positions must not index the block table.
+    # Real/dummy control from vLLM v0.32.0, tests/v1/worker/test_gpu_block_table.py
+    # (test_dummy_request_slot_mapping_is_pad). Keep our mixed rows and padding.
+    query_start_loc = torch.tensor([0, 1, 4], dtype=torch.int32, device="mps")
+    positions = torch.tensor([17, 14, 15, 16, 99999, 99999], device="mps")
     slots = tables.compute_slot_mappings(
-        torch.tensor([0, 3, -1], dtype=torch.int32, device="mps"),
-        torch.tensor([0, 1, 4, 5], dtype=torch.int32, device="mps"),
-        torch.tensor([17, 14, 15, 16, 99999, 99999], dtype=torch.int64, device="mps"),
-        num_tokens_padded=8,
+        mapping, query_start_loc, positions, num_tokens_padded=8
     )
     expected_slots = [
-        [65, 142, 143, 144, -1, -1, -1, -1],
-        [113, 206, 207, 208, -1, -1, -1, -1],
+        [65, 142, 143, 144] + [PAD_SLOT_ID] * 4,
+        [113, 206, 207, 208] + [PAD_SLOT_ID] * 4,
     ]
     assert slots.tolist() == expected_slots[:num_groups]
+    # The new dummy row must clear a stale real slot, not preserve existing PAD.
+    slots[:, 4] = slots[:, 0].clone()
+    dummy = tables.compute_slot_mappings(
+        torch.tensor([0, 3, -1], dtype=torch.int32, device="mps"),
+        torch.tensor([0, 1, 4, 5], dtype=torch.int32, device="mps"),
+        positions,
+        num_tokens_padded=8,
+    )
+    assert dummy.tolist() == expected_slots[:num_groups]
+
+
+@pytest.mark.parametrize("num_sampled", [0, 1, 3])
+def test_removed_request_writeback_at_capacity(state, num_sampled):
     # The second request disappears before writeback. Its -1 slot must not
     # alias slot zero and overwrite the surviving request's sampled token.
     start = state.all_token_ids.gpu.shape[1] - num_sampled
@@ -342,17 +357,16 @@ def test_rope_matches_upstream(dtype, rows, heads, kv_heads, head_size, gapped_h
 
 
 @pytest.mark.parametrize("logprobs", [None, 5])
-@pytest.mark.parametrize("chunk_rows", [4, 1024])
-def test_speculative_verification_preserves_ragged_requests(
-    run_in_spawn_process, monkeypatch, logprobs, chunk_rows
+def test_chunked_verification_matches_full_batch(
+    run_in_spawn_process, monkeypatch, logprobs
 ):
     """Verify fixed logits in a fresh worker, before other kernels are loaded."""
     monkeypatch.setenv("VLLM_METAL_BACKEND", "mps")
     monkeypatch.setenv("PYTORCH_ENABLE_MPS_FALLBACK", "0")
-    run_in_spawn_process(_check_speculative_verification, logprobs, chunk_rows)
+    run_in_spawn_process(_check_chunked_verification, logprobs)
 
 
-def _check_speculative_verification(logprobs, chunk_rows):
+def _check_chunked_verification(logprobs):
     from vllm.sampling_params import SamplingParams
     from vllm.v1.worker.gpu.sample.sampler import Sampler
     from vllm.v1.worker.gpu.spec_decode import rejection_sampler
@@ -362,7 +376,6 @@ def _check_speculative_verification(logprobs, chunk_rows):
     MetalPlatform.register_triton_kernel_overrides()
     install()
     state = RequestState(4, 64, 16, 0, 64, torch.device("mps"))
-    rejection_sampler.get_max_chunk_logits = lambda _: chunk_rows
     sampler = Sampler(
         SimpleNamespace(reasoning_config=None), 4, 64, torch.device("mps"), state
     )
@@ -404,19 +417,30 @@ def _check_speculative_verification(logprobs, chunk_rows):
     winners = to_device([1, 2, 3, 4, 5, 6, 7, 8, 2, 3, 4, 6]).long()
     logits = torch.arange(64, device="mps", dtype=torch.float32).repeat(12, 1) / 100
     logits.scatter_(1, winners[:, None], 10)
-    result = verifier(logits, batch)
-    assert result.num_sampled.tolist() == [4, 2, 1, 0]
-    assert result.num_rejected.tolist() == [0, 2, 2, 0]
-    assert result.sampled_token_ids.tolist() == [
+    # Chunk/full oracle from vLLM v0.32.0,
+    # tests/v1/worker/test_gpu_rejection_sampler_chunking.py. Keep real verification
+    # and our fixed acceptance/prefill expectations instead of its fake verifier.
+    rejection_sampler.get_max_chunk_logits = lambda _: 1024
+    full = verifier(logits, batch)
+    rejection_sampler.get_max_chunk_logits = lambda _: 4
+    chunked = verifier(logits, batch)
+    assert full.num_sampled.tolist() == [4, 2, 1, 0]
+    assert full.num_rejected.tolist() == [0, 2, 2, 0]
+    assert full.sampled_token_ids.tolist() == [
         [1, 2, 3, 4],
         [5, 6, -1, -1],
         [2, -1, -1, -1],
         [6, -1, -1, -1],
     ]
+    assert torch.equal(chunked.num_sampled, full.num_sampled)
+    assert torch.equal(chunked.num_rejected, full.num_rejected)
+    assert torch.equal(chunked.sampled_token_ids, full.sampled_token_ids)
     if logprobs is None:
-        assert result.logprobs_tensors is None
+        assert full.logprobs_tensors is None and chunked.logprobs_tensors is None
     else:
-        scores = result.logprobs_tensors
+        scores = full.logprobs_tensors
+        chunked_scores = chunked.logprobs_tensors
+        assert scores is not None and chunked_scores is not None
         kept = torch.tensor([0, 1, 2, 3, 4, 5, 8], device="mps")
         torch.testing.assert_close(
             scores.logprob_token_ids[kept, 0], winners[kept].int()
@@ -424,3 +448,9 @@ def _check_speculative_verification(logprobs, chunk_rows):
         expected = logits.log_softmax(-1).gather(1, winners[:, None])[:, 0]
         torch.testing.assert_close(scores.logprobs[kept, 0], expected[kept])
         assert scores.cu_num_generated_tokens == cu_np.tolist()
+        assert torch.equal(chunked_scores.logprob_token_ids, scores.logprob_token_ids)
+        assert torch.equal(chunked_scores.logprobs, scores.logprobs)
+        assert torch.equal(
+            chunked_scores.selected_token_ranks, scores.selected_token_ranks
+        )
+        assert chunked_scores.cu_num_generated_tokens == scores.cu_num_generated_tokens
