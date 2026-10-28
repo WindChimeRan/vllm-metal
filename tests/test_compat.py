@@ -18,6 +18,39 @@ from transformers.models.auto import configuration_auto
 import vllm_metal.compat as compat
 
 
+@pytest.mark.parametrize(
+    ("backend", "native_available"), [("mlx", False), ("mlx", True), ("mps", False)]
+)
+def test_model_metadata_compat_preserves_native_and_mps_registrations(
+    monkeypatch, backend, native_available
+) -> None:
+    from vllm.model_executor import models
+
+    native = object()
+    entries = {"Lfm3ForCausalLM": native} if native_available else {}
+    writes = []
+
+    def register(name, implementation):
+        writes.append(name)
+        entries[name] = implementation
+
+    monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+    monkeypatch.setattr(
+        models,
+        "ModelRegistry",
+        SimpleNamespace(
+            get_supported_archs=lambda: set(entries), register_model=register
+        ),
+    )
+    compat.register_model_compat()
+    compat.register_model_compat()
+    assert writes == (
+        ["Lfm3ForCausalLM"] if backend == "mlx" and not native_available else []
+    )
+    if native_available:
+        assert entries["Lfm3ForCausalLM"] is native
+
+
 @pytest.mark.parametrize("device", ["mps", "cuda", None])
 def test_host_cache_cleanup_only_skips_mps(monkeypatch, device) -> None:
     import torch

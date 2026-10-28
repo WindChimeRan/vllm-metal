@@ -1194,7 +1194,11 @@ def sdpa_forward(
     if out.dtype != attention_output_dtype:
         out = out.astype(attention_output_dtype)
     if gate is not None:
-        out = out * mx.sigmoid(gate)
+        if attention_contract.sigmoid_output_gate == "per_head":
+            out = out.reshape(B, L, n_heads, actual_head_dim)
+            out = (out * mx.sigmoid(gate)[..., None]).reshape(B, L, -1)
+        else:
+            out = out * mx.sigmoid(gate)
     out = apply_g_proj_gate(inner, out, x, n_heads, actual_head_dim)
     return _output_projection(inner)(out), kv_for_sharing
 
