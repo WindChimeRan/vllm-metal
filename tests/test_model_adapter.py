@@ -46,10 +46,19 @@ class TestShouldForceTextBackbone:
         result = adapter.should_force_text_backbone(hf_config)
         assert result is True
 
-    def test_qwen35_fp8_conditional_generation_uses_auto_override(self) -> None:
+    @pytest.mark.parametrize(
+        ("model_type", "architecture"),
+        [
+            ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
+        ],
+    )
+    def test_qwen35_fp8_conditional_generation_uses_auto_override(
+        self, model_type: str, architecture: str
+    ) -> None:
         hf_config = SimpleNamespace(
-            model_type="qwen3_5",
-            architectures=["Qwen3_5ForConditionalGeneration"],
+            model_type=model_type,
+            architectures=[architecture],
             quantization_config={"quant_method": "fp8"},
         )
         adapter = DefaultModelAdapter()
@@ -70,8 +79,8 @@ class TestShouldForceTextBackbone:
     @pytest.mark.parametrize(
         ("model_type", "architecture"),
         [
-            # Only the dense Qwen3.5 wrapper has a native multimodal adapter.
             ("qwen3_5", "Qwen3_5ForConditionalGeneration"),
+            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
         ],
     )
     def test_mlx_quant_conditional_generation_keeps_native_path(
@@ -91,7 +100,6 @@ class TestShouldForceTextBackbone:
     @pytest.mark.parametrize(
         ("model_type", "architecture"),
         [
-            ("qwen3_5_moe", "Qwen3_5MoeForConditionalGeneration"),
             ("qwen3_6", "Qwen3_6ForConditionalGeneration"),
             ("qwen3_6_moe", "Qwen3_6MoeForConditionalGeneration"),
         ],
@@ -864,7 +872,8 @@ _QWEN3_VL_FRAME_TOKEN_IDS = {
 
 
 class TestBuildMultimodalAdapter:
-    def test_builds_qwen35_adapter_from_loaded_vlm(self) -> None:
+    @pytest.mark.parametrize("model_type", ["qwen3_5", "qwen3_5_moe"])
+    def test_builds_qwen35_adapter_from_loaded_vlm(self, model_type: str) -> None:
         vision_tower = object()
         language_model = _Qwen35LanguageModelStub()
         model = SimpleNamespace(
@@ -874,7 +883,7 @@ class TestBuildMultimodalAdapter:
             vision_tower=vision_tower,
             language_model=language_model,
         )
-        hf_config = SimpleNamespace(model_type="qwen3_5", **_QWEN3_VL_FRAME_TOKEN_IDS)
+        hf_config = SimpleNamespace(model_type=model_type, **_QWEN3_VL_FRAME_TOKEN_IDS)
 
         adapter = DefaultModelAdapter().build_multimodal_adapter(model, hf_config)
 

@@ -45,14 +45,14 @@ wins. Outputs are unaffected.
 
 - `auto`: use the native multimodal path where it is supported. Qwen3.5/Qwen3.6
   **FP8** wrappers use the text backbone because mlx-vlm does not sanitize their
-  `*_weight_scale_inv` tensors. Qwen3.5 MoE, Qwen3.6, compatible Mistral 3, and
-  Muse Glimmer also use the text backbone because they have no multimodal
-  adapter. Non-FP8 Qwen3.5 dense checkpoints keep the native path. GGUF
-  checkpoints use the text-only path because they contain no vision tower.
-  Gemma 4 checkpoints serve images through the vision sidecar when they have
-  vision weights, a loadable HF processor, and no speculative decoding;
-  otherwise they stay text-only with a logged reason. See
-  [Supported Models](supported_models.md).
+  `*_weight_scale_inv` tensors. Architectures without a matching adapter,
+  compatible Mistral 3, and Muse Glimmer also use the text backbone. Non-FP8
+  Qwen3.5 dense and MoE architectures, including those used by Qwen3.6
+  checkpoints, keep the native path. GGUF checkpoints use the text-only path
+  because they contain no vision tower. Gemma 4 checkpoints serve images
+  through the vision sidecar when they have vision weights, a loadable HF
+  processor, and no speculative decoding; otherwise they stay text-only with a
+  logged reason. See [Supported Models](supported_models.md).
 - `multimodal-native`: disable the compatibility fallback and keep the native multimodal path active when validating or developing real multimodal support.
 - `text-only`: force the text-only backbone for every multimodal checkpoint, including Gemma 4 (the pre-sidecar behaviour).
 

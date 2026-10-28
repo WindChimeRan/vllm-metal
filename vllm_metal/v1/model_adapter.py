@@ -390,13 +390,9 @@ class ModelAdapter(Protocol):
 # Models/configs that vLLM flags as multimodal but must be loaded via mlx_lm.
 # gemma4: mlx_vlm forward path produces garbled output vs mlx_lm.
 # muse_glimmer: no multimodal adapter, so image requests must stop at the frontend.
-# Qwen3.5/Qwen3.6 conditional-generation wrappers expose a multimodal config,
-# but only the FP8 and adapter-less variants are forced onto the text backbone:
-# FP8 checkpoints ship `*_weight_scale_inv` tensors that the mlx_vlm qwen3_5
-# loader does not currently sanitize, while mlx_lm's qwen3_5 text loader handles
-# them; the MoE / Qwen3.6 wrappers have no multimodal adapter yet. Non-FP8
-# Qwen3.5 dense checkpoints keep the native multimodal path (see
-# `_matches_auto_text_backbone_override`).
+# Qwen3.5/Qwen3.6 wrappers expose a multimodal config. FP8 stays on mlx_lm
+# because mlx-vlm does not sanitize `*_weight_scale_inv`; other wrappers stay
+# native only when an adapter supports them.
 _TEXT_BACKBONE_OVERRIDE_ARCHITECTURES: frozenset[str] = frozenset(
     {
         "Qwen3_5ForConditionalGeneration",
@@ -413,10 +409,14 @@ _MISTRAL3_TEXT_BACKBONE_TEXT_TYPES: frozenset[str] = frozenset(
 _TEXT_BACKBONE_OVERRIDE_MODEL_TYPES: frozenset[str] = _GEMMA4_MODEL_TYPES | {
     "muse_glimmer"
 }
-_QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset({"qwen3_5", "qwen3_vl"})
+# mlx-vlm's qwen3_5_moe shares qwen3_5's multimodal adapter contract.
+_QWEN3_VL_MODEL_TYPES: frozenset[str] = frozenset(
+    {"qwen3_5", "qwen3_5_moe", "qwen3_vl"}
+)
 _QWEN3_VL_ARCHITECTURES: frozenset[str] = frozenset(
     {
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
         "Qwen3VLForConditionalGeneration",
     }
 )
@@ -481,10 +481,7 @@ class DefaultModelAdapter(ModelAdapter):
         if self._has_fp8_quantization_config(hf_config):
             return True
 
-        # MLX affine wrappers only keep the native path when
-        # `build_multimodal_adapter` actually has an adapter for them. The MoE
-        # and Qwen3.6 wrappers do not, and an image request against a missing
-        # adapter raises in the runner, so they stay on the text backbone.
+        # MLX affine wrappers stay native only when their family has an adapter.
         return self._has_mlx_quantized_weights(
             hf_config
         ) and not self._is_qwen3_vl_family(hf_config)
