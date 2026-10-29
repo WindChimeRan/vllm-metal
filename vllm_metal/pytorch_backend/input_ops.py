@@ -2,7 +2,8 @@
 """Temporary Torch replacements for vLLM 0.32 MRv2 input/state kernels on MPS.
 
 Upstream launches Triton kernels without a Torch fallback at these entry points.
-Replace the private bindings in install() as upstream kernel/component hooks become usable
+Replace the private bindings in bindings.install() as upstream kernel/component
+hooks become usable
 (vllm-project/vllm#43048 and #51212). Registration alone does not remove these
 implementations; prefer shared device-neutral fallbacks when they are available.
 """
@@ -201,28 +202,3 @@ def postprocess_state(self, idx_mapping, num_sampled, num_computed_tokens=None):
     # Hybrid speculation is rejected at configuration time. Upstream starts
     # with the neutral acceptance count (1), including unsampled prefill steps.
     pass
-
-
-def install():
-    from vllm.v1.worker.gpu import block_table, input_batch, model_runner
-    from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
-    from vllm.v1.worker.gpu.sample import sampler
-
-    for name in (
-        "prepare_prefill_inputs",
-        "prepare_pos_seq_lens",
-        "combine_sampled_and_draft_tokens",
-        "expand_idx_mapping",
-        "post_update",
-        "post_update_num_computed_tokens",
-    ):
-        setattr(input_batch, name, globals()[name])
-        setattr(model_runner, name, globals()[name])
-    input_batch.get_num_sampled_and_rejected = get_num_sampled_and_rejected
-    sampler.get_num_sampled_and_rejected = get_num_sampled_and_rejected
-    block_table.BlockTables.gather_block_tables = gather_block_tables
-    block_table.BlockTables.apply_staged_writes = apply_block_table_writes
-    block_table.BlockTables.compute_slot_mappings = compute_slot_mappings
-    block_table.BlockTables._make_ptr_tensor = make_block_pointer_tensor
-    MambaHybridModelState.preprocess_state = preprocess_state
-    MambaHybridModelState.postprocess_state = postprocess_state

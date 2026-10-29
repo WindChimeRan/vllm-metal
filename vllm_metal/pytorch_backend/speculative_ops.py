@@ -7,10 +7,7 @@ cache management remain upstream. These replace its Triton-only device helpers.
 
 import torch
 
-from vllm_metal.pytorch_backend.input_ops import (
-    get_num_sampled_and_rejected,
-    token_rows,
-)
+from vllm_metal.pytorch_backend.input_ops import token_rows
 
 
 def prepare_prefill_inputs(
@@ -141,29 +138,3 @@ def flatten_sampled(
     columns = (offsets - cu_num_logits[rows]).long()
     values = sampled[rows, columns.clamp_max(sampled.shape[1] - 1)]
     output.copy_(torch.where(columns < num_sampled[rows], values, output))
-
-
-def register_kernel_overrides():
-    from vllm.triton_utils.dispatcher import register_kernels
-
-    module = "vllm.v1.worker.gpu.spec_decode.rejection_sampler"
-    register_kernels(
-        {
-            f"{module}._gather_draft_sampled_kernel": gather_draft_sampled,
-            f"{module}._flatten_sampled_kernel": flatten_sampled,
-        }
-    )
-
-
-def install():
-    from vllm.v1.worker.gpu.spec_decode import rejection_sampler
-    from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import speculator
-
-    from vllm_metal.pytorch_backend.runtime import compute_topk_scores
-
-    rejection_sampler.compute_topk_scores = compute_topk_scores
-    speculator.prepare_prefill_inputs = prepare_prefill_inputs
-    speculator.prepare_decode_inputs = prepare_decode_inputs
-    speculator.update_draft_inputs = update_draft_inputs
-    rejection_sampler.rejection_sample = rejection_sample
-    rejection_sampler.get_num_sampled_and_rejected = get_num_sampled_and_rejected

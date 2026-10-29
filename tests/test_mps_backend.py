@@ -11,8 +11,8 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.states import RequestState
 
+from vllm_metal.pytorch_backend.bindings import install
 from vllm_metal.pytorch_backend.input_ops import post_update
-from vllm_metal.pytorch_backend.runtime import install
 
 pytestmark = pytest.mark.skipif(
     not torch.backends.mps.is_available(), reason="MPS required"

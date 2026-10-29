@@ -144,7 +144,7 @@ class MetalPlatform(Platform):
     @classmethod
     def register_triton_kernel_overrides(cls) -> None:
         if envs.VLLM_METAL_BACKEND == "mps":
-            from vllm_metal.pytorch_backend.speculative_ops import (
+            from vllm_metal.pytorch_backend.bindings import (
                 register_kernel_overrides,
             )
 
