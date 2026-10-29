@@ -107,6 +107,7 @@ def serving(
     env: dict,
     additional_config: str | None = None,
     trust_remote_code: bool = False,
+    speculative_config: dict | None = None,
 ):
     """Start one local server and clean up its process group on every exit."""
     with socket.socket() as sock:
@@ -136,7 +137,12 @@ def serving(
                 "vllm",
             ]
             + (["--trust-remote-code"] if trust_remote_code else [])
-            + (["--additional-config", additional_config] if additional_config else []),
+            + (["--additional-config", additional_config] if additional_config else [])
+            + (
+                ["--speculative-config", json.dumps(speculative_config)]
+                if speculative_config is not None
+                else []
+            ),
             stdout=log,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -179,6 +185,7 @@ def check_parity(
     gpu_memory_utilization: float = 0.65,
     additional_config: str | None = None,
     trust_remote_code: bool = False,
+    speculative_config: dict | None = None,
 ) -> bool:
     """Generate one reference, then compare every request batch size on one server."""
     if not prompts or not batch_sizes or min(batch_sizes) < 1:
@@ -238,6 +245,7 @@ def check_parity(
         env,
         additional_config,
         trust_remote_code,
+        speculative_config=speculative_config,
     ) as base_url:
         for size in batch_sizes:
             print(f"Prompts/request: {size}", flush=True)
@@ -381,6 +389,11 @@ def main() -> None:
         choices=["dflash", "dspark", "draft_model"],
         help="Compare speculative serving with native MLX and target-only serving",
     )
+    parser.add_argument(
+        "--speculative-config",
+        type=json.loads,
+        help="JSON speculative config for HTTP parity (including MPS EAGLE3)",
+    )
     parser.add_argument("--draft", help="Draft checkpoint for --method")
     parser.add_argument("--num-draft-tokens", type=int, default=3)
     parser.add_argument("--dspark-draft-topk", type=int)
@@ -413,7 +426,13 @@ def main() -> None:
         parser.error("--top-k must be positive")
     if min(args.batch_size) < 1 or len(set(args.batch_size)) != len(args.batch_size):
         parser.error("--batch-size values must be positive and unique")
+    if args.speculative_config is not None and not isinstance(
+        args.speculative_config, dict
+    ):
+        parser.error("--speculative-config must be a JSON object")
     if args.method is not None:
+        if args.speculative_config is not None:
+            parser.error("--method cannot be combined with --speculative-config")
         if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
             parser.error("--method requires the MLX backend")
         if args.generate_reference:
@@ -459,6 +478,7 @@ def main() -> None:
         args.gpu_memory_utilization,
         args.additional_config,
         args.trust_remote_code,
+        speculative_config=args.speculative_config,
     )
     raise SystemExit(0 if passed else 1)
 
