@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Install PyTorch MPS implementations into upstream vLLM 0.32."""
 
 from functools import partial
 
