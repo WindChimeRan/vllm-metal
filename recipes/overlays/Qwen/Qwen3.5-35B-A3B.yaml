@@ -39,13 +39,17 @@ variants:
       - "127.0.0.1"
       - --max-model-len
       - "32768"
-    guide: |
-      - The first run downloads 20 GB.
-      - It is the fastest of the three, because only part of the model runs for
-        each word.
 
 strategy_hardware:
   single_node_tep:
     metal: unsupported
   single_node_dep:
     metal: unsupported
+
+notes:
+  - title: Model download
+    when:
+      hardware: [apple_64gb]
+      variants: [mlx_int4]
+    body: |
+      - The first run downloads 20 GB.

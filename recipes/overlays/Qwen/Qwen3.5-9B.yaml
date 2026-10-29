@@ -41,7 +41,13 @@ variants:
       - "8192"
       - --max-num-batched-tokens
       - "2048"
-    guide: |
+
+notes:
+  - title: Memory settings
+    when:
+      hardware: [apple_16gb, apple_32gb, apple_64gb]
+      variants: [mlx_int4]
+    body: |
       - The first run downloads 6.0 GB.
       - `--max-num-batched-tokens 2048` reads long text in smaller steps, so the
         model needs less memory. Without it this model does not fit on 16 GB.
