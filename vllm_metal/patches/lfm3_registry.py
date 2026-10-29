@@ -10,10 +10,11 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-# TODO: Remove this shim once the pinned vLLM provides native LFM3 hybrid
-# metadata, including ShortConv shape/dtype/copy hooks. Remove its fallback in
-# compat.register_model_compat and the metal_models entry point if then unused.
-# Re-run batched and prefix-cache LFM3 parity before removing the bridge.
+# TODO: Once the pinned vLLM registers Lfm3ForCausalLM with native hybrid
+# capabilities and ShortConv shape/dtype/copy hooks, remove this shim and its
+# fallback in compat.register_model_compat. Remove metal_model_metadata if
+# no other metadata shims need it, then re-run batched and prefix-cache
+# LFM3 parity against the upstream registration.
 class Lfm3ForCausalLM(Lfm2ForCausalLM):
     """Reuse LFM2's hybrid capabilities and short-convolution state policy."""
 

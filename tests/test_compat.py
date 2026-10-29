@@ -19,12 +19,22 @@ import vllm_metal.compat as compat
 
 
 @pytest.mark.parametrize(
-    ("backend", "native_available"), [("mlx", False), ("mlx", True), ("mps", False)]
+    ("is_metal", "backend", "native_available"),
+    [
+        (True, "mlx", False),
+        (True, "mlx", True),
+        (True, "mps", False),
+        (False, "mlx", False),
+    ],
 )
-def test_model_metadata_compat_preserves_native_and_mps_registrations(
-    monkeypatch, backend, native_available
+def test_model_metadata_compat_only_registers_missing_metal_mlx_models(
+    monkeypatch, is_metal, backend, native_available
 ) -> None:
+    import vllm.platforms as platforms
     from vllm.model_executor import models
+    from vllm.platforms.cpu import CpuPlatform
+
+    from vllm_metal.platform import MetalPlatform
 
     native = object()
     entries = {"Lfm3ForCausalLM": native} if native_available else {}
@@ -36,6 +46,9 @@ def test_model_metadata_compat_preserves_native_and_mps_registrations(
 
     monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
     monkeypatch.setattr(
+        platforms, "current_platform", MetalPlatform() if is_metal else CpuPlatform()
+    )
+    monkeypatch.setattr(
         models,
         "ModelRegistry",
         SimpleNamespace(
@@ -45,7 +58,9 @@ def test_model_metadata_compat_preserves_native_and_mps_registrations(
     compat.register_model_compat()
     compat.register_model_compat()
     assert writes == (
-        ["Lfm3ForCausalLM"] if backend == "mlx" and not native_available else []
+        ["Lfm3ForCausalLM"]
+        if is_metal and backend == "mlx" and not native_available
+        else []
     )
     if native_available:
         assert entries["Lfm3ForCausalLM"] is native
