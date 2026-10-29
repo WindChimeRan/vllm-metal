@@ -55,20 +55,21 @@ def combine_sampled_and_draft_tokens(
     num_new_sampled_tokens=1,
 ):
     if drafts.shape[1]:
-        from vllm_metal.pytorch_backend.speculative_ops import combine_tokens
-
-        return combine_tokens(
-            ids,
-            mapping,
-            last,
-            cu,
-            lengths,
-            prefill,
-            drafts,
-            cu_logits,
-            num_logits,
-            num_new_sampled_tokens,
+        offsets, rows = token_rows(cu_logits, num_logits)
+        local = offsets - cu_logits[rows]
+        widths = cu_logits.diff()
+        starts = cu[1:] - widths
+        indices = (starts[rows] + local).long()
+        slots = mapping[rows].long()
+        first_pos = lengths[rows] - widths[rows]
+        is_draft = local >= num_new_sampled_tokens
+        draft_col = (local - num_new_sampled_tokens).clamp(0, drafts.shape[1] - 1)
+        values = torch.where(is_draft, drafts[slots, draft_col], last[slots, 0])
+        generated = (lengths[rows] > prefill[slots]) & (
+            is_draft | (first_pos >= prefill[slots])
         )
+        ids[indices] = torch.where(generated, values.to(ids.dtype), ids[indices])
+        return indices
     indices = (cu[1:] - 1).long()
     slots = mapping.long()
     ids[indices] = torch.where(

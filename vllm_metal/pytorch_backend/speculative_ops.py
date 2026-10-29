@@ -13,35 +13,6 @@ from vllm_metal.pytorch_backend.input_ops import (
 )
 
 
-def combine_tokens(
-    ids,
-    mapping,
-    last,
-    cu,
-    lengths,
-    prefill,
-    drafts,
-    cu_logits,
-    num_logits,
-    num_new_sampled_tokens=1,
-):
-    offsets, rows = token_rows(cu_logits, num_logits)
-    local = offsets - cu_logits[rows]
-    widths = cu_logits.diff()
-    starts = cu[1:] - widths
-    indices = (starts[rows] + local).long()
-    slots = mapping[rows].long()
-    first_pos = lengths[rows] - widths[rows]
-    is_draft = local >= num_new_sampled_tokens
-    draft_col = (local - num_new_sampled_tokens).clamp(0, drafts.shape[1] - 1)
-    values = torch.where(is_draft, drafts[slots, draft_col], last[slots, 0])
-    generated = (lengths[rows] > prefill[slots]) & (
-        is_draft | (first_pos >= prefill[slots])
-    )
-    ids[indices] = torch.where(generated, values.to(ids.dtype), ids[indices])
-    return indices
-
-
 def prepare_prefill_inputs(
     last_indices, step, buffers, batch, sampled, rejected, last, lookahead, max_num_reqs
 ):
