@@ -12,9 +12,9 @@ if TYPE_CHECKING:
 
 # TODO: Once the pinned vLLM registers Lfm3ForCausalLM with native hybrid
 # capabilities and ShortConv shape/dtype/copy hooks, remove this shim and its
-# fallback in compat.register_model_compat. Remove metal_model_metadata if
-# no other metadata shims need it, then re-run batched and prefix-cache
-# LFM3 parity against the upstream registration.
+# LFM3 branch in compat.register_model_compat. Keep the shared hook and
+# metal_model_metadata entry point while Flint or other fallbacks need them.
+# Re-run batched and prefix-cache LFM3 parity against the native registration.
 class Lfm3ForCausalLM(Lfm2ForCausalLM):
     """Reuse LFM2's hybrid capabilities and short-convolution state policy."""
 
