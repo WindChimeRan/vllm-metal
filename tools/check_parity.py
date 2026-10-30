@@ -5,6 +5,10 @@
 Generate one native reference, then compare individual and batched requests.
 Speculative modes observe target verification in isolated engine workers;
 ordinary parity uses HTTP serving. Both use the same checkpoint and input IDs.
+
+Parity checks may be unreliable for MoE models. When mismatches occur,
+investigate routing flips between experts with nearly tied scores.
+
 See docs/tools.md or --help for usage.
 """
 

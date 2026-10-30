@@ -164,6 +164,7 @@ and TurboQuant are not validated.
 | StableLM 2 | ✅ | | MHA + partial RoPE (paged) | ✅ | `mlx-community/stablelm-2-zephyr-1_6b-4bit` |
 | Phi 1.5 / Phi 2 | ✅ | | MHA + partial RoPE (paged) | ✅ | `mlx-community/phi-2-hf-4bit-mlx` |
 | GPT-OSS | 🔵 | | Sink attention (paged) | ✅ | `openai/gpt-oss-20b` |
+| Flint | 🔵 | | GQA + per-layer sliding window + learned sinks, no RoPE on full-attention layers (paged) | ✅ | `RecursiveSI/flint-int4` |
 | Ling-3.0 Tiny | 🔵 | | Hybrid MLA + KDA (paged latent + recurrent state) | 🔵 | `inclusionAI/Ling-3.0-tiny` (BF16 or converted MXFP8) |
 | GLM-4.5 | Not verified | | MLA (paged latent cache, MLX SDPA — no Metal kernel) | Not verified | — |
 | MiniCPM3-4B | ✅ | | MLA (paged latent cache) | ✅ | `mlx-community/MiniCPM3-4B-4bit` |

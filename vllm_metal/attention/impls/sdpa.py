@@ -551,7 +551,7 @@ def truncate_padded_output(
 # === SDPA forward ===
 
 
-def _float32_sinks(inner: nn.Module) -> mx.array | None:
+def _float32_sinks(inner: nn.Module, attr: str = "sinks") -> mx.array | None:
     """The module's attention sinks as float32, cast once per parameter.
 
     The widened copy is stored outside the parameter tree, so the checkpoint
@@ -559,7 +559,7 @@ def _float32_sinks(inner: nn.Module) -> mx.array | None:
     walks the parameters. It is keyed by the original array, so a reloaded
     parameter is cast again.
     """
-    sinks = getattr(inner, "sinks", None)
+    sinks = getattr(inner, attr, None)
     if sinks is None or sinks.dtype == mx.float32:
         return sinks
     cached = getattr(inner, "_vllm_metal_sinks_f32", None)
@@ -727,7 +727,7 @@ def sdpa_forward(
     # sinks leave this None and the kernel keeps its plain-softmax path.
     # The kernel reads them as device float; the cast is memoized off the
     # module's parameter tree, since this is the per-layer hot path.
-    sinks = _float32_sinks(inner)
+    sinks = _float32_sinks(inner, attention_contract.sinks_attr)
 
     queries, keys, values, gate, kv_for_sharing = prepare_sdpa_qkv(
         inner,

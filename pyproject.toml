@@ -34,7 +34,7 @@ dependencies = [
     "mlx==0.32.4; platform_system == 'Darwin' and platform_machine == 'arm64'",
     # Git SHA (2026-08-25), not a version: this revision requires MLX >=0.32.1
     # and includes cache APIs not available in the latest release (0.31.3).
-    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@9e6acca691e64d6d8bb808c328fcdea459099cca ; platform_system == 'Darwin' and platform_machine == 'arm64'",
+    "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@4cfc6478473b0668ede3eb0cc93f2a9181a15052 ; platform_system == 'Darwin' and platform_machine == 'arm64'",
     "llguidance>=1.7.0,<1.8.0; platform_machine == 'x86_64' or platform_machine == 'arm64' or platform_machine == 'aarch64' or platform_machine == 'ppc64le'",
     # Keep Qwen3.5/3.6 mRoPE support (#685) and enable upstream Laya reuse.
     # mlx-vlm 0.7.6 requires MLX >=0.32.2.
@@ -101,6 +101,8 @@ metal = "vllm_metal:register"
 # subprocesses; GGUF loading stays lazy for other model formats.
 [project.entry-points."vllm.general_plugins"]
 gguf_metal = "vllm_metal.gguf.vllm_integration:register"
+# Scheduler/cache metadata for MLX architectures missing from the pinned vLLM.
+metal_model_metadata = "vllm_metal.compat:register_model_compat"
 
 [tool.setuptools]
 include-package-data = false

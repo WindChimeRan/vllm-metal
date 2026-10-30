@@ -30,6 +30,8 @@ class AttentionContract:
     shared_qk_norm: bool = False
     post_norm_query_scale: bool = False
     sigmoid_output_gate: bool = False
+    # Module attribute holding learned per-head attention sinks, if any.
+    sinks_attr: str = "sinks"
 
 
 DEFAULT_ATTENTION_CONTRACT = AttentionContract()
@@ -73,7 +75,14 @@ _ATTENTION_CONTRACTS: dict[str, AttentionContract] = {
 
 def attention_contract_for(module: object) -> AttentionContract:
     """Return the model's attention contract or the standard default."""
-    if type(module).__module__ == "mlx_lm.models.granitemoehybrid":
+    module_name = type(module).__module__
+    if module_name == "mlx_lm.models.granitemoehybrid":
         # Granite selects RoPE or position-free attention from the checkpoint.
         return AttentionContract(use_rope=module.rope is not None)
-    return _ATTENTION_CONTRACTS.get(type(module).__module__, DEFAULT_ATTENTION_CONTRACT)
+    if module_name == "mlx_lm.models.flint":
+        # Flint's full-attention layers are position-free; every layer has
+        # learned sinks named ``softmax_offset``.
+        return AttentionContract(
+            use_rope=module.rope is not None, sinks_attr="softmax_offset"
+        )
+    return _ATTENTION_CONTRACTS.get(module_name, DEFAULT_ATTENTION_CONTRACT)

@@ -1,15 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Compatibility patches for vLLM + transformers version mismatches.
 
-Applied once at platform registration time. Optional missing dependencies are
-logged; unexpected runtime errors are allowed to surface so regressions remain
-diagnosable.
+Most patches run at platform registration; model-registry compatibility uses
+the later general-plugin hook. Unexpected runtime errors remain visible.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -26,6 +26,69 @@ _EMBEDDING_LOAD_SCOPE: ContextVar[bool] = ContextVar(
 _QWEN35_FP8_BLOCK_SIZE = 128
 _QWEN3_BACKBONE_ROOTS = frozenset({"embed_tokens", "layers", "norm", "lm_head"})
 _EXAONE4_LAYER_TYPE = {"L": "sliding_attention", "G": "full_attention"}
+
+
+# TODO: Remove Flint fallbacks once the pinned Transformers and vLLM know it.
+def _flint_config_class() -> type[Any]:
+    """Parse Flint checkpoint metadata on older Transformers releases."""
+    from transformers.configuration_utils import PretrainedConfig
+
+    class FlintCompatConfig(PretrainedConfig):
+        model_type = "flint"
+        keys_to_ignore_at_inference = ["past_key_values"]
+
+        def __init__(
+            self,
+            use_cache: bool = True,
+            initializer_range: float = 0.02,
+            **kwargs: Any,
+        ) -> None:
+            layer_types = kwargs.get("layer_types")
+            num_layers = kwargs.get("num_hidden_layers")
+            if layer_types is not None and len(layer_types) != num_layers:
+                raise ValueError(
+                    f"layer_types has {len(layer_types)} entries but "
+                    f"num_hidden_layers is {num_layers}"
+                )
+            self.use_cache = use_cache
+            self.initializer_range = initializer_range
+            super().__init__(**kwargs)
+
+    return FlintCompatConfig
+
+
+def register_model_compat() -> None:
+    """Register missing model metadata for the Metal MLX runner.
+
+    MLX executes the model, while vLLM still queries registered model classes
+    for hybrid capabilities and state-cache metadata. The general-plugin hook
+    runs before ModelConfig inspection, after vllm.config is importable;
+    registering in apply_compat_patches would create an import cycle.
+    """
+    if os.environ.get("VLLM_METAL_BACKEND", "mlx") != "mlx":
+        return
+    from vllm.platforms import current_platform
+
+    from vllm_metal.platform import MetalPlatform
+
+    if not isinstance(current_platform, MetalPlatform):
+        return
+
+    from transformers import AutoConfig
+    from vllm.model_executor.models import ModelRegistry
+
+    try:
+        AutoConfig.for_model("flint")
+    except ValueError:
+        AutoConfig.register("flint", _flint_config_class(), exist_ok=True)
+        logger.debug("Registered Flint config compatibility")
+
+    if "FlintForCausalLM" not in ModelRegistry.get_supported_archs():
+        ModelRegistry.register_model(
+            "FlintForCausalLM",
+            "vllm.model_executor.models.transformers:TransformersMoEForCausalLM",
+        )
+        logger.debug("Registered Flint architecture compatibility")
 
 
 def apply_compat_patches() -> None:

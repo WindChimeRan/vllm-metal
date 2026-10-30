@@ -19,6 +19,8 @@ The default is the 40 prompts in `tools/parity_prompts.py`, greedy decoding, and
 - `TOP_K_MATCH`: the first divergence passes mutual top-K membership; later tokens are not compared. Enabled with `--top-k K`.
 - `FAIL`: a mismatch fails the comparison, or generation is incomplete.
 
+Parity checks may be unreliable for MoE models. When mismatches occur, investigate routing flips between experts with nearly tied scores.
+
 Exit status is 0 when all prompts pass, otherwise nonzero. No saved golden token IDs or regeneration step is needed.
 
 ## Speculative decoding

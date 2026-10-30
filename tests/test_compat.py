@@ -345,6 +345,119 @@ class TestGemma4MTPConfigCompatPatch:
         ]
 
 
+def _write_flint_config(path) -> None:
+    layer_types = ["full_attention", "sliding_attention", "sliding_attention"]
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["FlintForCausalLM"],
+                "model_type": "flint",
+                "hidden_size": 128,
+                "num_hidden_layers": 3,
+                "layer_types": layer_types,
+                "no_rope_layer_indices": [0],
+                "sliding_window": 513,
+                "num_experts": 8,
+                "num_experts_per_tok": 2,
+                "use_cache": False,
+                "initializer_range": 0.04,
+            }
+        )
+    )
+
+
+class TestFlintCompat:
+    @pytest.fixture(autouse=True)
+    def metal_mlx(self, monkeypatch):
+        import vllm.platforms as platforms
+
+        from vllm_metal.platform import MetalPlatform
+
+        monkeypatch.delenv("VLLM_METAL_BACKEND", raising=False)
+        monkeypatch.setattr(platforms, "current_platform", MetalPlatform())
+
+    @pytest.fixture
+    def without_flint(self, monkeypatch):
+        """Hide any Flint registration in Transformers and vLLM."""
+        from vllm.model_executor.models import ModelRegistry
+
+        config_mapping = configuration_auto.CONFIG_MAPPING
+        monkeypatch.setattr(config_mapping, "_mapping", dict(config_mapping._mapping))
+        monkeypatch.setattr(
+            config_mapping, "_extra_content", dict(config_mapping._extra_content)
+        )
+        config_mapping._mapping.pop("flint", None)
+        config_mapping._extra_content.pop("flint", None)
+        monkeypatch.setattr(ModelRegistry, "models", dict(ModelRegistry.models))
+        ModelRegistry.models.pop("FlintForCausalLM", None)
+        return ModelRegistry
+
+    def test_flint_checkpoint_metadata_loads(self, without_flint, tmp_path) -> None:
+        with pytest.raises(ValueError, match="flint"):
+            AutoConfig.for_model("flint")
+
+        _write_flint_config(tmp_path)
+        compat.register_model_compat()
+        compat.register_model_compat()
+        config = AutoConfig.from_pretrained(tmp_path)
+
+        assert "FlintForCausalLM" in without_flint.get_supported_archs()
+        assert config.model_type == "flint"
+        assert config.hidden_size == 128
+        assert config.sliding_window == 513
+        assert config.layer_types[0] == "full_attention"
+        assert config.no_rope_layer_indices == [0]
+        assert config.num_experts == 8
+        assert config.use_cache is False
+        assert config.initializer_range == 0.04
+
+    def test_flint_config_rejects_inconsistent_layer_count(
+        self, without_flint, tmp_path
+    ) -> None:
+        _write_flint_config(tmp_path)
+        path = tmp_path / "config.json"
+        data = json.loads(path.read_text())
+        path.write_text(json.dumps(data | {"num_hidden_layers": 4}))
+        compat.register_model_compat()
+
+        with pytest.raises(
+            ValueError, match="layer_types has 3 entries but num_hidden_layers is 4"
+        ):
+            AutoConfig.from_pretrained(tmp_path)
+
+    def test_existing_registrations_are_kept(self, without_flint) -> None:
+        sentinel_config = type("Sentinel", (), {"model_type": "flint"})
+        AutoConfig.register("flint", sentinel_config, exist_ok=True)
+        without_flint.register_model(
+            "FlintForCausalLM", "vllm.model_executor.models.llama:LlamaForCausalLM"
+        )
+
+        compat.register_model_compat()
+
+        assert configuration_auto.CONFIG_MAPPING["flint"] is sentinel_config
+        assert without_flint.models["FlintForCausalLM"].class_name == "LlamaForCausalLM"
+
+    @pytest.mark.parametrize(
+        ("is_metal", "backend"),
+        [(False, "mlx"), (True, "mps")],
+    )
+    def test_other_platforms_and_backends_keep_flint_unregistered(
+        self, without_flint, monkeypatch, is_metal, backend
+    ) -> None:
+        import vllm.platforms as platforms
+        from vllm.platforms.cpu import CpuPlatform
+
+        monkeypatch.setenv("VLLM_METAL_BACKEND", backend)
+        if not is_metal:
+            monkeypatch.setattr(platforms, "current_platform", CpuPlatform())
+
+        compat.register_model_compat()
+
+        assert "FlintForCausalLM" not in without_flint.get_supported_archs()
+        with pytest.raises(ValueError, match="flint"):
+            AutoConfig.for_model("flint")
+
+
 def _install_fake_qwen35_modules(monkeypatch, *, include_moe: bool):
     mlx_pkg = ModuleType("mlx")
     mlx_core = ModuleType("mlx.core")
