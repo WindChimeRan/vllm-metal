@@ -201,8 +201,8 @@ class SamplingBatch:
 
         Requests must use plain temperature/top-k/top-p/min-p sampling; the
         mask is built per row, so rows may mix greedy (temperature 0) with
-        random sampling and differ in top-k/top-p/min-p. Seeded requests
-        stay on the torch path.
+        random sampling and differ in top-k/top-p/min-p. Requests with seeds,
+        sample logprobs, or structured outputs stay on the torch path.
         """
         if not sampling_params_list:
             return False
@@ -212,39 +212,39 @@ class SamplingBatch:
             and sp.presence_penalty == 0.0
             and sp.repetition_penalty == 1.0
             and sp.num_logprobs is None
+            and sp.structured_outputs is None
             and not sp.allowed_token_ids
             and not sp.bad_words_token_ids
             for sp in sampling_params_list
         )
 
     @classmethod
-    def native_decode_tokens(
+    def native_sample_tokens(
         cls,
         logits_2d: mx.array,
         sampling_params_list: Sequence[SamplingParams],
         *,
         vocab_size: int,
-        next_key: Callable[[], mx.array] | None,
+        next_native_rng_key: Callable[[], mx.array] | None,
     ) -> mx.array:
-        """Build the lazy native token graph for a deferred decode batch.
+        """Build the lazy native token graph for an eligible batch.
 
-        Owns the sampling policy for the decode pipeline's deferred step:
-        greedy argmax when the batch allows it, otherwise the temperature/
+        Uses greedy argmax when the batch allows it, otherwise the temperature/
         top-k/top-p categorical graph over the vocab-sliced logits (unlike
         argmax, categorical can select a padded lm_head column). The caller
-        owns evaluation and RNG state; ``next_key`` is consumed only on the
+        owns evaluation and RNG state; ``next_native_rng_key`` is consumed only on the
         random path. Raises on batches neither native path admits — the
-        pipeline gate must not let those reach here.
+        caller must not let those reach here.
         """
         if cls.params_allow_native_greedy(sampling_params_list):
             return mlx_greedy_tokens(logits_2d)
-        if next_key is not None and cls.params_allow_native_random(
+        if next_native_rng_key is not None and cls.params_allow_native_random(
             sampling_params_list
         ):
             return cls._native_random_tokens(
-                logits_2d[..., :vocab_size], sampling_params_list, next_key()
+                logits_2d[..., :vocab_size], sampling_params_list, next_native_rng_key()
             )
-        key_state = "live" if next_key is not None else "absent"
+        key_state = "live" if next_native_rng_key is not None else "absent"
         raise RuntimeError(
             "Deferred sampling requires a native-greedy or native-random "
             f"eligible batch (native sample key {key_state}, random-eligible="
@@ -629,11 +629,14 @@ def sample_from_logits(
     logits_2d: mx.array,
     batch: SamplingBatch,
     sampler: Sampler,
+    *,
+    next_native_rng_key: Callable[[], mx.array] | None = None,
 ) -> _SamplingResult:
     """Sample tokens from pre-sliced 2D logits ``(batch_size, vocab)``.
 
-    Single entry point for all sampling paths.  Chooses native MLX greedy
-    when possible, otherwise bridges to the vLLM torch sampler on
+    Single entry point for all sampling paths. Chooses native MLX greedy
+    when possible, or eligible native random sampling with a live ``next_native_rng_key``.
+    Otherwise bridges to the vLLM torch sampler on
     ``SamplingBatch.SAMPLER_DEVICE``. Requests that need sample logprobs must
     use the vLLM sampler so ``ModelRunnerOutput`` can satisfy the OpenAI
     serving contract.
@@ -647,6 +650,21 @@ def sample_from_logits(
         if tokens.ndim == 0:
             return _SamplingResult([int(tokens.item())])
         return _SamplingResult(tokens.tolist())  # type: ignore[arg-type]
+
+    if (
+        next_native_rng_key is not None
+        and not batch.generators
+        and not batch.needs_logprobs
+        and SamplingBatch.params_allow_native_random(batch.sampling_params_list)
+    ):
+        tokens = SamplingBatch.native_sample_tokens(
+            logits_2d,
+            batch.sampling_params_list,
+            vocab_size=batch.vocab_size,
+            next_native_rng_key=next_native_rng_key,
+        )
+        mx.eval(tokens)
+        return _SamplingResult(tokens.tolist())
 
     mx.eval(logits_2d)
     logits_torch = mlx_to_torch(
@@ -670,6 +688,7 @@ def sample_decode_tokens(
     sampler: Sampler,
     *,
     vocab_size: int,
+    next_native_rng_key: Callable[[], mx.array] | None = None,
 ) -> _SamplingResult:
     """Sample one token per decode request from evaluated logits.
 
@@ -707,7 +726,9 @@ def sample_decode_tokens(
         vocab_size=vocab_size,
         generators=generators,
     )
-    return sample_from_logits(decode_logits, batch, sampler)
+    return sample_from_logits(
+        decode_logits, batch, sampler, next_native_rng_key=next_native_rng_key
+    )
 
 
 def sample_prefill_tokens(
@@ -718,6 +739,7 @@ def sample_prefill_tokens(
     sampler: Sampler,
     *,
     vocab_size: int,
+    next_native_rng_key: Callable[[], mx.array] | None = None,
 ) -> _SamplingResult:
     """Sample from the last logit position of each completed prefill.
 
@@ -766,7 +788,9 @@ def sample_prefill_tokens(
             if pr.generator is not None
         },
     )
-    result = sample_from_logits(last_logits, batch, sampler)
+    result = sample_from_logits(
+        last_logits, batch, sampler, next_native_rng_key=next_native_rng_key
+    )
     if len(final_reqs) == len(prefill_reqs):
         return result
 
