@@ -943,7 +943,17 @@ validate_paged_attention_support` only when ``kv_heads_per_layer`` has
     def _apply_target_logit_postprocessing(
         self, model: Any, logits: mx.array
     ) -> mx.array:
-        softcap = getattr(model, "final_logit_softcapping", None)
+        # Muse Glimmer scales its logits before the softcap, and mlx-lm keeps
+        # both values on ``args``.
+        args = getattr(model, "args", None)
+        multiplier = getattr(args, "output_multiplier", None)
+        if multiplier is not None:
+            logits = logits * multiplier
+        softcap = getattr(
+            model,
+            "final_logit_softcapping",
+            getattr(args, "final_logit_softcapping", None),
+        )
         if softcap is None:
             return logits
         return mx.tanh(logits / softcap) * softcap
