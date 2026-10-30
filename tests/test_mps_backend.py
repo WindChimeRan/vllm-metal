@@ -3,6 +3,7 @@
 """MPS request mapping, cache sizing and normalization parity."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -226,21 +227,37 @@ def test_explicit_cache_budget_must_fit_one_metal_buffer(mps_memory, limit, larg
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
-@pytest.mark.parametrize("fused", [False, True], ids=["plain", "residual"])
-def test_rms_norm_parity(dtype, fused):
+@pytest.mark.parametrize(
+    ("fused", "num_tokens", "hidden_size"),
+    [
+        (False, 4, 128),
+        (True, 4, 128),
+        (True, 1, 1024),
+        (True, 4, 1024),
+        (True, 3, 1028),
+    ],
+    ids=["plain", "residual", "decode", "batched-decode", "tail"],
+)
+def test_rms_norm_parity(dtype, fused, num_tokens, hidden_size):
     from vllm import ir
 
     import vllm_metal.pytorch_backend.normalization  # noqa: F401
 
     op = ir.ops.fused_add_rms_norm if fused else ir.ops.rms_norm
-    args = op.generate_inputs(num_tokens=4, hidden_size=128, dtype=dtype, device="cpu")
-    args[-2].copy_(torch.tensor([1.25, 1.75, 0.75, 1.5], dtype=dtype).repeat(32))
+    args = op.generate_inputs(
+        num_tokens=num_tokens, hidden_size=hidden_size, dtype=dtype, device="cpu"
+    )
+    args[-2].copy_(
+        torch.tensor([1.25, 1.75, 0.75, 1.5], dtype=dtype).repeat(hidden_size // 4)
+    )
     if fused:
         # This row distinguishes FP32 accumulation and cast-before-weight from
         # rounding the sum early or applying the learned weight before casting.
         args[0][0].fill_(1)
         args[1][0] = (
-            torch.tensor([0.125, 0.375, 0.625, 0.875], dtype=dtype).repeat(32)
+            torch.tensor([0.125, 0.375, 0.625, 0.875], dtype=dtype).repeat(
+                hidden_size // 4
+            )
             * torch.finfo(dtype).eps
         )
     with op.set_priority(["native"]):
@@ -254,7 +271,89 @@ def test_rms_norm_parity(dtype, fused):
         expected, expected_residual = expected
         torch.testing.assert_close(residual.cpu(), expected_residual, atol=0, rtol=0)
         torch.testing.assert_close(actual[0].cpu(), expected[0], atol=0, rtol=0)
+        for original, gpu_arg in zip(args[:-1], gpu_args[:-1], strict=True):
+            torch.testing.assert_close(gpu_arg.cpu(), original, atol=0, rtol=0)
     torch.testing.assert_close(actual.cpu(), expected, **op.get_tolerance(dtype))
+
+
+@pytest.mark.parametrize("strided_arg", [0, 1, 2], ids=["input", "residual", "weight"])
+def test_residual_rms_norm_falls_back_for_noncontiguous_inputs(strided_arg):
+    from vllm import ir
+
+    from vllm_metal.pytorch_backend import normalization
+
+    op = ir.ops.fused_add_rms_norm
+    args = list(
+        op.generate_inputs(
+            num_tokens=4,
+            hidden_size=1024,
+            dtype=torch.bfloat16,
+            epsilon=1e-3,
+            device="mps",
+        )
+    )
+    source = args[strided_arg]
+    storage = torch.empty(
+        (*source.shape[:-1], source.shape[-1] * 2), device="mps", dtype=source.dtype
+    )
+    args[strided_arg] = storage[..., ::2]
+    args[strided_arg].copy_(source)
+    assert not args[strided_arg].is_contiguous()
+    before = [arg.cpu() if isinstance(arg, torch.Tensor) else arg for arg in args]
+    with op.set_priority(["native"]):
+        expected = op(*before)
+    with (
+        op.set_priority(["torch_mps", "native"]),
+        patch.object(
+            normalization,
+            "_add_rms_norm_kernel",
+            side_effect=AssertionError(
+                "Noncontiguous inputs must bypass the fused kernel"
+            ),
+        ) as kernel_loader,
+    ):
+        assert op.dispatch(*args).provider == "torch_mps"
+        actual = op(*args)
+        kernel_loader.assert_not_called()
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            result.cpu(), reference, **op.get_tolerance(source.dtype)
+        )
+    for arg, original in zip(args[:-1], before[:-1], strict=True):
+        torch.testing.assert_close(arg.cpu(), original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("case", ["empty", "unweighted", "partial-variance"])
+def test_residual_rms_norm_retains_native_fallback(case):
+    from vllm import ir
+
+    import vllm_metal.pytorch_backend.normalization  # noqa: F401
+
+    op = ir.ops.fused_add_rms_norm
+    args = list(
+        op.generate_inputs(
+            num_tokens=0 if case == "empty" else 1,
+            hidden_size=1024,
+            dtype=torch.bfloat16,
+            device="cpu",
+        )
+    )
+    if case == "unweighted":
+        args[2] = None
+    elif case == "partial-variance":
+        args.append(512)
+    with op.set_priority(["native"]):
+        expected = op(*args)
+    gpu_args = tuple(
+        arg.to("mps") if isinstance(arg, torch.Tensor) else arg for arg in args
+    )
+    with op.set_priority(["torch_mps", "native"]):
+        assert op.dispatch(*gpu_args).provider == "native"
+        actual = op(*gpu_args)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            result.cpu(), reference, **op.get_tolerance(torch.bfloat16)
+        )
 
 
 def test_shortconv_checkpoint_survives_resume():
