@@ -1,11 +1,18 @@
-# Sampling benchmark evidence for vllm-metal #1234
+# Sampling benchmarks for vllm-metal #1234
 
-The figures and numeric results are review assets, separate from the implementation PR.
+Measured November 3, 2026 on an Apple M5 Pro with 64 GiB. PyTorch 2.16.0.dev20261013, MLX 0.32.4 and vLLM 0.32.0+cpu. MPS CPU fallback was disabled.
 
-- End-to-end: Qwen3-0.6B FP16, 32 requests, 128 input/128 output tokens, C=1/4/8, two warmups, one measured run per setting. MLX baseline is main 3136697d including #1233; MPS baseline is the prior PyTorch-operator sampler 09fbdaad. Shared implementation: 5d136d81. All 960 requests completed.
-- Microbenchmark: B=1/4/8, vocabulary 6,562 and 152,064, fresh FP32 logits already scaled by temperature 0.8. Ten warmups and one window of 200 draws, synchronized after every draw. MPS uses torch.inference_mode. Includes host dispatch, allocation, GPU work and reduction; excludes model execution, filtering and seed derivation. This is not device-only shader timing.
-- Micro baselines: frozen PyTorch-operator Gumbel sampler; MLX per-row seeded categorical draw as used by #1233. The shared adapters use the same Metal shader. MPS reference tokens matched for every checked shape; MLX RNG streams differ by design.
-- Hardware/software: Apple M5 Pro, 64 GiB; PyTorch 2.16.0.dev20261013, MLX 0.32.4, vLLM 0.32.0+cpu. MPS CPU fallback disabled.
-- Speech-sized micro inputs do not establish an MLX Omni serving integration. Existing Omni serving uses PyTorch-MPS.
+The candidate is [95da4bb3](https://github.com/vllm-project/vllm-metal/commit/95da4bb32b1146c3521ce7f2b61016487cc8bbd6).
 
-Run micro_benchmark.py from an environment with the PR installed, with --backend mps or mlx, --variant baseline or shared, and --output result.json. Keep pytorch_reference.py beside it. Set PYTORCH_ENABLE_MPS_FALLBACK=0.
+- Serving uses Qwen3-0.6B FP16 with Model Runner V2 in both arms, 32 requests of 128 input and 128 output tokens, concurrency 1/4/8 and temperature 0.8. Each setting ran once after eight warmup requests. All 960 measured requests completed.
+- The MLX baseline is [the PR base](https://github.com/vllm-project/vllm-metal/commit/a44be48731005932a24dd30b55c21e992dc90b9a). The MPS baseline uses the candidate checkout with only the sampler replaced by the frozen PyTorch-operator reference below. The PR base supports greedy MPS decoding only.
+- The draw benchmark uses GPU-resident, temperature-scaled FP32 logits, at least ten warmups spanning at least 0.5 seconds, and one window of 200 fresh draws per shape. Each draw is synchronized. Timings include dispatch, allocation and final token reduction. Model execution, filters and key derivation are outside the timed region. All 5,200 measured MPS token IDs matched the operator reference. MLX uses a different RNG stream from its baseline.
+- The small vocabulary measures the shared primitive on speech-sized inputs. Omni serving currently uses the MPS backend.
+
+![Serving](end-to-end.png)
+
+![Draw latency](microbenchmark.png)
+
+[Serving measurements](end-to-end.json) · [Draw measurements](microbenchmark.json) · [Serving harness](run_benchmarks.py) · [Draw harness](micro_benchmark.py) · [PyTorch reference](pytorch_reference.py) · [Plotting](plot_results.py)
+
+The serving harness records the exact checkout, patch and CLI arguments per run. Its paths select the local benchmark checkouts. The draw harness accepts `--backend mlx|mps`, `--variant baseline|shared` and `--output result.json`. Use `PYTORCH_ENABLE_MPS_FALLBACK=0`.

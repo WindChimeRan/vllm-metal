@@ -1,98 +1,86 @@
 [
   {
-    "backend": "mps",
-    "batch": 1,
-    "vocab": 6562,
-    "baseline_us": 406.660415,
-    "shared_us": 256.670415,
-    "speedup": 1.5843680893257606
-  },
-  {
-    "backend": "mps",
-    "batch": 4,
-    "vocab": 6562,
-    "baseline_us": 383.655835,
-    "shared_us": 151.11667,
-    "speedup": 2.538805513647171
-  },
-  {
-    "backend": "mps",
-    "batch": 8,
-    "vocab": 6562,
-    "baseline_us": 397.353545,
-    "shared_us": 192.00167000000002,
-    "speedup": 2.0695317129272883
-  },
-  {
-    "backend": "mps",
-    "batch": 1,
-    "vocab": 152064,
-    "baseline_us": 456.14896000000005,
-    "shared_us": 216.68125,
-    "speedup": 2.105161198765468
-  },
-  {
-    "backend": "mps",
-    "batch": 4,
-    "vocab": 152064,
-    "baseline_us": 756.108335,
-    "shared_us": 290.692295,
-    "speedup": 2.6010608055504187
-  },
-  {
-    "backend": "mps",
-    "batch": 8,
-    "vocab": 152064,
-    "baseline_us": 1246.921665,
-    "shared_us": 312.16916499999996,
-    "speedup": 3.9943780642139983
-  },
-  {
     "backend": "mlx",
     "batch": 1,
     "vocab": 6562,
-    "baseline_us": 305.07125,
-    "shared_us": 270.41729,
-    "speedup": 1.1281499418916596
+    "baseline_us": 162.3375,
+    "shared_us": 154.353335
   },
   {
     "backend": "mlx",
     "batch": 4,
     "vocab": 6562,
-    "baseline_us": 233.034165,
-    "shared_us": 166.46729000000002,
-    "speedup": 1.3998796099822373
+    "baseline_us": 226.470625,
+    "shared_us": 161.401875
   },
   {
     "backend": "mlx",
     "batch": 8,
     "vocab": 6562,
-    "baseline_us": 286.6025,
-    "shared_us": 218.45479,
-    "speedup": 1.3119533794612608
+    "baseline_us": 263.495415,
+    "shared_us": 164.309375
   },
   {
     "backend": "mlx",
     "batch": 1,
     "vocab": 152064,
-    "baseline_us": 286.35542,
-    "shared_us": 274.855625,
-    "speedup": 1.0418394020497126
+    "baseline_us": 197.383125,
+    "shared_us": 161.38708499999998
   },
   {
     "backend": "mlx",
     "batch": 4,
     "vocab": 152064,
-    "baseline_us": 431.27583000000004,
-    "shared_us": 279.1925,
-    "speedup": 1.54472570000985
+    "baseline_us": 314.665835,
+    "shared_us": 180.031665
   },
   {
     "backend": "mlx",
     "batch": 8,
     "vocab": 152064,
-    "baseline_us": 605.04875,
-    "shared_us": 334.433125,
-    "speedup": 1.8091770963178364
+    "baseline_us": 514.28396,
+    "shared_us": 208.27521
+  },
+  {
+    "backend": "mps",
+    "batch": 1,
+    "vocab": 6562,
+    "baseline_us": 342.99354,
+    "shared_us": 145.064165
+  },
+  {
+    "backend": "mps",
+    "batch": 4,
+    "vocab": 6562,
+    "baseline_us": 351.469375,
+    "shared_us": 143.85
+  },
+  {
+    "backend": "mps",
+    "batch": 8,
+    "vocab": 6562,
+    "baseline_us": 405.184375,
+    "shared_us": 142.508125
+  },
+  {
+    "backend": "mps",
+    "batch": 1,
+    "vocab": 152064,
+    "baseline_us": 380.564795,
+    "shared_us": 146.95333499999998
+  },
+  {
+    "backend": "mps",
+    "batch": 4,
+    "vocab": 152064,
+    "baseline_us": 700.300835,
+    "shared_us": 159.667085
+  },
+  {
+    "backend": "mps",
+    "batch": 8,
+    "vocab": 152064,
+    "baseline_us": 1173.24375,
+    "shared_us": 177.14833
   }
 ]

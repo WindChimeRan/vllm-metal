@@ -1,7 +1,7 @@
 """Synchronized sampling draw latency, excluding model execution and filtering.
 
 MPS uses vLLM's public gumbel_sample wrapper for both implementations.
-The MLX baseline is the per-row seeded categorical draw from main #1233;
+The MLX baseline is the per-row seeded categorical draw from the PR base a44be487;
 its filter stage and seed derivation are outside the timed region.
 """
 import argparse
@@ -19,6 +19,7 @@ parser.add_argument('--variant', choices=('baseline', 'shared'), required=True)
 parser.add_argument('--output', type=Path, required=True)
 parser.add_argument('--calls', type=int, default=200)
 parser.add_argument('--warmups', type=int, default=10)
+parser.add_argument('--warmup-seconds', type=float, default=0.5)
 args = parser.parse_args()
 
 if args.backend == 'mps':
@@ -73,30 +74,34 @@ with context:
                 else:
                     def draw(i):
                         keys = mx.stack(row_keys[i]).view(mx.int64).reshape(-1)
-                        indices, maxima = ops.gumbel_sample(logits[i], keys, positions, temperatures)
-                        best = mx.max(maxima, axis=-1, keepdims=True)
-                        return mx.min(mx.where(maxima == best, indices, 0x7FFFFFFFFFFFFFFF), axis=-1)
+                        return ops.gumbel_sample(logits[i], keys, positions, temperatures)
                 synchronize = mx.synchronize
                 evaluate = mx.eval
                 mx.eval(logits, positions, temperatures, *[key for keys in row_keys for key in keys])
             del host
-            for i in range(args.warmups):
-                evaluate(draw(i))
+            warmup_start = time.perf_counter()
+            warmup_calls = 0
+            while warmup_calls < args.warmups or time.perf_counter() - warmup_start < args.warmup_seconds:
+                evaluate(draw(warmup_calls % args.warmups))
+                warmup_calls += 1
             synchronize()
+            sampled = []
             start = time.perf_counter_ns()
             for i in range(args.warmups, steps):
                 result = draw(i)
                 evaluate(result)
+                sampled.append(result)
             elapsed_ns = time.perf_counter_ns() - start
+            all_tokens = torch.stack(sampled).cpu().tolist() if args.backend == 'mps' else mx.stack(sampled).tolist()
             tokens = result.cpu().tolist() if args.backend == 'mps' else result.tolist()
             assert len(tokens) == batch and all(0 <= t < vocab for t in tokens)
             row = {'backend': args.backend, 'variant': args.variant, 'batch': batch,
-                   'vocab': vocab, 'warmups': args.warmups, 'calls': args.calls,
+                   'vocab': vocab, 'warmups': warmup_calls, 'minimum_warmup_seconds': args.warmup_seconds, 'calls': args.calls,
                    'microseconds_per_draw': elapsed_ns / args.calls / 1000,
-                   'last_tokens': tokens}
+                   'last_tokens': tokens, 'all_tokens': all_tokens}
             results.append(row)
             args.output.write_text(json.dumps(results, indent=2))
             print(json.dumps(row), flush=True)
-            del result, logits, draw
+            del result, logits, draw, sampled
             synchronize()
 print('CORRECT=True (finite token IDs; MPS baseline equality checked by orchestrator)', flush=True)
