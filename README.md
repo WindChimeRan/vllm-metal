@@ -1,6 +1,6 @@
 # MPS DFlash evidence
 
-Benchmarks were measured on **2026-10-29**, with vLLM 0.32.0+cpu, on the DFlash patch in `measured-source.patch` applied to `e51f6e8755821e4684f544101783f8c545c711fb`. They predate the vLLM 0.33 rebase. Current code was revalidated for correctness on **2026-11-05** at `e5ddbf7ab049fc82068a0ffc34ae789de9842479`; its throughput has not been remeasured.
+Benchmarks were measured on **2026-10-29**, with vLLM 0.32.0+cpu, on the DFlash patch in `measured-source.patch` applied to `e51f6e8755821e4684f544101783f8c545c711fb`. They predate the vLLM 0.33 rebase. Current code was revalidated for correctness on **2026-11-05** at `8f082edc2af91846d44638f922de62fc2b022626`; its throughput has not been remeasured.
 
 ![DFlash serving comparison](comparison.png)
 
@@ -25,9 +25,9 @@ MPS servers used asynchronous scheduling and a 3 GiB KV budget; MLX used synchro
 
 ## Current code validation
 
-[validation.json](validation.json) records the November 5 checks on vLLM 0.33.0+cpu and default nightly Torch: **6,397 passed / 16 skipped** in the non-slow suite; **259 passed / 2 optional Omni skips** in the focused MPS suite; Ruff and mypy passed.
+[validation.json](validation.json) records the November 5 checks on vLLM 0.33.0+cpu and default nightly Torch: **6,292 passed / 16 skipped** in the non-slow suite; **154 passed / 2 optional Omni skips** in the focused MPS suite; Ruff and mypy passed.
 
-Fresh native and target-only comparisons use matching checkpoints and input token IDs, 12 prompts × 32 output tokens at B=1/8, chunked prefill and prefix-cache reuse. All comparisons have **zero FAIL**. `TOP_K_MATCH` is mutual top-five membership at the first divergence, not full-sequence equality.
+Fresh native and target-only comparisons use matching checkpoints and input token IDs, 12 prompts × 32 output tokens at B=1/8, chunked prefill and prefix-cache reuse. All comparisons have **zero FAIL**. All 24 DFlash continuations match the pre-cleanup outputs exactly; draft and acceptance counters also match. `TOP_K_MATCH` is mutual top-five membership at the first divergence, not full-sequence equality.
 
 ```bash
 PYTORCH_ENABLE_MPS_FALLBACK=0 python -m pytest tests/ .github/scripts/test_parity.py -m 'not slow' -q

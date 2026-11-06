@@ -1,8 +1,8 @@
 {
   "validated_on": "2026-11-05",
-  "source_commit": "e5ddbf7ab049fc82068a0ffc34ae789de9842479",
+  "source_commit": "8f082edc2af91846d44638f922de62fc2b022626",
   "base_commit": "81d5883f71b7ce23f30889c16d0d136e096064be",
-  "validated_diff_sha256": "5e8cefed362ab0a16593b56d4dda26aceebf7dfc4ccc8d65bcc14fa332eb2e58",
+  "validated_diff_sha256": "77028ee82d20f41173e931e6f8d8f86fe2305490d1854e9d3900549d33291804",
   "versions": {
     "torch": "2.16.0.dev20261013",
     "vllm": "0.33.0+cpu",
@@ -12,12 +12,12 @@
   },
   "tests": {
     "non_slow": {
-      "passed": 6397,
+      "passed": 6292,
       "skipped": 16,
       "deselected": 316
     },
     "focused_mps": {
-      "passed": 259,
+      "passed": 154,
       "skipped": 2,
       "skip_reason": "Optional vllm-omni package is absent."
     },
@@ -106,6 +106,32 @@
         "queries": 6342.0,
         "hits": 4656.0
       }
+    }
+  },
+  "source_files": {
+    "docs/dflash.md": "0c92ab9d5170a12d9df9bceb0a22bf6c38c54a509a0fb70d401f32a3021ca60d",
+    "docs/pytorch-mps.md": "b52bb005d825dc018dd298bd813df0ec49b294125fd375481d0de474122a5b68",
+    "tests/test_mps_attention.py": "1be5e2441060c4ee3051eeec051f417b193e23db8cdd5ce8fa4df83b2f57dc29",
+    "tests/test_mps_backend.py": "15f28de5e7d38ef16284343e4225104d82c55be939ed065d85a9d6b2a5c32bc4",
+    "vllm_metal/pytorch_backend/attention.py": "551032f45e6c64d727dd53f5b5e4a678275e4aecfe6bcfcfbcc4884b39728c68",
+    "vllm_metal/pytorch_backend/bindings.py": "8b4a59edb4fcfcc1298c076cf5d2ecd80d74c8fbd9fc91309aeef5def1aeec0d",
+    "vllm_metal/pytorch_backend/mps_ops.mm": "ef00bc322ff2fabe6a2010c446ce1ee8a1867fbfebe7c2d79b60a9247f791acb",
+    "vllm_metal/pytorch_backend/normalization.py": "54d5727ca4fdf25f8766c3ce37fcdcb40b9007bd9af334df76faebc97cdde781",
+    "vllm_metal/pytorch_backend/rotary.py": "5395107dd15975fb3d9658f1bfd4fbc7d59e38b1c8eff94d19b0d2f06ffe0fde",
+    "vllm_metal/pytorch_backend/speculative_ops.py": "f9ffd6cc2b3d8b24dbbd7ce643e10bca863137788cb19cd6a2d9a8d7e621167b",
+    "vllm_metal/pytorch_backend/worker.py": "c8ae105282b1ea5dce514eeceed2dd14f18121ffbfa2395c3d4d87009933bb20"
+  },
+  "before_after_reference_commit": "985ba92e671731006320bad082ce5213bb5b7388",
+  "before_after": {
+    "1": {
+      "EXACT": 12,
+      "TOP_K_MATCH": 0,
+      "FAIL": 0
+    },
+    "8": {
+      "EXACT": 12,
+      "TOP_K_MATCH": 0,
+      "FAIL": 0
     }
   }
 }
