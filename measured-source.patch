@@ -1,0 +1,765 @@
+diff --git a/docs/dflash.md b/docs/dflash.md
+index a99b0096..f04d1e23 100644
+--- a/docs/dflash.md
++++ b/docs/dflash.md
+@@ -1,5 +1,8 @@
+ # Experimental DFlash serving
+ 
++For PyTorch MPS, see [DFlash on the MPS backend](pytorch-mps.md#dflash-speculative-decoding).
++This page describes the MLX path.
++
+ This implements the first experimental serving stage of
+ [RFC #825](https://github.com/vllm-project/vllm-metal/issues/825): synchronous
+ DFlash drafting with native Metal block attention and
+diff --git a/docs/pytorch-mps.md b/docs/pytorch-mps.md
+index f476d4d9..84b7552a 100644
+--- a/docs/pytorch-mps.md
++++ b/docs/pytorch-mps.md
+@@ -33,6 +33,20 @@ Output logprobs are supported. Parallel drafting, probabilistic sampling, and
+ hybrid recurrent targets are not supported. Measure draft length on your workload;
+ more draft tokens do not always improve throughput.
+ 
++## DFlash speculative decoding
++
++Use a matching DFlash draft with the same dense FP16/BF16 target restrictions:
++
++```bash
++VLLM_METAL_BACKEND=mps PYTORCH_ENABLE_MPS_FALLBACK=0 \
++  vllm serve Qwen/Qwen3-8B --dtype bfloat16 \
++  --speculative-config '{"method":"dflash","model":"z-lab/Qwen3-8B-DFlash-b16","num_speculative_tokens":7}'
++```
++
++Use greedy requests (`temperature=0`). Asynchronous scheduling and output-token
++logprobs are supported. DFlash2, adaptive verification, probabilistic sampling,
++and hybrid recurrent targets are not supported.
++
+ ## Models
+ 
+ - Use `model_impl="auto"` and vLLM's resolver. Keep model definitions and weight
+diff --git a/tests/test_mps_attention.py b/tests/test_mps_attention.py
+index 252a41f9..79b01fdb 100644
+--- a/tests/test_mps_attention.py
++++ b/tests/test_mps_attention.py
+@@ -96,12 +96,14 @@ torch.mps.synchronize()
+ 
+ 
+ @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++@pytest.mark.parametrize("causal", [True, False])
+ @pytest.mark.parametrize(
+     "head_size,block_size,window,softcap",
+     [
+         (64, 8, None, None),
+         (96, 16, 33, 2.0),
+         (128, 32, None, 0.0),
++        (128, 16, 2, None),
+         (256, 16, 33, None),
+         (512, 8, None, 2.0),
+     ],
+@@ -121,6 +123,7 @@ torch.mps.synchronize()
+ )
+ def test_mps_paged_attention(
+     dtype,
++    causal,
+     head_size,
+     block_size,
+     window,
+@@ -170,10 +173,16 @@ def test_mps_paged_attention(
+             torch.arange(start + count)[None, :]
+             <= torch.arange(start, start + count)[:, None]
+         )
++        if not causal:
++            mask.fill_(True)
+         if window is not None:
+             mask &= torch.arange(start + count)[None, :] >= (
+                 torch.arange(start, start + count)[:, None] + 1 - window
+             )
++            if not causal:
++                mask &= torch.arange(start + count)[None, :] <= (
++                    torch.arange(start, start + count)[:, None] + window - 1
++                )
+         q_ref = q[offset : offset + count].transpose(0, 1).float()
+         k_ref = (
+             history[..., :head_size].repeat_interleave(2, dim=1).transpose(0, 1).float()
+@@ -210,12 +219,13 @@ def test_mps_paged_attention(
+         block_table_tensor=torch.tensor(table, dtype=torch.int32, device="mps"),
+         slot_mapping=torch.tensor(slots, dtype=torch.int64, device="mps"),
+         is_prefilling=torch.tensor(prefilling) if prefilling is not None else None,
++        causal=causal,
+     )
+     metadata = MPSAttentionMetadataBuilder(None, [], None, torch.device("mps")).build(
+         0, common
+     )
+     assert metadata.window_seqlen_q == (
+-        max(counts) if prefilling == [False, False] else 1
++        max(counts) if causal and prefilling == [False, False] else 1
+     )
+     gpu_qkv = qkv.to("mps")
+     gpu_q, gpu_k, gpu_v = gpu_qkv.split([16, 8, 8], dim=1)
+@@ -247,3 +257,16 @@ def test_mps_paged_attention(
+         out.cpu().float(), torch.cat(reference), atol=0.003, rtol=0.03
+     )
+     torch.testing.assert_close(gpu_cache.cpu(), expected_cache, atol=0, rtol=0)
++
++
++def test_context_cache_write_skips_rejected_rows():
++    from vllm_metal.pytorch_backend.attention import MPSAttentionImpl
++
++    impl = MPSAttentionImpl(2, 128, 128**-0.5, num_kv_heads=1)
++    cache = torch.full((3, 1, 16, 256), 7, dtype=torch.bfloat16, device="mps")
++    k, v = torch.randn(2, 3, 1, 128, dtype=cache.dtype, device="mps")
++    impl.do_kv_cache_update(None, k, v, cache, torch.tensor([16, -1, 33], device="mps"))
++    expected = torch.full_like(cache, 7)
++    expected[1, 0, 0] = torch.cat((k[0, 0], v[0, 0]))
++    expected[2, 0, 1] = torch.cat((k[2, 0], v[2, 0]))
++    torch.testing.assert_close(cache, expected, atol=0, rtol=0)
+diff --git a/tests/test_mps_backend.py b/tests/test_mps_backend.py
+index 97c147fb..52473eca 100644
+--- a/tests/test_mps_backend.py
++++ b/tests/test_mps_backend.py
+@@ -25,6 +25,109 @@ def state():
+     return RequestState(4, 64, 16, 0, 64, torch.device("mps"))
+ 
+ 
++@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
++def test_context_normalization_and_key_only_rope(dtype):
++    from vllm import _custom_ops as ops
++    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
++
++    install()
++    torch.manual_seed(19)
++    x = torch.randn(2, 5, 3, 128, dtype=dtype, device="mps")
++    weight = torch.randn(2, 128, dtype=dtype, device="mps")
++    expected = x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)
++    expected = (expected * weight.float()[:, None, None]).to(dtype)
++    out = torch.empty_like(x)
++    ops.rms_norm(out, x, weight, 1e-6)
++    torch.testing.assert_close(out, expected)
++    positions = torch.arange(5, device="mps").repeat(2)
++    cache = torch.randn(8, 128, dtype=dtype, device="mps")
++    key = out.view(10, -1)
++    expected, _ = RotaryEmbedding.forward_static(
++        positions, key, None, 128, 128, cache, True
++    )
++    ops.rotary_embedding(positions, key, None, 128, cache, True)
++    torch.testing.assert_close(key, expected, atol=0, rtol=0)
++
++
++@pytest.mark.parametrize("sample_from_anchor", [False, True])
++def test_block_draft_inputs_preserve_only_verified_context(sample_from_anchor):
++    from vllm_metal.pytorch_backend.speculative_ops import prepare_dflash_inputs
++
++    def tensor(data, dtype=torch.int64):
++        return torch.tensor(data, device="mps", dtype=dtype)
++
++    def full(size, dtype=torch.int64):
++        return torch.full((size,), 999, device="mps", dtype=dtype)
++
++    width = 3 if sample_from_anchor else 4
++    buffers = SimpleNamespace(
++        input_ids=full(16),
++        positions=full(16),
++        query_start_loc=full(4, torch.int32),
++        seq_lens=full(3, torch.int32),
++    )
++    batch = SimpleNamespace(
++        num_reqs=2,
++        num_tokens=5,
++        query_start_loc=tensor([0, 3, 5], torch.int32),
++        positions=tensor([15, 16, 17, 30, 31]),
++        idx_mapping=tensor([2, 0], torch.int32),
++    )
++    query_slots, context_pos, context_slots = full(16), full(5), full(5)
++    indices, positions, mapping = full(9), full(9), full(9)
++    temperature, seeds = full(3, torch.float32), full(3)
++    prepare_dflash_inputs(
++        buffers,
++        query_slots,
++        context_pos,
++        context_slots,
++        indices,
++        positions,
++        mapping,
++        temperature,
++        seeds,
++        batch,
++        tensor([1, 0], torch.int32),
++        tensor([1, 0], torch.int32),
++        tensor([[0], [0], [42]]),
++        tensor([[61, 62, 63]]),
++        tensor([0.0, 0.0, 0.0], torch.float32),
++        tensor([1, 2, 3]),
++        tensor([[0, 2, 3], [4, 5, 6]], torch.int32),
++        16,
++        0,
++        1,
++        1,
++        99,
++        width,
++        3,
++        3,
++        16,
++        48,
++        sample_from_anchor,
++    )
++    assert context_pos.tolist() == [15, 16, 0, 30, 31]
++    assert context_slots.tolist() == [-1, 32, -1, 94, 95]
++    assert buffers.input_ids[: 2 * width].tolist() == [42] + [99] * (width - 1) + [
++        61
++    ] + [99] * (width - 1)
++    assert buffers.positions[: 2 * width].tolist() == list(
++        range(17, 17 + width)
++    ) + list(range(32, 32 + width))
++    assert query_slots.tolist() == list(range(33, 33 + width)) + list(
++        range(96, 96 + width)
++    ) + [-1] * (16 - 2 * width)
++    assert buffers.seq_lens.tolist() == [17 + width, 32 + width, 0]
++    assert buffers.query_start_loc.tolist() == [0, width, 2 * width, 2 * width]
++    first = 0 if sample_from_anchor else 1
++    assert (
++        indices.tolist()
++        == list(range(first, width)) + list(range(width + first, 2 * width)) + [0] * 3
++    )
++    assert positions.tolist() == [18, 19, 20, 33, 34, 35, 0, 0, 0]
++    assert mapping.tolist() == [2, 2, 2, 0, 0, 0, -1, -1, -1]
++
++
+ @pytest.mark.parametrize("num_groups", [1, 2])
+ def test_request_slots_and_dummy_padding(num_groups):
+     install()
+diff --git a/vllm_metal/pytorch_backend/attention.py b/vllm_metal/pytorch_backend/attention.py
+index b024be3f..939977c0 100644
+--- a/vllm_metal/pytorch_backend/attention.py
++++ b/vllm_metal/pytorch_backend/attention.py
+@@ -12,6 +12,7 @@ from vllm.v1.attention.backend import (
+     AttentionType,
+ )
+ 
++from vllm_metal.pytorch_backend.input_ops import token_rows
+ from vllm_metal.pytorch_backend.mps_ops import get_mps_ops
+ 
+ 
+@@ -23,6 +24,7 @@ class MPSAttentionMetadata(AttentionMetadata):
+     cu_seqlens: torch.Tensor
+     max_seq_len: int
+     window_seqlen_q: int = 1
++    block_ranges: torch.Tensor | None = None
+ 
+ 
+ class MPSAttentionBackend(AttentionBackend):
+@@ -42,6 +44,10 @@ class MPSAttentionBackend(AttentionBackend):
+     def supports_sliding_window(cls):
+         return True
+ 
++    @classmethod
++    def supports_non_causal(cls):
++        return True
++
+     @staticmethod
+     def get_impl_cls():
+         return MPSAttentionImpl
+@@ -60,8 +66,19 @@ class MPSAttentionMetadataBuilder(AttentionMetadataBuilder[MPSAttentionMetadata]
+         # MRv2 supplies these flags on CPU. As on MLX, any true prefill keeps
+         # the batch on the prefill route; only decode/verification uses windows.
+         window_seqlen_q = 1
++        if not isinstance(m.causal, bool):
++            raise NotImplementedError("MPS requires a uniform attention mode per layer")
++        block_ranges = None
++        if not m.causal and m.max_query_len > 1:
++            offsets, rows = token_rows(m.query_start_loc, m.num_actual_tokens)
++            starts = m.seq_lens - m.query_start_loc.diff()
++            query_positions = starts[rows] + offsets - m.query_start_loc[rows]
++            block_ranges = torch.stack(
++                (query_positions, m.seq_lens[rows] - 1), dim=-1
++            ).to(torch.int32)
+         if (
+-            m.max_query_len > 1
++            m.causal
++            and m.max_query_len > 1
+             and m.is_prefilling is not None
+             and not m.is_prefilling.any()
+         ):
+@@ -73,6 +90,7 @@ class MPSAttentionMetadataBuilder(AttentionMetadataBuilder[MPSAttentionMetadata]
+             m.query_start_loc,
+             m.max_seq_len,
+             window_seqlen_q,
++            block_ranges,
+         )
+ 
+ 
+@@ -98,7 +116,7 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
+             or kv_sharing_target_layer_name is not None
+         ):
+             raise NotImplementedError(
+-                "MPS requires causal attention with a supported head size, "
++                "MPS requires decoder attention with a supported head size, "
+                 "without ALiBi or cross-layer KV sharing"
+             )
+         self.num_heads = num_heads
+@@ -110,6 +128,16 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
+         self.kv_cache_dtype = kv_cache_dtype
+         self.ops = get_mps_ops()
+ 
++    def do_kv_cache_update(self, layer, key, value, kv_cache, slot_mapping):
++        kv_cache = kv_cache.transpose(1, 2)
++        self.ops.reshape_and_cache(
++            key,
++            value,
++            kv_cache[..., : self.head_size],
++            kv_cache[..., self.head_size :],
++            slot_mapping,
++        )
++
+     def forward(
+         self,
+         layer,
+@@ -129,6 +157,16 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
+             return output.zero_()
+         # Upstream's LBNHC cache is [block, head, token, K+V].
+         kv_cache = kv_cache.transpose(1, 2)
++        ranges = m.block_ranges
++        if ranges is not None and self.sliding_window >= 0:
++            # Upstream noncausal SWA uses a symmetric per-query window.
++            ranges = torch.stack(
++                (
++                    ranges[:, 0],
++                    torch.minimum(ranges[:, 1], ranges[:, 0] + self.sliding_window - 1),
++                ),
++                dim=-1,
++            )
+         self.ops.forward(
+             query.contiguous(),
+             key,
+@@ -145,5 +183,6 @@ class MPSAttentionImpl(AttentionImpl[MPSAttentionMetadata]):
+             self.sliding_window,
+             self.logits_soft_cap,
+             m.window_seqlen_q,
++            ranges,
+         )
+         return output
+diff --git a/vllm_metal/pytorch_backend/bindings.py b/vllm_metal/pytorch_backend/bindings.py
+index be4e74c7..62734068 100644
+--- a/vllm_metal/pytorch_backend/bindings.py
++++ b/vllm_metal/pytorch_backend/bindings.py
+@@ -48,6 +48,7 @@ def _install_input_ops():
+ 
+ def _install_speculative_ops():
+     from vllm.v1.worker.gpu.spec_decode import rejection_sampler
++    from vllm.v1.worker.gpu.spec_decode.dflash import speculator as dflash
+     from vllm.v1.worker.gpu.spec_decode.target_dependent_ar import speculator
+ 
+     from vllm_metal.pytorch_backend import input_ops, runtime, speculative_ops
+@@ -56,6 +57,7 @@ def _install_speculative_ops():
+     speculator.prepare_prefill_inputs = speculative_ops.prepare_prefill_inputs
+     speculator.prepare_decode_inputs = speculative_ops.prepare_decode_inputs
+     speculator.update_draft_inputs = speculative_ops.update_draft_inputs
++    dflash.prepare_dflash_inputs = speculative_ops.prepare_dflash_inputs
+     rejection_sampler.rejection_sample = speculative_ops.rejection_sample
+     rejection_sampler.get_num_sampled_and_rejected = (
+         input_ops.get_num_sampled_and_rejected
+@@ -67,11 +69,16 @@ def install():
+     from vllm.v1.worker.gpu import buffer_utils, model_runner
+     from vllm.v1.worker.gpu.sample import sampler
+ 
+-    from vllm_metal.pytorch_backend import runtime
++    from vllm_metal.pytorch_backend import normalization, rotary, runtime
+ 
+     if getattr(buffer_utils, "_metal_installed", False):
+         return
+ 
++    # DFlash context precompute calls these operators directly, outside the
++    # RMSNorm IR and RotaryEmbedding layer dispatch used by normal forwards.
++    torch.library.impl("_C::rms_norm", "MPS", normalization.rms_norm_out)
++    torch.library.impl("_C::rotary_embedding", "MPS", rotary.rotary_embedding)
++
+     @ShortConv.register_oot
+     class MPSShortConv(ShortConv):
+         # Reuse upstream Torch ops without its CPU/CUDA custom-op wrapper.
+diff --git a/vllm_metal/pytorch_backend/mps_ops.mm b/vllm_metal/pytorch_backend/mps_ops.mm
+index f8823134..90efe989 100644
+--- a/vllm_metal/pytorch_backend/mps_ops.mm
++++ b/vllm_metal/pytorch_backend/mps_ops.mm
+@@ -51,8 +51,9 @@ static void override_max_buffer_length_for_test(int64_t nbytes) {
+   int gpu_cores_;
+ 
+   id<MTLComputePipelineState> pipeline(const std::string& name, bool split = false,
+-                                      int window_q = 0) {
+-    const auto key = name + "_wq" + std::to_string(window_q);
++                                      int window_q = 0, bool block_attention = false) {
++    const auto key = name + "_wq" + std::to_string(window_q)
++        + "_block" + std::to_string(block_attention);
+     auto it = pipelines_.find(key);
+     if (it != pipelines_.end()) return it->second;
+     auto constants = [[MTLFunctionConstantValues alloc] init];
+@@ -63,6 +64,7 @@ static void override_max_buffer_length_for_test(int64_t nbytes) {
+     // loop. The split pipeline is only chosen by the MLX launcher.
+     [constants setConstantValue:&no type:MTLDataTypeBool atIndex:41];
+     [constants setConstantValue:&split type:MTLDataTypeBool atIndex:10];
++    [constants setConstantValue:&block_attention type:MTLDataTypeBool atIndex:120];
+     int kbits = 8, vbits = 3;
+     [constants setConstantValue:&kbits type:MTLDataTypeInt atIndex:60];
+     [constants setConstantValue:&vbits type:MTLDataTypeInt atIndex:70];
+@@ -91,6 +93,43 @@ static void scalar(id<MTLComputeCommandEncoder> enc, int i, T value) {
+     [enc setBytes:&value length:sizeof(T) atIndex:i];
+   }
+ 
++  static void check_cache(const Tensor& k, const Tensor& v, const Tensor& kc,
++                          const Tensor& vc, const Tensor& slots) {
++    for (auto* t : {&k, &v, &kc, &vc, &slots})
++      TORCH_CHECK(t->is_mps(), "All cache buffers must be on MPS");
++    TORCH_CHECK(kc.dim() == 4 &&
++                (kc.size(1) == 8 || kc.size(1) == 16 || kc.size(1) == 32) &&
++                kc.stride(3) == 1 && vc.strides() == kc.strides() && kc.sizes() == vc.sizes(),
++                "MPS attention requires [blocks,8/16/32,kv_heads,head_dim] KV");
++    TORCH_CHECK(k.scalar_type() == at::kHalf || k.scalar_type() == at::kBFloat16,
++                "MPS cache writes require fp16 or bf16");
++    for (auto* t : {&v, &kc, &vc})
++      TORCH_CHECK(t->scalar_type() == k.scalar_type(), "K/V/cache dtype mismatch");
++    TORCH_CHECK(k.sizes() == v.sizes() && k.dim() == 3 &&
++                k.size(1) == kc.size(2) && k.size(2) == kc.size(3) &&
++                k.stride(2) == 1 && k.stride(1) == k.size(2) &&
++                v.stride(2) == 1 && v.stride(1) == v.size(2) &&
++                slots.numel() == k.size(0) && slots.scalar_type() == at::kLong &&
++                slots.is_contiguous(), "Inconsistent cache shapes/strides");
++  }
++
++  void encode_cache(id<MTLComputeCommandEncoder> enc, const Tensor& k,
++                    const Tensor& v, const Tensor& kc, const Tensor& vc,
++                    const Tensor& slots) {
++    const std::string dt = k.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
++    [enc setComputePipelineState:pipeline(kernels::reshape_and_cache_name(dt, dt))];
++    buffer(enc, 0, k); buffer(enc, 1, v);
++    buffer(enc, 2, kc); buffer(enc, 3, vc); buffer(enc, 4, slots);
++    scalar<int>(enc, 7, k.stride(0)); scalar<int>(enc, 8, v.stride(0));
++    scalar<int>(enc, 9, kc.size(2)); scalar<int>(enc, 10, kc.size(3));
++    scalar<int>(enc, 11, kc.size(1));
++    scalar<int64_t>(enc, 12, kc.stride(0));
++    scalar<int64_t>(enc, 13, kc.stride(1));
++    scalar<int64_t>(enc, 14, kc.stride(2));
++    [enc dispatchThreadgroups:MTLSizeMake(k.size(0), 1, 1)
++        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++  }
++
+  public:
+   PagedAttention(const std::string& path, const std::string& nax_path, int gpu_cores)
+       : gpu_cores_(gpu_cores) {
+@@ -116,11 +155,24 @@ static void scalar(id<MTLComputeCommandEncoder> enc, int i, T value) {
+     [nax_library_ release];
+   }
+ 
++  void reshape_and_cache(const Tensor& k, const Tensor& v, const Tensor& kc,
++                         const Tensor& vc, const Tensor& slots) {
++    check_cache(k, v, kc, vc, slots);
++    if (k.size(0) == 0) return;
++    auto stream = at::mps::getCurrentMPSStream();
++    at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
++      @autoreleasepool {
++        encode_cache(stream->commandEncoder(), k, v, kc, vc, slots);
++      }
++    });
++  }
++
+   void forward(const Tensor& q, const Tensor& k, const Tensor& v,
+                const Tensor& kc, const Tensor& vc, const Tensor& slots,
+                const Tensor& blocks, const Tensor& lens, const Tensor& cu,
+                const Tensor& out, int max_seq_len, double scale,
+-               int sliding_window, double softcap, int window_seqlen_q) {
++               int sliding_window, double softcap, int window_seqlen_q,
++               const std::optional<Tensor>& block_ranges) {
+     for (auto* t : {&q, &k, &v, &kc, &vc, &slots, &blocks, &lens, &cu, &out})
+       TORCH_CHECK(t->is_mps(), "All paged attention buffers must be on MPS");
+     TORCH_CHECK(q.dim() == 3 && q.is_contiguous() &&
+@@ -128,11 +180,8 @@ void forward(const Tensor& q, const Tensor& k, const Tensor& v,
+                  q.size(2) == 256 || q.size(2) == 512),
+                 "MPS attention requires contiguous Q with head_dim=64/96/128/256/512");
+     const int head_size = q.size(2);
+-    TORCH_CHECK(kc.dim() == 4 &&
+-                (kc.size(1) == 8 || kc.size(1) == 16 || kc.size(1) == 32) &&
+-                kc.size(3) == head_size &&
+-                kc.stride(3) == 1 && vc.strides() == kc.strides() && kc.sizes() == vc.sizes(),
+-                "MPS attention requires [blocks,8/16/32,kv_heads,head_dim] KV");
++    check_cache(k, v, kc, vc, slots);
++    TORCH_CHECK(kc.size(3) == head_size, "Query and cache head sizes must match");
+     const int block_size = kc.size(1);
+     TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16,
+                 "Experimental MPS attention requires fp16 or bf16");
+@@ -147,31 +196,35 @@ void forward(const Tensor& q, const Tensor& k, const Tensor& v,
+     const int tokens = q.size(0), heads = q.size(1), kv_heads = kc.size(2);
+     const int seqs = lens.numel();
+     const int parts = (max_seq_len + kPartitionSize - 1) / kPartitionSize;
+-    TORCH_CHECK(k.sizes() == v.sizes() && k.dim() == 3 && k.size(0) == tokens &&
+-                k.size(1) == kv_heads && k.size(2) == head_size &&
+-                k.stride(2) == 1 && k.stride(1) == head_size &&
+-                v.stride(2) == 1 && v.stride(1) == head_size &&
++    TORCH_CHECK(k.size(0) == tokens &&
+                 out.sizes() == q.sizes() && out.is_contiguous() &&
+                 slots.numel() == tokens && blocks.dim() == 2 && blocks.size(0) == seqs &&
+                 cu.numel() == seqs + 1 && heads % kv_heads == 0,
+                 "Inconsistent attention shapes/strides");
+     // Reuse the same short verification-window shader mode as the MLX launcher.
+-    const bool window = tokens > seqs && window_seqlen_q > 1 &&
++    const bool block_attention = block_ranges.has_value();
++    if (block_attention) {
++      const auto& ranges = *block_ranges;
++      TORCH_CHECK(ranges.is_mps() && ranges.scalar_type() == at::kInt &&
++                  ranges.is_contiguous() && ranges.dim() == 2 &&
++                  ranges.size(0) == tokens && ranges.size(1) == 2 && tokens > seqs,
++                  "Block attention requires int32 [query tokens,2] ranges");
++    }
++    const bool window = !block_attention && tokens > seqs && window_seqlen_q > 1 &&
+         head_size <= VLLM_METAL_PA_WINDOW_MAX_HEAD;
+     const int window_q = window ?
+         (window_seqlen_q + VLLM_METAL_PA_WINDOW_ROWS - 1) / VLLM_METAL_PA_WINDOW_ROWS : 0;
+     const bool prefill = tokens > seqs && !window;
+-    const bool nax = prefill && nax_library_ != nil;
++    const bool nax = prefill && !block_attention && nax_library_ != nil;
+     const bool split = !prefill
+         && kernels::should_split_decode(heads, tokens, parts, gpu_cores_);
+     const std::string dt = q.scalar_type() == at::kHalf ? "half" : "bfloat16_t";
+     const auto cfg = kernels::select_tile_config(head_size).value();
+-    auto scatter = pipeline(kernels::reshape_and_cache_name(dt, dt));
+     auto name = nax ? kernels::nax_name(dt, head_size, block_size) :
+         prefill ? kernels::tiled_name(dt, head_size, block_size, cfg) :
+         kernels::paged_name(
+             dt, dt, dt, head_size, block_size, split ? kPartitionSize : 0);
+-    auto attn = pipeline(name, split, window_q);
++    auto attn = pipeline(name, split, window_q, block_attention);
+     id<MTLComputePipelineState> reduce = nil;
+     Tensor tmp, sums, maxes;
+     if (split) {
+@@ -185,17 +238,7 @@ void forward(const Tensor& q, const Tensor& k, const Tensor& v,
+     at::mps::dispatch_sync_with_rethrow(stream->queue(), ^{
+       @autoreleasepool {
+         auto enc = stream->commandEncoder();
+-        [enc setComputePipelineState:scatter];
+-        buffer(enc, 0, k); buffer(enc, 1, v);
+-        buffer(enc, 2, kc); buffer(enc, 3, vc); buffer(enc, 4, slots);
+-        scalar<int>(enc, 7, k.stride(0)); scalar<int>(enc, 8, v.stride(0));
+-        scalar<int>(enc, 9, kv_heads); scalar<int>(enc, 10, head_size);
+-        scalar<int>(enc, 11, block_size);
+-        scalar<int64_t>(enc, 12, kc.stride(0));
+-        scalar<int64_t>(enc, 13, kc.stride(1));
+-        scalar<int64_t>(enc, 14, kc.stride(2));
+-        [enc dispatchThreadgroups:MTLSizeMake(tokens, 1, 1)
+-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
++        encode_cache(enc, k, v, kc, vc, slots);
+         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+         [enc setComputePipelineState:attn];
+         buffer(enc, 2, split ? tmp : out); buffer(enc, 3, q);
+@@ -208,6 +251,7 @@ void forward(const Tensor& q, const Tensor& k, const Tensor& v,
+         scalar<int>(enc, 16, kc.stride(0)); scalar<int>(enc, 17, kc.stride(2));
+         buffer(enc, 19, cu); scalar<int>(enc, 20, seqs);
+         scalar<int>(enc, 21, sliding_window);
++        if (block_attention) buffer(enc, 22, *block_ranges);
+         int grid_y = window ? seqs * window_q : tokens, threads = 256;
+         if (prefill) {
+           grid_y = tokens / (nax ? kernels::kNaxBQ : cfg.BQ) + seqs;
+@@ -252,5 +296,12 @@ void forward(const Tensor& q, const Tensor& k, const Tensor& v,
+         &override_max_buffer_length_for_test);
+   pybind11::class_<PagedAttention>(m, "PagedAttention")
+       .def(pybind11::init<const std::string&, const std::string&, int>())
+-      .def("forward", &PagedAttention::forward);
++      .def("reshape_and_cache", &PagedAttention::reshape_and_cache)
++      .def("forward", &PagedAttention::forward,
++           pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
++           pybind11::arg("kc"), pybind11::arg("vc"), pybind11::arg("slots"),
++           pybind11::arg("blocks"), pybind11::arg("lens"), pybind11::arg("cu"),
++           pybind11::arg("out"), pybind11::arg("max_seq_len"), pybind11::arg("scale"),
++           pybind11::arg("sliding_window"), pybind11::arg("softcap"),
++           pybind11::arg("window_seqlen_q"), pybind11::arg("block_ranges") = std::nullopt);
+ }
+diff --git a/vllm_metal/pytorch_backend/normalization.py b/vllm_metal/pytorch_backend/normalization.py
+index 55ef14ad..df08aa19 100644
+--- a/vllm_metal/pytorch_backend/normalization.py
++++ b/vllm_metal/pytorch_backend/normalization.py
+@@ -33,6 +33,22 @@ def rms_norm(
+     return torch.nn.functional.rms_norm(x, (x.shape[-1],), weight, epsilon)
+ 
+ 
++def rms_norm_out(out, x, weight, epsilon):
++    """Adapt the direct vLLM op, including per-layer context K-norm weights."""
++    if weight is not None and weight.ndim == 2:
++        if weight.shape != (x.shape[0], x.shape[-1]):
++            raise ValueError("Grouped RMSNorm weights must match the outer dimension")
++        normalized = rms_norm.impl_fn(
++            x.float(), torch.ones_like(weight[0], dtype=torch.float32), epsilon
++        )
++        out.copy_(
++            normalized
++            * weight.float().view(x.shape[0], *([1] * (x.ndim - 2)), x.shape[-1])
++        )
++    else:
++        out.copy_(rms_norm.impl_fn(x, weight, epsilon))
++
++
+ def _supports_add_rms_norm(x, x_residual, weight, epsilon, variance_size=None):
+     return (
+         _supports_rms_norm(x, weight, epsilon, variance_size)
+diff --git a/vllm_metal/pytorch_backend/rotary.py b/vllm_metal/pytorch_backend/rotary.py
+index 67ddfdf2..f8eab824 100644
+--- a/vllm_metal/pytorch_backend/rotary.py
++++ b/vllm_metal/pytorch_backend/rotary.py
+@@ -7,6 +7,22 @@ import torch
+ from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+ 
+ 
++def rotary_embedding(positions, query, key, head_size, cos_sin_cache, is_neox):
++    """Keep the direct vLLM op's in-place contract using upstream Torch RoPE."""
++    q, k = RotaryEmbedding.forward_static(
++        positions,
++        query,
++        key,
++        head_size,
++        cos_sin_cache.shape[-1],
++        cos_sin_cache,
++        is_neox,
++    )
++    query.copy_(q)
++    if key is not None:
++        key.copy_(k)
++
++
+ @cache
+ def _kernel(dtype):
+     from vllm_metal import envs
+diff --git a/vllm_metal/pytorch_backend/speculative_ops.py b/vllm_metal/pytorch_backend/speculative_ops.py
+index 9090dcf0..cb0171b0 100644
+--- a/vllm_metal/pytorch_backend/speculative_ops.py
++++ b/vllm_metal/pytorch_backend/speculative_ops.py
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: Apache-2.0
+-"""MPS tensor operations for upstream MRv2's greedy EAGLE3 path.
++"""MPS tensor operations for upstream MRv2's greedy speculative decoding.
+ 
+ The model, auxiliary-state extraction, proposal loop, verifier bookkeeping and
+ cache management remain upstream. These replace its Triton-only device helpers.
+@@ -10,6 +10,98 @@ import torch
+ from vllm_metal.pytorch_backend.input_ops import token_rows
+ 
+ 
++def prepare_dflash_inputs(
++    buffers,
++    query_slots,
++    context_positions,
++    context_slots,
++    sample_indices,
++    sample_pos,
++    sample_mapping,
++    temperature,
++    seeds,
++    batch,
++    sampled,
++    rejected,
++    last,
++    next_prefill,
++    input_temperature,
++    input_seeds,
++    block_table,
++    block_size,
++    cp_rank,
++    cp_size,
++    cp_interleave,
++    mask_token,
++    query_width,
++    num_steps,
++    max_num_reqs,
++    max_num_tokens,
++    max_model_len,
++    sample_from_anchor=False,
++):
++    if cp_size != 1 or cp_rank != 0:
++        raise NotImplementedError("MPS drafting requires a single device")
++    n, total = batch.num_reqs, batch.num_tokens
++    cu = batch.query_start_loc
++    ends = cu[1:] - rejected
++    offsets, rows = token_rows(cu, total)
++
++    def slots(positions, request_rows):
++        blocks = block_table[
++            request_rows, (positions // block_size).clamp_max(block_table.shape[1] - 1)
++        ].long()
++        return torch.where(
++            blocks != 0, blocks * block_size + positions % block_size, -1
++        )
++
++    valid = offsets < ends[rows]
++    positions = torch.where(valid, batch.positions[:total], 0)
++    context_positions[:total].copy_(positions)
++    context_slots[:total] = torch.where(valid, slots(positions, rows), -1)
++
++    request_slots = batch.idx_mapping.long()
++    anchor = torch.where(
++        sampled > 0,
++        last.reshape(-1)[request_slots],
++        next_prefill.reshape(-1)[request_slots],
++    )
++    columns = torch.arange(query_width, device=cu.device)
++    query_positions = batch.positions[(ends - 1).long(), None] + 1 + columns
++    count = n * query_width
++    buffers.input_ids[:count] = torch.where(
++        columns == 0, anchor[:, None], mask_token
++    ).flatten()
++    buffers.positions[:count].copy_(
++        query_positions.clamp_max(max_model_len - 1).flatten()
++    )
++    query_slots[:count] = slots(
++        query_positions, torch.arange(n, device=cu.device)[:, None]
++    ).flatten()
++    query_slots[count:].fill_(-1)
++    buffers.query_start_loc.copy_(
++        torch.arange(max_num_reqs + 1, device=cu.device).clamp_max(n) * query_width
++    )
++    buffers.seq_lens[:n] = (query_positions[:, -1] + 1).clamp_max(max_model_len)
++    buffers.seq_lens[n:].zero_()
++
++    first = 0 if sample_from_anchor else 1
++    num_sample = n * num_steps
++    indices = torch.arange(count, device=cu.device).view(n, query_width)
++    sample_indices[:num_sample].copy_(indices[:, first:].flatten())
++    sample_pos[:num_sample].copy_(
++        (query_positions[:, first:] + sample_from_anchor).flatten()
++    )
++    sample_mapping[:num_sample].copy_(
++        request_slots[:, None].expand(n, num_steps).flatten()
++    )
++    sample_indices[num_sample:].zero_()
++    sample_pos[num_sample:].zero_()
++    sample_mapping[num_sample:].fill_(-1)
++    temperature[request_slots] = input_temperature[request_slots]
++    seeds[request_slots] = input_seeds[request_slots]
++
++
+ def prepare_prefill_inputs(
+     last_indices, step, buffers, batch, sampled, rejected, last, lookahead, max_num_reqs
+ ):
+diff --git a/vllm_metal/pytorch_backend/worker.py b/vllm_metal/pytorch_backend/worker.py
+index 2b6577aa..a147ff23 100644
+--- a/vllm_metal/pytorch_backend/worker.py
++++ b/vllm_metal/pytorch_backend/worker.py
+@@ -75,15 +75,24 @@ def configure_mps(config):
+         )
+     spec = config.speculative_config
+     if spec is not None and (
+-        spec.method != "eagle3"
++        spec.method not in ("eagle3", "dflash")
+         or spec.draft_sample_method != "greedy"
+         or spec.rejection_sample_method != "standard"
+         or spec.enable_adaptive_verification
+-        or spec.parallel_drafting
++        or (spec.parallel_drafting and spec.method != "dflash")
+         or model.has_inner_state
+         or config.watermark_config is not None
+     ):
+-        raise NotImplementedError("MPS speculation currently supports greedy EAGLE3")
++        raise NotImplementedError(
++            "MPS speculation currently supports greedy EAGLE3 and DFlash"
++        )
++    if (
++        spec is not None
++        and spec.method == "dflash"
++        and set(spec.draft_model_config.architectures)
++        & {"DFlash2DraftModel", "LiLiCorrDraftModel"}
++    ):
++        raise NotImplementedError("MPS does not yet implement candidate-walk drafting")
+     if config.cache_config.block_size is None:
+         config.cache_config.block_size = 16
+     if not MPSAttentionBackend.supports_block_size(config.cache_config.block_size):

@@ -1,0 +1,111 @@
+{
+  "validated_on": "2026-11-05",
+  "source_commit": "e5ddbf7ab049fc82068a0ffc34ae789de9842479",
+  "base_commit": "81d5883f71b7ce23f30889c16d0d136e096064be",
+  "validated_diff_sha256": "5e8cefed362ab0a16593b56d4dda26aceebf7dfc4ccc8d65bcc14fa332eb2e58",
+  "versions": {
+    "torch": "2.16.0.dev20261013",
+    "vllm": "0.33.0+cpu",
+    "mlx": "0.32.4",
+    "mlx-lm": "0.32.3.dev12+g4cfc64784",
+    "transformers": "5.20.2"
+  },
+  "tests": {
+    "non_slow": {
+      "passed": 6397,
+      "skipped": 16,
+      "deselected": 316
+    },
+    "focused_mps": {
+      "passed": 259,
+      "skipped": 2,
+      "skip_reason": "Optional vllm-omni package is absent."
+    },
+    "ruff_check": "passed",
+    "ruff_format": "passed",
+    "mypy": "passed",
+    "diff_check": "passed"
+  },
+  "parity_protocol": {
+    "prompts": 12,
+    "composition": "First eight tools/parity_prompts.py prompts plus two long prompts repeated.",
+    "output_tokens": 32,
+    "batch_sizes": [
+      1,
+      8
+    ],
+    "top_k": 5,
+    "prefix_caching": true,
+    "kv_blocks": 160,
+    "prefill_budget": 512,
+    "fresh_native_reference": true,
+    "fresh_target_only_control": true,
+    "PYTORCH_ENABLE_MPS_FALLBACK": "0"
+  },
+  "results": {
+    "target": {
+      "1": {
+        "native": {
+          "EXACT": 8,
+          "TOP_K_MATCH": 4,
+          "FAIL": 0
+        }
+      },
+      "8": {
+        "native": {
+          "EXACT": 10,
+          "TOP_K_MATCH": 2,
+          "FAIL": 0
+        }
+      },
+      "counters": {
+        "requests": 24.0,
+        "drafts": 0,
+        "draft_tokens": 0,
+        "accepted_tokens": 0,
+        "preemptions": 0.0
+      },
+      "prefix_cache": {
+        "queries": 6342.0,
+        "hits": 4656.0
+      }
+    },
+    "dflash": {
+      "1": {
+        "native": {
+          "EXACT": 8,
+          "TOP_K_MATCH": 4,
+          "FAIL": 0
+        },
+        "target_only": {
+          "EXACT": 11,
+          "TOP_K_MATCH": 1,
+          "FAIL": 0
+        }
+      },
+      "8": {
+        "native": {
+          "EXACT": 8,
+          "TOP_K_MATCH": 4,
+          "FAIL": 0
+        },
+        "target_only": {
+          "EXACT": 10,
+          "TOP_K_MATCH": 2,
+          "FAIL": 0
+        }
+      },
+      "counters": {
+        "requests": 24.0,
+        "drafts": 342.0,
+        "draft_tokens": 2394.0,
+        "accepted_tokens": 460.0,
+        "preemptions": 0.0
+      },
+      "prefix_cache": {
+        "queries": 6342.0,
+        "hits": 4656.0
+      }
+    }
+  }
+}
