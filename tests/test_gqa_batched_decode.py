@@ -12,7 +12,7 @@ from tests.gqa_test_utils import (
     _primitive,
     _run_primitive,
 )
-from tests.test_gqa_paged_decode import GQA_GEOMETRIES, GQA_PARTITIONS
+from tests.test_gqa_paged_decode import GQA_GEOMETRIES, GQA_PARTITION_SIZE
 from vllm_metal.metal import get_ops
 
 
@@ -282,15 +282,6 @@ def test_forward_context_reorder_and_membership_survive_deferred_evaluation(
         clear_context()
 
 
-@pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-@pytest.mark.parametrize("length", [1, 1536, 8192, 10752, 21248, 42496, 262145])
-def test_batch_planner_preserves_single_request(q, kv, head, block, length):
-    ops = get_ops()
-    assert ops.gqa_decode_batch_partition_size(q, kv, head, [length], 40, block) == (
-        ops.gqa_decode_partition_size(q, kv, head, length, 40, block)
-    )
-
-
 @pytest.mark.parametrize(
     "geometry", [(32, 4, 128, 16), (32, 8, 128, 32), (24, 4, 256, 8)]
 )
@@ -303,11 +294,15 @@ def test_batch_planner_rejects_unshipped_geometry(geometry):
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition, dtype):
+def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, dtype):
     # Disjoint shuffled pages and different tail widths expose row/stride errors.
-    lengths = [1, partition - 1, partition + 1, 3 * partition + 3]
+    lengths = [
+        1,
+        GQA_PARTITION_SIZE - 1,
+        GQA_PARTITION_SIZE + 1,
+        3 * GQA_PARTITION_SIZE + 3,
+    ]
     kwargs = {
         "interleaved": True,
         "seed": 1004,
@@ -315,12 +310,12 @@ def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition,
         "num_kv_heads": kv,
         "head_size": head,
         "block_size": block,
-        "test_partition": partition,
+        "force_gqa": True,
     }
     rectangular, _ = _run_primitive(lengths, dtype, **kwargs)
     out, ref = _run_primitive(lengths, dtype, gqa_lengths=lengths, **kwargs)
     assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == partition
+    assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
     assert get_ops().last_gqa_num_requests() == 4
     _assert_close(out, ref, dtype)
     np.testing.assert_array_equal(
@@ -330,11 +325,10 @@ def test_forced_batched_kernels_with_ragged_tails(q, kv, head, block, partition,
 
 
 @pytest.mark.parametrize("q,kv,head,block", GQA_GEOMETRIES)
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
-def test_automatic_batch_route_matches_reference(q, kv, head, block, partition):
+def test_automatic_batch_route_matches_reference(q, kv, head, block):
     # 40 cores, two rows: 21 / 28 / 42 full partitions per row for Q32/24/16.
     per_row = {32: 21, 24: 28, 16: 42}[q]
-    lengths = [partition * per_row + 1, partition * per_row + 3]
+    lengths = [GQA_PARTITION_SIZE * per_row + 1, GQA_PARTITION_SIZE * per_row + 3]
     out, ref = _run_primitive(
         lengths,
         mx.bfloat16,
@@ -349,7 +343,7 @@ def test_automatic_batch_route_matches_reference(q, kv, head, block, partition):
         gqa_lengths=lengths,
     )
     assert _dispatch_family() == "gqa_decode"
-    assert get_ops().last_gqa_partition_size() == partition
+    assert get_ops().last_gqa_partition_size() == GQA_PARTITION_SIZE
     assert get_ops().last_gqa_num_requests() == 2
     _assert_close(out, ref, mx.bfloat16)
 
@@ -496,13 +490,12 @@ def test_host_lengths_are_captured_by_each_lazy_primitive():
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("partition", GQA_PARTITIONS)
 @pytest.mark.parametrize(
     "q,kv,head,cache_block",
     [(24, 4, 256, 784), (24, 4, 256, 800), (16, 2, 256, 1056)],
 )
 def test_batched_shared_prefix_and_strided_scheduler_pages(
-    dtype, partition, q, kv, head, cache_block
+    dtype, q, kv, head, cache_block
 ):
     from tests.test_gqa_paged_decode import _grouped_paged_reference
     from vllm_metal.attention.block_tables import build_block_tables
@@ -551,7 +544,6 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
         mx.array([length - 1, length], mx.int32),
         block,
         length,
-        partition,
     )
     mx.eval(out)  # No evaluation boundary between scatter and attention.
     ref = _grouped_paged_reference(
@@ -568,9 +560,7 @@ def test_batched_shared_prefix_and_strided_scheduler_pages(
 
 
 def test_recorded_batch_size_clears_with_diagnostics():
-    _run_primitive(
-        [513, 1025], mx.float16, interleaved=True, seed=1010, test_partition=256
-    )
+    _run_primitive([513, 1025], mx.float16, interleaved=True, seed=1010, force_gqa=True)
     ops = get_ops()
     assert ops.last_gqa_num_requests() == 2
     ops._set_paged_dispatch_diagnostics(False)

@@ -188,7 +188,7 @@ def _run_primitive(
     sink_value: float | None = None,
     turboquant: bool = False,
     native_reference: bool = False,
-    test_partition: int | None = None,
+    force_gqa: bool = False,
     gqa_lengths: list[int] | None = None,
 ) -> tuple[mx.array, mx.array]:
     mx.random.seed(seed)
@@ -261,7 +261,7 @@ def _run_primitive(
         )
         mx.eval(key_cache, value_cache, k_scale, k_zero, v_scale, key_ref, value_ref)
 
-    if test_partition is not None:
+    if force_gqa:
         out = get_ops()._gqa_paged_attention_for_test(
             query,
             key_cache,
@@ -271,7 +271,6 @@ def _run_primitive(
             kv_lens_arr,
             block_size,
             max_kv_len,
-            test_partition,
             **quant_kwargs,
         )
     else:

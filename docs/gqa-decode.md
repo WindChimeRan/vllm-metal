@@ -65,7 +65,7 @@ forward gets a new plan; deferred execution retains the original value.
 Single- and multi-request selection use the same planner. There is no GPU
 readback, startup benchmark or per-request performance probe.
 `gqa_decode_partition_size` exposes the default decision for tests, 256 or
-zero; `gqa_decode_shape_eligible` is true when it is nonzero.
+zero.
 `gqa_decode_batch_partition_size` takes a list of per-request lengths;
 `max_seq_len` optionally supplies an allocation upper bound.
 These queries check geometry, work and the scratch budget, not all dispatch
@@ -191,62 +191,16 @@ rows or whose maximum exceeds `max_decode_context_len`.
 
 ## Validation
 
-`tests/test_gqa_decode_routing.py` evaluates the public primitive and checks
-`last_paged_dispatch()` alongside the numerical reference. Positive cases
-must actually report `gqa_decode`; partition tests additionally check
-`last_gqa_partition_size()`. Boundary, multi-request, verification, feature,
-and disabled cases must report the appropriate established family, including
-upstream mixed prefill/decode.
-References include independent grouped CPU FP32 attention and native MLX SDPA.
-All four geometries and both cache dtypes are checked at 128K, 192K,
-and 256K, including a partial final partition.
-These extended matrices are marked `slow` and excluded from regular CI;
-all specialization, tail and routing-boundary checks remain in regular CI.
-Run the long-context matrices explicitly with
-`python -m pytest tests/test_gqa_paged_decode.py tests/test_gqa_decode_routing.py -m slow`.
-Shared-storage tests use upstream-allocated
-K/V views, non-contiguous page tables, native writes, prefix-page copying,
-source-page clearing and a subsequent decode write. Dominant attention rows
-make missing writes observable even in a long context.
-The 1056-token upstream-page case also exercises the real block-table
-translation and unreshaped K/V storage: the block32 kernel addresses each
-translated page with its 32-token stride.
-Remainder tests cover block16/block32 pages and final page lengths that
-exercise both the 4-token loop and the scalar tail. Long-context page
-tables use a bounded permutation to avoid inflating the physical cache.
-Resource-limit tests reject oversized forced partitions before Metal
-encoding.
-`tests/test_attention_sdpa.py` checks that the environment switch and scheduler
-decode count reach the primitive.
-`tests/test_gqa_batched_decode.py` covers independent batch-planning boundaries,
-ragged lengths, every shipped specialization and dtype, shared prefix pages,
-translated scheduler pages, lazy writes, metadata lifetime and excluded routes.
-The Python tests keep expanded verification metadata out of batch planning
-and pass only the decode prefix of a mixed batch, regenerating the plan when
-a later forward changes decode membership, order or lengths. Mixed-prefix
-tests pin the GPU core count and require decode rows bit-identical to the
-same rows as a pure GQA decode batch and prefill rows bit-identical to the
-unsplit prefill kernel, for representative geometries, both cache dtypes and
-translated scheduler pages; a short decode row next to a long prefill stays
-per-token, and an allocation-wide `max_seq_len` does not size the prefix.
+The GQA tests cover numerical agreement, production routing and fallbacks,
+resource limits, ragged batches, and cache updates under lazy evaluation.
 
-Default-policy positive route tests need a GPU core count and a sufficient
-partition grid. Hosts whose IORegistry does not report cores inject a
-test-only count through `_override_detected_gpu_core_count_for_test` so
-the default selector still runs; the unknown-core fallback test forces
-that count to zero. Production serving never calls the override.
-`tests/test_gqa_paged_decode.py` tests kernel correctness separately through the private
-`_gqa_paged_attention_for_test` entry, which accepts one query row per request
-and selects an explicit partition
-without changing global state or the public primitive's routing API.
-Its partition is captured in the lazy primitive and its equivalence key.
-These tests execute both partitions, both dtypes, every shipped shader
-specialization, tails and upstream shared-page writes/copies even when CI
-cannot report GPU cores. Numerical parity does not establish performance
-eligibility. Feature/dtype/page-size fallback tests remain independent.
-The library-availability check loads all 12 active GQA specializations and
-their matching reducers even when the reported core count is unavailable.
-Validate the positive path on a capable GPU before reporting GQA coverage.
+```bash
+python -m pytest tests/test_gqa_*.py -m "not slow"
+python -m pytest tests/test_gqa_paged_decode.py tests/test_gqa_decode_routing.py -m slow
+```
+
+Forced-kernel tests bypass performance admission. Check `last_paged_dispatch()`
+when testing default routing; numerical agreement alone does not show that GQA ran.
 
 Dispatch diagnostics are disabled by default. The ordinary dispatch path
 reads one relaxed atomic flag and returns without writing diagnostic state.
@@ -288,42 +242,7 @@ and keep noisy measurements visible. The
 explains why in-process engine measurements and short probes are not
 interchangeable with serving results.
 
-## Follow-up work (separate PRs)
+## Design discussions
 
-These are directions for evaluation after this scoped change, not additional
-enablement or performance claims of this routing policy:
-
-1. **GQA without split-KV:** evaluate a grouped kernel that writes its final
-   output directly, independently of context partitioning. Measure its
-   tradeoff against the split producer at larger batch sizes.
-2. **Mixed prefill/decode:** the decode prefix split by
-   [#851](https://github.com/vllm-project/vllm-metal/pull/851) (and its NAX
-   counterpart) now uses GQA through a decode-prefix length plan (see the
-   mixed-batch paragraph above). The tiled-era 4096-token context threshold
-   for that split is now a 512-token decode-work floor (the sum of the decode
-   rows' context lengths): on M5, many short decode rows gain the most from
-   the split, while a single 256-token row next to a short NAX prefill was
-   slower split (`tools/benchmark/mixed_decode_split_benchmark.py`). M1 Max
-   kernel and serving measurements on the tiled route agree with the floor.
-   The native split's overhead at short prefills remains: fixing it would let
-   the floor come down.
-3. **TurboQuant decode:** `paged_attention_gqa_decode_tq` reads packed K/V
-   and their scales in place, dequantizing each lane's slice in registers with
-   no per-step materialization of the history. Its partials stay in the
-   rotated V domain, and the TurboQuant reduce applies the single inverse FWHT,
-   as the split-KV TurboQuant path does. Default routing admits it under the
-   same work budget (see the eligibility list above). On M1 Max the budget
-   leaves some short-context head256 shapes on the established kernels even
-   though the producer is faster there; a TurboQuant-specific budget could
-   admit them. `tools/benchmark/tq_gqa_decode_benchmark.py` times the kernels.
-4. **Sliding windows:** bound loads and split selection by the actual visible
-   KV window. This is relevant to Gemma/Mistral-style attention, but their
-   geometries and other features such as sinks or soft-capping must also
-   satisfy the supported kernel contract.
-5. **Speculative verification:** evaluate sharing KV across both grouped heads
-   and multiple query rows. The existing verification kernel already shares
-   KV across rows; compare against it while preserving causal masks and
-   controlling register pressure. A larger gain is possible, not established.
-6. **Cooperative K/V loading:** evaluate shared staging against direct
-   loads on each device, accounting for cache reuse, synchronization and
-   occupancy. Context length alone does not establish a benefit.
+See [GQA routing RFC #1328](https://github.com/vllm-project/vllm-metal/issues/1328)
+for proposed extensions to routing and backend support.

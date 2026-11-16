@@ -148,7 +148,7 @@ array paged_attention_primitive_fn(
     int num_decode_requests = -1,
     int num_decode_tokens = 0,
     int max_decode_context_len = 0, bool gqa_disabled = false,
-    int gqa_test_partition = 0,
+    bool force_gqa = false,
     const std::optional<GqaDecodeLengthPlan>& gqa_length_plan = std::nullopt,
     int nax_split_hint = -1, int nax_prefill_split_hint = -1);
 std::tuple<array, array, array, array, array> tq_encode_primitive_fn(
